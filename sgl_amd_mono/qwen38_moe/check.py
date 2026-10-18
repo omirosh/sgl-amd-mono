@@ -40,8 +40,9 @@ def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
     a, b = a.float().reshape(-1), b.float().reshape(-1)
     if a.numel() == 0:
         return {}
+    # equal also covers the graph warmup's zero tensors, where the cosine is 0
     return {
-        "cosine": F.cosine_similarity(a, b, dim=0).item(),
+        "cosine": 1.0 if torch.equal(a, b) else F.cosine_similarity(a, b, dim=0).item(),
         "rel": ((a - b).norm() / b.norm().clamp_min(1e-30)).item(),
         "max_abs": (a - b).abs().max().item(),
     }

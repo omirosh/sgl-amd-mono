@@ -8,6 +8,7 @@ that stops the server before any token of the failed step is sent."""
 
 import os
 import re
+import resource
 import tempfile
 import time
 import unittest
@@ -124,7 +125,8 @@ class TestMonokernelCheck(CustomTestCase):
         ):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
-                extra_args=["--disable-cuda-graph"],
+                # ARGS' --cuda-graph-config wins over --disable-cuda-graph
+                extra_args=["--cuda-graph-config", '{"decode":{"backend":"disabled"}}'],
                 log=(out, err),
             )
             try:
@@ -167,6 +169,9 @@ class TestMonokernelFault(CustomTestCase):
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
+            # a GPU fault aborts each rank; with core dumps on, the ranks stay
+            # alive for minutes while they dump
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_FAULT_INJECT": "1:1:100"},
                 extra_args=["--watchdog-timeout", "20"],
