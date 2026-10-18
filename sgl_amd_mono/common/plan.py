@@ -7,11 +7,15 @@
 # atom/mono/plan/arith.py
 # atom/mono/plan/shard.py
 # atom/mono/plan/build_key.py
-"""Plain-Python planning of the mono kernels: execution model, layouts, TP shards and build keys."""
+# (``KernelAbi`` from ATOM at a526f0d, atom/mono/runtime/abi.py, by way of
+# sgl-project/sglang#43481)
+"""Plain-Python planning of the mono kernels: execution model, layouts, TP shards, build keys and kernel ABIs."""
 
 import enum
 import functools
 import hashlib
+import inspect
+from dataclasses import dataclass
 from pathlib import Path
 
 import msgspec
@@ -123,3 +127,42 @@ def key_tuple(key, sources: str) -> tuple:
         out.append((f.name, value))
     out.append(("sources", sources))
     return tuple(out)
+
+
+# ---------------------------------------------------------------- kernel ABIs
+def _python_params(fn) -> tuple[str, ...]:
+    """Parameter names of a ``@flyc.kernel`` / ``@flyc.jit`` object's Python
+    function (FlyDSL keeps it as ``_func`` / ``func``)."""
+    py = getattr(fn, "func", None) or getattr(fn, "_func", None)
+    if py is None:
+        raise TypeError(f"no Python function behind {fn!r}")
+    return tuple(inspect.signature(py).parameters)
+
+
+@dataclass(frozen=True)
+class KernelAbi:
+    names: tuple[str, ...]
+
+    def check(self, kernel, launcher) -> None:
+        """The kernel takes exactly ``names``; the launcher too, then ``stream``."""
+        got = _python_params(kernel)
+        if got != self.names:
+            raise TypeError(f"kernel parameters {got} != ABI {self.names}")
+        got = _python_params(launcher)
+        if got != (*self.names, "stream"):
+            raise TypeError(f"launcher parameters {got} != ABI {self.names} + stream")
+
+    def pack(self, values: dict) -> list:
+        """``values`` (every name, nothing else) in ABI order."""
+        try:
+            if len(values) == len(self.names):
+                return [values[n] for n in self.names]
+        except KeyError:
+            pass
+        extra = sorted(set(values) - set(self.names))
+        missing = sorted(set(self.names) - set(values))
+        raise TypeError(f"ABI mismatch: missing {missing}, unexpected {extra}")
+
+    def zeros(self) -> list:
+        """Every argument 0: what a compile-only call passes."""
+        return [0] * len(self.names)

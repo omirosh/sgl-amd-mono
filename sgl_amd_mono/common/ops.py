@@ -6,7 +6,8 @@
 # atom/mono/device/ranks.py
 # atom/mono/device/stamps.py
 # (``global_load`` and ``ld_i32`` from ATOM at 454d0e3023, by way of
-# sgl-project/sglang#43984)
+# sgl-project/sglang#43984; the wave reductions and the CTA scan from ATOM at
+# a526f0d, by way of sgl-project/sglang#43481)
 """Device primitives of the mono kernels: wave ops, hardware math, packing and buffer access."""
 
 import flydsl.expr as fx
@@ -15,7 +16,7 @@ from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import const_expr
+from flydsl.expr import const_expr, gpu
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
@@ -142,9 +143,54 @@ def butterfly(v, offsets, op=_add):
     return v
 
 
+def wave_sum(v):
+    return butterfly(v, (32, 16, 8, 4, 2, 1))
+
+
+def wave_max(v):
+    return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
+
+
 def traced(fn):
     """Apply FlyDSL's AST rewrite to a helper, so its control flow on traced values lowers to scf."""
     return ASTRewriter.transform(fn)
+
+
+def _xpartner(v, off, lane):
+    """Lane ``lane ^ off``'s v: DPP within a row, v_permlane*_swap across rows
+    (``xshfl`` takes ``shuffle_xor`` there)."""
+    if off < 16:
+        return xshfl(v, off)
+    a, b = permlane_swap(off, v, v)
+    return ((lane & off) != 0).select(a, b)
+
+
+def wave_incl_scan(v, lane):
+    """Inclusive prefix sum of an Int32 over the wave, in lane order."""
+    blk = v
+    for off in (1, 2, 4, 8, 16, 32):
+        o = _xpartner(blk, off, lane)
+        v = v + ((lane & off) != 0).select(o, 0)
+        blk = blk + o
+    return v
+
+
+@traced
+def block_excl_scan(v, lane, wave, buf):
+    """(exclusive prefix of v over the CTA in thread order, CTA total); ``buf``
+    needs WAVES words."""
+    incl = wave_incl_scan(v, lane)
+    gpu.barrier()
+    if lane == 63:
+        fx.ptr_store(incl, buf + wave)
+    gpu.barrier()
+    off = fx.Int32(0)
+    tot = fx.Int32(0)
+    for w in range_constexpr(WAVES):
+        cnt = fx.ptr_load(buf + w)
+        off = off + (w < wave).select(cnt, 0)
+        tot = tot + cnt
+    return incl - v + off, tot
 
 
 def global_load(addr, words=1, nt=False):

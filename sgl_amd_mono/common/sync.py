@@ -3,6 +3,7 @@
 # Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6, MIT License,
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/device/sync.py
+# (``shift`` from ATOM at a526f0d, by way of sgl-project/sglang#43481)
 """The tagged mailbox between CTAs (device scope) and GPUs (system scope)."""
 
 from enum import Enum
@@ -100,6 +101,11 @@ def sreg(base, offset, region):
 def preg(base, offset, region):
     """Return the address of peer-symmetric region ``region`` at byte ``offset`` of buffer ``base``."""
     return Addr(region, Space.PEER, base + fx.Int64(offset))
+
+
+def shift(a, delta):
+    """``a`` moved by ``delta`` bytes (a traced or Python integer), same region."""
+    return Addr(a.region, a.space, a.value + delta)
 
 
 # the store / load cache policy of a hand-off in each space

@@ -2,8 +2,8 @@
 """Shared device primitives of the HIP monokernels (RFC #43949): a resident grid
 with one workgroup per CU (``plan``), wave ops and buffer access (``ops``), MX
 helpers (``mx``), device-incremented epoch tags (``epoch``), the tagged mailbox
-between workgroups and GPUs (``sync``), and the deadlines and error words every
-wait runs under (``guard``).
+between workgroups and GPUs (``sync``), the deadlines and error words every
+wait runs under (``guard``), and the bf16 GEMV stage (``gemv``).
 
 Adapted from ROCm/ATOM (https://github.com/ROCm/ATOM) at 97359d6 (MIT License,
 Copyright (C) 2026, Advanced Micro Devices, Inc.) by way of vLLM's DeepSeek-V4.1
