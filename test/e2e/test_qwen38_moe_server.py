@@ -212,7 +212,7 @@ class TestMonokernelFault(CustomTestCase):
                 log = err.read() + out.read()
                 # a launch never runs on after a failed wait: it stops with a store
                 # to the null page, so the only faults are at address 0x0
-                faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+)", log)
+                faults = re.findall(r"faulting addr: (0x[0-9a-fA-F]+), kernel", log)
                 self.assertTrue(faults, log[-2000:])
                 self.assertEqual(set(faults) - {"0x0"}, set(), faults)
             finally:
