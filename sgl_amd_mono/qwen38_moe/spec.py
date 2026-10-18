@@ -149,10 +149,10 @@ SGLANG_READS = {
     ),
 }
 
-# K1 and K2 against SGLang's layer on the same input and state (the bounds of
-# vLLM's Qwen3.8 mono tests). The kernels quantize the expert inputs to MXFP8 and
-# SGLang's AITER MoE its own way, so the layer output differs by about the MoE's
-# error.
+# K1 and K2 against SGLang's layer on the same input and state (check.py,
+# SGLANG_AMD_MONO_CHECK; the bounds of vLLM's Qwen3.8 mono tests). The kernels
+# quantize the expert inputs to MXFP8 and SGLang's AITER MoE its own way, so the
+# layer output differs by about the MoE's error.
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
@@ -372,6 +372,7 @@ class _Built:
         self.k1_keys, self.k2_keys = k1_keys, k2_keys
         self.k1_scratch, self.k2_scratch = k1_scratch, k2_scratch
         self.epoch, self.peer = epoch, peer
+        self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
 
     def forward(
         self,
@@ -399,6 +400,11 @@ class _Built:
         m = lm.model
         s = plan.key.rows
         verify = plan.key.forward_mode == "target_verify"
+        fb = (
+            forward_batch
+            if self.check_layers and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
         self.epoch[:1].add_(1)
         h = m.embed_tokens(input_ids)
         residual = None
@@ -406,14 +412,14 @@ class _Built:
         for i in range(m.start_layer, m.end_layer):
             layer = m.layers[i]
             if _is_gdn(layer) and not verify:
-                core, res_attn = self._k1(i, layer, h, residual, idx, s)
+                core, res_attn = self._k1(i, layer, h, residual, idx, s, fb)
             else:
                 if residual is None:
                     res_attn, x = h, layer.input_layernorm(h)
                 else:
                     x, res_attn = layer.input_layernorm(h, residual)
                 core = self._core(layer, positions, x, forward_batch)
-            h, residual = self._k2(i, layer, core, res_attn, s)
+            h, residual = self._k2(i, layer, core, res_attn, s, fb)
         h, _ = m.norm(h, residual)
         return lm.logits_processor(input_ids, h, lm.lm_head, forward_batch, None)
 
@@ -459,11 +465,17 @@ class _Built:
             )
         return conv, temporal
 
-    def _k1(self, i, layer, h, residual, idx, s):
+    def _k1(self, i, layer, h, residual, idx, s, check_batch=None):
+        """``check_batch``: the forward batch in check mode, else None."""
+        from sgl_amd_mono.qwen38_moe import check
         from sgl_amd_mono.qwen38_moe.gfx950 import gdn
 
         a = layer.linear_attn
         conv, temporal = self._state(a)
+        if check_batch is not None:
+            ref = check.k1_reference(
+                layer, h, residual, conv, temporal, idx[:s], check_batch
+            )
         qq = _mxfp4(a.in_proj_qkvz)
         core = torch.empty(s, L.CORE, dtype=h.dtype, device=h.device)
         res_out = torch.empty_like(h)
@@ -488,13 +500,19 @@ class _Built:
             layer=i,
             w_qkvzs=a.in_proj_qkvz.weight_scale if qq else None,
         )
+        if check_batch is not None:
+            got = check.k1_outputs(core, res_out, conv, temporal, idx[:s])
+            check.compare("k1", layer.layer_id, s, ref, got)
         return core, res_out
 
-    def _k2(self, i, layer, core, residual, s):
+    def _k2(self, i, layer, core, residual, s, check_batch=None):
+        from sgl_amd_mono.qwen38_moe import check
         from sgl_amd_mono.qwen38_moe.gfx950 import layer as k2
 
         mlp = layer.mlp
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
+        if check_batch is not None:
+            ref = check.k2_reference(layer, o, core, residual, check_batch)
         oq, fse = _mxfp4(o), _fse(mlp)
         se, ex = mlp.shared_expert, mlp.experts
         out = torch.empty_like(residual)
@@ -522,6 +540,9 @@ class _Built:
             w_sgu=None if se is None else se.gate_up_proj.weight,
             w_sd=None if se is None else se.down_proj.weight,
         )
+        if check_batch is not None:
+            got = {"out": out, "res_out": res_out}
+            check.compare("k2", layer.layer_id, s, ref, got)
         return out, res_out
 
 
