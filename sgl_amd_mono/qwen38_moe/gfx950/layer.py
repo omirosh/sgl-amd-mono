@@ -64,7 +64,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
-from sgl_amd_mono.common import guard
+from sgl_amd_mono.common import gemv, guard
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     CM_NT,
@@ -72,36 +72,32 @@ from sgl_amd_mono.common.ops import (
     bf16_round,
     bf_hi,
     bf_lo,
+    block_excl_scan,
     div_rn,
     hw_exp2,
     hw_rsq,
     ld_i32,
     load_ptr64,
     mfma_bf16,
+    peer_bases,
     row_sum,
     rsrc,
+    sum_partials,
     traced,
     uniform,
+    wave_max,
+    wave_sum,
     xred,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
+    KernelAbi,
     key_tuple,
     pair_layout,
 )
-from sgl_amd_mono.common.sync import Mailbox, preg, sreg
-from sgl_amd_mono.qwen38_moe.gfx950 import _k3 as gemv
-from sgl_amd_mono.qwen38_moe.gfx950._k3 import (
-    KernelAbi,
-    block_excl_scan,
-    peer_bases,
-    shift,
-    sum_partials,
-    wave_max,
-    wave_sum,
-)
+from sgl_amd_mono.common.sync import Mailbox, preg, shift, sreg
 from sgl_amd_mono.qwen38_moe.gfx950 import layout as L
 from sgl_amd_mono.qwen38_moe.gfx950.layout import need
 from sgl_amd_mono.qwen38_moe.gfx950.sources import digest
@@ -1369,7 +1365,9 @@ def build(key: K2Build):
                 peer[region] = [
                     shift(preg(b, off, region), fx.Int64(par) * half) for b in bases
                 ]
-                peer[region + "_own"] = shift(preg(own, off, region), fx.Int64(par) * half)
+                peer[region + "_own"] = shift(
+                    preg(own, off, region), fx.Int64(par) * half
+                )
             c = {
                 "S": s,
                 "tid": tid,
@@ -1458,7 +1456,9 @@ def build(key: K2Build):
             # come in; the fused shared expert's tasks need no route
             is_ps = (bid >= PS0) & (bid < PS0 + UG_GROUPS)
             if const_expr(key.ps):
-                sops = ug_loads(c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True)
+                sops = ug_loads(
+                    c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True
+                )
             wait_x(c, HIDDEN, 0)
             quant_x_fp4(c)
             if const_expr(key.ps):  # noqa: SIM102

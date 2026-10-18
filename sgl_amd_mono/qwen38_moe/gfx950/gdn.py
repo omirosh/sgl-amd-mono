@@ -52,7 +52,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
-from sgl_amd_mono.common import guard
+from sgl_amd_mono.common import gemv, guard
 from sgl_amd_mono.common.ops import (
     bf16_round,
     bf_hi,
@@ -65,16 +65,16 @@ from sgl_amd_mono.common.ops import (
     rsrc,
     traced,
     uniform,
+    wave_sum,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
+    KernelAbi,
     key_tuple,
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
-from sgl_amd_mono.qwen38_moe.gfx950 import _k3 as gemv
-from sgl_amd_mono.qwen38_moe.gfx950._k3 import KernelAbi, wave_sum
 from sgl_amd_mono.qwen38_moe.gfx950 import layout as L
 from sgl_amd_mono.qwen38_moe.gfx950.layer import (
     fp4_gemv,
