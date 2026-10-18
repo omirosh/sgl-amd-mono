@@ -72,7 +72,7 @@ def test_config_reasons(monkeypatch):
     monkeypatch.delenv("SGLANG_ROCM_GDN_ONLINE_MXFP4")
     other = SimpleNamespace(**{**vars(QWEN), "hidden_size": 4096})
     joined = " | ".join(
-        reasons(_cfg(**MTP, speculative_eagle_topk=4), other)
+        reasons(_cfg(**{**MTP, "speculative_eagle_topk": 4}), other)
         + reasons(_cfg(enable_linear_replayssm=True), QWEN)
     )
     for want in ("hidden_size = 8192", "one draft chain", "--enable-linear-replayssm"):
