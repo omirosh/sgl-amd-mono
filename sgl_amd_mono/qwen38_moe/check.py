@@ -96,6 +96,81 @@ def k2_reference(layer, o_proj, core, residual, forward_batch) -> dict:
     return {"out": out.clone(), "res_out": res.clone()}
 
 
+def k2_rows_probe(layer, o_proj, core, residual, ref, out) -> None:
+    """One-off: SGLang's K2 reference on the whole batch against the same
+    reference run one row at a time, and K2 against both. Collective on every
+    rank; logged on TP rank 0."""
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce as ar
+    from sglang.srt.runtime_context import get_parallel
+
+    s = core.shape[0]
+    mlp = layer.mlp
+    a_b = ar(o_proj(core)[0])
+    a_r = torch.cat([ar(o_proj(core[i : i + 1])[0]) for i in range(s)])
+    x_b, _ = layer.post_attention_layernorm(a_b.clone(), residual.clone())
+    x_r = torch.cat(
+        [
+            layer.post_attention_layernorm(
+                a_r[i : i + 1].clone(), residual[i : i + 1].clone()
+            )[0]
+            for i in range(s)
+        ]
+    )
+    m_b = ar(mlp(x_b.clone()))
+    m_b2 = ar(mlp(x_b.clone()))
+    m_bin_r = torch.cat([ar(mlp(x_b[i : i + 1].clone())) for i in range(s)])
+    out_r = torch.cat([ar(mlp(x_r[i : i + 1].clone())) for i in range(s)])
+    try:
+        ids_b = mlp.topk(x_b, mlp.gate(x_b)[0]).topk_ids
+        ids_r = torch.cat(
+            [
+                mlp.topk(x_b[i : i + 1], mlp.gate(x_b[i : i + 1])[0]).topk_ids
+                for i in range(s)
+            ]
+        )
+    except Exception as e:
+        ids_b = ids_r = None
+        ids_err = repr(e)[:120]
+    if get_parallel().tp_rank != 0:
+        return
+
+    def row_cos(a, b):
+        c = F.cosine_similarity(a.float(), b.float(), dim=1)
+        return "[" + " ".join(f"{v:.5f}" for v in c.tolist()) + "]"
+
+    def fmt(a, b):
+        return (
+            " ".join(f"{k}={v:.6g}" for k, v in _metrics(a, b).items())
+            + " rows="
+            + row_cos(a, b)
+        )
+
+    flips = (
+        ids_err
+        if ids_b is None
+        else [
+            i
+            for i in range(s)
+            if set(ids_b[i, :10].tolist()) != set(ids_r[i, :10].tolist())
+        ]
+    )
+    logger.info(
+        "k2 rows probe layer %d (%d rows): k2_vs_ref_b %s | k2_vs_ref_r %s | "
+        "ref_b_vs_ref_r %s | oproj_b_vs_r %s | moe_b_vs_r_same_input %s | "
+        "moe_b_rerun %s | probe_b_vs_ref_b %s | routing_flips %s",
+        layer.layer_id,
+        s,
+        fmt(out, ref["out"]),
+        fmt(out, out_r),
+        fmt(ref["out"], out_r),
+        fmt(a_b, a_r),
+        fmt(m_b, m_bin_r),
+        fmt(m_b, m_b2),
+        fmt(m_b, ref["out"]),
+        flips,
+    )
+
+
 def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> None:
     from sglang.srt.runtime_context import get_parallel
 

@@ -543,6 +543,8 @@ class _Built:
         if check_batch is not None:
             got = {"out": out, "res_out": res_out}
             check.compare("k2", layer.layer_id, s, ref, got)
+            if s > 1:
+                check.k2_rows_probe(layer, o, core, residual, ref, out)
         return out, res_out
 
 
