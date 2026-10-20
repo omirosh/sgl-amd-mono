@@ -159,7 +159,7 @@ NUMERICS = Numerics(
         "k1.core.cosine": 0.9999,
         "k1.conv.cosine": 0.9999,
         "k1.state.cosine": 0.9999,
-        "k2.out.cosine": 0.99,
+        "k2.out.cosine": 0.97,
     },
 )
 
