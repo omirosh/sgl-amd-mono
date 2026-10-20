@@ -181,7 +181,7 @@ def check_batch_invariance():
     conv0, state0 = k1_state(g, slots)
     probe_h, probe_r = rnd(g, 1, HIDDEN, scale=2.0), rnd(g, 1, HIDDEN, scale=2.0)
     ep = epoch(DEV)
-    # one scratch a width, as the spec has (a shared one is the vllm#60397 race)
+    # one scratch a width, as the spec has (widths that share one race in a graph)
     keys = {s: gdn.K1Build(tokens=s) for s in range(1, MAXT + 1)}
     scr = {s: scratch(k) for s, k in keys.items()}
     outs = {}

@@ -42,7 +42,7 @@ on it).
 
 Two variants follow the stock flags:
 
-- ``fse`` (``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``): the shared expert is
+- ``fse`` (a fused shared expert, ``num_fused_shared_experts`` 1): the shared expert is
   expert 512 of w13 / w2, a pick of every token at top-k index 10 with weight
   sigmoid(bf16(x . w_sg)) (fp32, the top-k kernel's fused sigmoid); no sgu
   stage, no shared down rows.
@@ -1576,7 +1576,7 @@ def layer_post(
     w_sd=None,
     gate=None,
 ):
-    """Host launcher; every weight as vLLM holds it after loading, the experts'
+    """Host launcher; every weight as SGLang holds it after loading, the experts'
     shuffled (``layout``). ``w_os``: an fp4 o_proj's scales (``key.oq``);
     ``w_sgu`` / ``w_sd``: the unfused shared expert (not ``key.fse``); ``gate``:
     the attention output gate (``key.og``), core's shape.

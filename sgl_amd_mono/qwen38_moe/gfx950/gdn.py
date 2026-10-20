@@ -32,9 +32,8 @@ gated delta rule, RMSNormGated) where it is elementwise: every conv product
 rounded to bf16 as Triton's bf16 multiply does, the bf16 conv output, the bf16
 core before the gated norm. Split-K reductions differ only in their order.
 
-A row whose state index is <= 0 (vLLM's null block, what the GDN metadata pads
-a decode batch with) writes no state and a zero core row, as stock (its query
-length is 0 there).
+A row whose state index is <= 0 (a pad row: SGLang's decode graphs pad with -1)
+writes no state and a zero core row.
 
 A GDN round is 256 consecutive tasks on distinct CTAs; a task waits only on
 tasks of its own round (a key head's 64 tasks, a head's 8 chunks), so no CTA
@@ -841,7 +840,7 @@ def gdn_pre(
     layer,
     w_qkvzs=None,
 ):
-    """Host launcher; every weight as vLLM holds it after loading (``w_qkvzs``:
+    """Host launcher; every weight as SGLang holds it after loading (``w_qkvzs``:
     an fp4 in_proj_qkvz's scales, ``key.qq``). ``residual``
     None on the first layer (``key.first``). ``conv_state`` [slots, dim, 3] or a
     transposed view of [slots, 3, dim] (strides read); ``rstate`` [slots, 16,

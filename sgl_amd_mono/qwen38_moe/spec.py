@@ -150,9 +150,9 @@ SGLANG_READS = {
 }
 
 # K1 and K2 against SGLang's layer on the same input and state (check.py,
-# SGLANG_AMD_MONO_CHECK; the bounds of vLLM's Qwen3.8 mono tests). The kernels
-# quantize the expert inputs to MXFP8 and SGLang's AITER MoE its own way, so the
-# layer output differs by about the MoE's error.
+# SGLANG_AMD_MONO_CHECK). K2 quantizes the expert inputs to MXFP4 as SGLang's
+# AITER MoE does but sums in another order, so the layer output differs by about
+# the MoE's rounding error.
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
