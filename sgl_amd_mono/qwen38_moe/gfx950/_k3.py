@@ -19,6 +19,7 @@ bodies equal #43481's. This module goes away once these names land in
 import inspect
 from dataclasses import dataclass
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
@@ -33,7 +34,6 @@ from sgl_amd_mono.common.ops import (
     mfma_bf16,
     permlane_swap,
     rsrc,
-    traced,
     xshfl,
 )
 from sgl_amd_mono.common.plan import THREADS, WAVES
@@ -69,7 +69,7 @@ def wave_incl_scan(v, lane):
     return v
 
 
-@traced
+@flyc.jit
 def block_excl_scan(v, lane, wave, buf):
     """(exclusive prefix of v over the CTA in thread order, CTA total); ``buf``
     needs WAVES words."""
@@ -240,7 +240,7 @@ def const_live(per, n):
     return per * WAVES != n
 
 
-@traced
+@flyc.jit
 def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
     """Columns k0 .. k0 + k of token rows 0 .. s - 1 of the bf16 [s, ldk] at
     ``src`` -> LDS (``xrow`` a row), 16 B a lane."""

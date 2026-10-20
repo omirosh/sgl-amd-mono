@@ -80,7 +80,6 @@ from sgl_amd_mono.common.ops import (
     mfma_bf16,
     row_sum,
     rsrc,
-    traced,
     uniform,
     xred,
 )
@@ -88,11 +87,13 @@ from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
+    kernel_sources,
     key_tuple,
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.qwen38_moe.gfx950 import _k3 as gemv
+from sgl_amd_mono.qwen38_moe.gfx950 import layout as L
 from sgl_amd_mono.qwen38_moe.gfx950._k3 import (
     KernelAbi,
     block_excl_scan,
@@ -102,9 +103,9 @@ from sgl_amd_mono.qwen38_moe.gfx950._k3 import (
     wave_max,
     wave_sum,
 )
-from sgl_amd_mono.qwen38_moe.gfx950 import layout as L
 from sgl_amd_mono.qwen38_moe.gfx950.layout import need
-from sgl_amd_mono.qwen38_moe.gfx950.sources import digest
+
+SOURCES = kernel_sources(__name__)
 
 TP, HIDDEN, ROWS = L.TP, L.HIDDEN, L.ROWS
 E, TOPK, RI, SI, EPR = L.E, L.TOPK, L.RI, L.SI, L.EPR
@@ -403,7 +404,7 @@ def fp4_gemv(lane, wave, xl, xrow, k, s, rg, ops):
 
 
 # ---------------------------------------------------------------- o_proj
-@traced
+@flyc.jit
 def stage_o(c, rg, ops):
     """Rows 16 rg ..: GEMV of the LDS core rows -> bf16 partials -> every rank's
     AR region, this rank's slot (thread: token, row pair)."""
@@ -435,7 +436,7 @@ def o_loads(c, j):
     return gemv.loads(lane, wave, a["w_o"], rg * ROWS, OK)
 
 
-@traced
+@flyc.jit
 def gated_rows_to_lds(c, core, gate):
     """``og``: bf16(core x sigmoid(gate)) (fp32 math, as the compiled
     ``o * torch.sigmoid(gate)``) -> the o_proj input rows in LDS."""
@@ -463,7 +464,7 @@ def gated_rows_to_lds(c, core, gate):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def run_oproj(c, oops):
     """This CTA's o_proj tasks (bid, bid + 256) on the core rows (plain loads:
     the previous launch wrote them), their weights ``oops`` already in flight."""
@@ -479,7 +480,7 @@ def run_oproj(c, oops):
 
 
 # ---------------------------------------------------------------- norm
-@traced
+@flyc.jit
 def stage_norm(c, j):
     """Columns 128 j ..: the AR sum (rank order, fp32 -> bf16) + residual (fp32;
     bf16 -> ``res_out``); the bf16 AR sums -> the x buffer, the columns' sums
@@ -521,7 +522,7 @@ def stage_norm(c, j):
         c["put"](c["msq"], j * s + t, sq)
 
 
-@traced
+@flyc.jit
 def load_rstd(c):
     """Every norm task's sums of squares -> each token's rstd -> LDS ``rs``
     (fp32 sum in task order). A wave waits on the last token's first: the
@@ -544,7 +545,7 @@ def load_rstd(c):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def x_rows_to_lds(c, klen, k0):
     """The x columns k0 .. k0 + klen = bf16((AR sum + residual) rstd (1 + w)) ->
     LDS, 8 columns a lane. The norm reads the unrounded sum, as
@@ -581,14 +582,14 @@ def x_rows_to_lds(c, klen, k0):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def wait_x(c, klen, k0):
     """Every norm task's sums in -> x columns k0 .. k0 + klen into LDS."""
     load_rstd(c)
     x_rows_to_lds(c, klen, k0)
 
 
-@traced
+@flyc.jit
 def quant_x(c, k=HIDDEN):
     """The rows of K ``k`` in LDS through MXFP4 in place, 1 x 32 blocks (RCEIL
     scale), 8 elements a lane (a block on 4 adjacent lanes: one 16 B LDS access
@@ -643,7 +644,7 @@ def xq_scales(s):
     return s * XQ_ROW // 4
 
 
-@traced
+@flyc.jit
 def quant_x_fp4(c):
     """The x rows in LDS (bf16, K ``HIDDEN``) -> MXFP4 codes over them,
     ``quant_x``'s arithmetic and lanes: token t's block b at byte t ``XQ_ROW`` +
@@ -700,7 +701,7 @@ def router_loads(c, i, q):
     )
 
 
-@traced
+@flyc.jit
 def stage_router(c, i, q, ops):
     """Router task (i, q): this rank's experts 16 i .., K quarter q. Parts
     q > 0 publish fp32 partials; part 0 adds them in part order, rounds to bf16
@@ -740,7 +741,7 @@ def stage_router(c, i, q, ops):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_sgu(c, g, ops):
     """Shared gate | up rows 16 g .. (gate 0 .. SI, up SI .. 2 SI) -> bf16 SGU."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
@@ -758,7 +759,7 @@ def stage_sgu(c, g, ops):
 
 
 # ---------------------------------------------------------------- route
-@traced
+@flyc.jit
 def stage_sgate(c, t):
     """Token t's shared-expert gate: sigmoid(bf16(x . w_sg)) as bf16 -> SGATE
     (ReplicatedLinear then torch.sigmoid, both bf16 out); fused (``fse``), the
@@ -846,7 +847,7 @@ def _route_mp(c, lgs):
     return fx.min(lane, TOPK - 1), fx.min(fx.max(e, 0), fx.Int32(E - 1)), mex * inv
 
 
-@traced
+@flyc.jit
 def route_token(c, t):
     """Token t on this wave: the 512 bf16 logits (packed pairs), 8 a lane (expert
     lane + 64 i; a NaN logit, a warmup's garbage row, ranks last) -> the top-10
@@ -875,7 +876,7 @@ def put_route(c, t, rank, e, w):
     c["put"](c["route"], t * 2 * TOPK + TOPK + rank, w)
 
 
-@traced
+@flyc.jit
 def local_route(c):
     """Every CTA routes its tokens itself, wave t token t, into its LDS route
     (``load_route``'s layout; ``load_route``'s barrier follows); CTA RT0 also
@@ -895,7 +896,7 @@ def local_route(c):
                 put_route(c, wave, rank, e, w)
 
 
-@traced
+@flyc.jit
 def load_route(c):
     """The LDS route (ids, weights; a token's ``KT`` picks) -> the union U in
     expert order: flag[e] -> slot, expert[slot], kof[slot][t] (the token's pick
@@ -998,7 +999,7 @@ def ug_loads(c, task, live, shared=False):
     return tiles + words
 
 
-@traced
+@flyc.jit
 def stage_ug(c, task, ops, shared=False):
     """Slot task / 16, columns 16 (task % 16) ..: the gate and up rows against
     the x rows' MXFP4 codes in LDS (``ops``: ``ug_loads``); silu(g) u -> fp32 ->
@@ -1052,7 +1053,7 @@ def stage_ug(c, task, ops, shared=False):
 
 
 # ---------------------------------------------------------------- down
-@traced
+@flyc.jit
 def load_inter(c, nu):
     """Every pick's INTER (fp32) through MXFP4 by 32 columns (RCEIL scale, the
     block's 16 column pairs on 16 lanes of a row), as the stock decode kernel
@@ -1086,7 +1087,7 @@ def load_inter(c, nu):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def load_h(c):
     """SGU -> h = bf16(silu(g) u) (SiluAndMul on bf16) -> LDS rows of SI."""
     s, tid = c["S"], c["tid"]
@@ -1141,7 +1142,7 @@ def down_loads(c, rgd, nu, b0):
     return tiles + words
 
 
-@traced
+@flyc.jit
 def stage_down(c, rgd, nu, ops0, rgd_next=None):
     """Hidden rows 16 rgd ..: every slot's w2 against its picks' INTER (wave w
     the slots w, w + 8, ...; a batch in flight under the last one's MFMAs)
@@ -1241,7 +1242,7 @@ def stage_down(c, rgd, nu, ops0, rgd_next=None):
 
 
 # ---------------------------------------------------------------- final
-@traced
+@flyc.jit
 def stage_final(c, j):
     """Columns 128 j ..: FINAL in rank order -> bf16 out."""
     s, tid = c["S"], c["tid"]
@@ -1309,7 +1310,7 @@ def build(key: K2Build):
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         rs: fx.Array[fx.Float32, 16, 16]
 
-    keyed = key_tuple(key, digest())
+    keyed = key_tuple(key, SOURCES)
     name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_o{int(key.oq)}_a{int(key.og)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1369,7 +1370,9 @@ def build(key: K2Build):
                 peer[region] = [
                     shift(preg(b, off, region), fx.Int64(par) * half) for b in bases
                 ]
-                peer[region + "_own"] = shift(preg(own, off, region), fx.Int64(par) * half)
+                peer[region + "_own"] = shift(
+                    preg(own, off, region), fx.Int64(par) * half
+                )
             c = {
                 "S": s,
                 "tid": tid,
@@ -1458,7 +1461,9 @@ def build(key: K2Build):
             # come in; the fused shared expert's tasks need no route
             is_ps = (bid >= PS0) & (bid < PS0 + UG_GROUPS)
             if const_expr(key.ps):
-                sops = ug_loads(c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True)
+                sops = ug_loads(
+                    c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True
+                )
             wait_x(c, HIDDEN, 0)
             quant_x_fp4(c)
             if const_expr(key.ps):  # noqa: SIM102

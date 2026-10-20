@@ -63,26 +63,27 @@ from sgl_amd_mono.common.ops import (
     ld_i32,
     row_sum,
     rsrc,
-    traced,
     uniform,
 )
 from sgl_amd_mono.common.plan import (
     BLOCKS,
     THREADS,
+    kernel_sources,
     key_tuple,
     pair_layout,
 )
 from sgl_amd_mono.common.sync import Mailbox, sreg
 from sgl_amd_mono.qwen38_moe.gfx950 import _k3 as gemv
-from sgl_amd_mono.qwen38_moe.gfx950._k3 import KernelAbi, wave_sum
 from sgl_amd_mono.qwen38_moe.gfx950 import layout as L
+from sgl_amd_mono.qwen38_moe.gfx950._k3 import KernelAbi, wave_sum
 from sgl_amd_mono.qwen38_moe.gfx950.layer import (
     fp4_gemv,
     fp4_gemv_loads,
     quant_x,
 )
 from sgl_amd_mono.qwen38_moe.gfx950.layout import need
-from sgl_amd_mono.qwen38_moe.gfx950.sources import digest
+
+SOURCES = kernel_sources(__name__)
 
 HIDDEN, ROWS, HD = L.HIDDEN, L.ROWS, L.HD
 NK, NV, KEY = L.NK, L.NV, L.KEY
@@ -233,7 +234,7 @@ def pack_bf(v0, v1):
 
 
 # ---------------------------------------------------------------- front
-@traced
+@flyc.jit
 def stage_front(c, j):
     """Columns 128 j ..: hidden + residual (fp32; bf16 -> ``res_out``); the
     columns' sums of squares -> MSQ (the in_proj CTAs build x: ``local_x``)."""
@@ -274,7 +275,7 @@ def qkvz_fp4_loads(c, rg):
     return fp4_gemv_loads(c["lane"], c["wave"], a["w_qkvz"], a["w_qkvzs"], rg, HIDDEN)
 
 
-@traced
+@flyc.jit
 def local_x(c):
     """Every front task's sums of squares -> each token's rstd (fp32 sum in task
     order) -> x = bf16((hidden + residual) rstd (1 + w)) rows into LDS, 8
@@ -336,7 +337,7 @@ def ba_loads(c, i):
     )
 
 
-@traced
+@flyc.jit
 def stage_ba(c, i, ops):
     """in_proj_ba part i on the unquantized x rows -> fp32 BAPART."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
@@ -352,7 +353,7 @@ def stage_ba(c, i, ops):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_proj(c, rg, ops, fp4=False):
     """Rows 16 rg .. of [in_proj_qkvz; in_proj_ba] -> bf16 PROJ (``fp4``: an
     in_proj_qkvz task on the quantized rows)."""
@@ -415,7 +416,7 @@ def gdn_stage(c, t, h, ch):
     return k
 
 
-@traced
+@flyc.jit
 def gdn_conv(c, k, t, h, ch):
     """The owned channels' conv update: the window shifted (in place), the
     width-4 conv (each product rounded to bf16, fp32 sum), SiLU -> bf16; q / k
@@ -447,7 +448,7 @@ def gdn_conv(c, k, t, h, ch):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def gdn_gates(c, k, t, h):
     """The key head's q and k (QK) l2-normed (q scaled by HD^-1/2); the head's
     decay exp(-exp(A_log) softplus(a + dt_bias)) and beta = sigmoid(b)."""
@@ -498,7 +499,7 @@ def gdn_gates(c, k, t, h):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def gdn_recur(c, k, t, h, ch):
     """State rows 16 ch .. of head h, one token: decay, the delta rule, the new
     state (in place), o = bf16(h q) -> LDS ``ol``, the chunk's sum of squares
@@ -536,7 +537,7 @@ def gdn_recur(c, k, t, h, ch):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def gdn_norm(c, k, t, h, ch):
     """Rows 16 ch ..: RMSNormGated over the head's 128 (every chunk's partial):
     bf16(o rstd w silu(z)) -> ``core``."""
@@ -578,7 +579,7 @@ def gdn_round(c, r):
     return cr, task < n, tc // GTASKS, (tc // NVCH) % NV, tc % NVCH
 
 
-@traced
+@flyc.jit
 def gdn_tasks(c):
     """This CTA's GDN tasks phase by phase: a task waits only on earlier phases
     of other CTAs' tasks, and every CTA finishes a phase's work before it
@@ -631,7 +632,7 @@ def build(key: K1Build):
         red: fx.Array[fx.Float32, THREADS * 4, 16]
         rs: fx.Array[fx.Float32, 16, 16]
 
-    keyed = key_tuple(key, digest())
+    keyed = key_tuple(key, SOURCES)
     name = (
         f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}_q{int(key.qq)}"
     )
