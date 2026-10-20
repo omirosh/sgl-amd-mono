@@ -171,7 +171,8 @@ class TestMonokernelFault(CustomTestCase):
         ):
             # a GPU fault aborts each rank; with core dumps on, the ranks stay
             # alive for minutes while they dump
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+            resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_FAULT_INJECT": "1:1:100"},
                 extra_args=["--watchdog-timeout", "20"],

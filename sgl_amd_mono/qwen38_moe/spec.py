@@ -80,12 +80,25 @@ SGLANG_READS = {
         "forward_metadata",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
+    "kernels/ops/attention/fla/layernorm_gated.py": (
+        "eps",
+        "group_size",
+        "norm_before_gate",
+        "activation",
+    ),
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/mem_cache/memory_pool.py": (
         "mamba2_layer_cache",
         "conv",
         "temporal",
         "replayssm_d",
+    ),
+    "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
+        "is_shuffled",
+        '"w13_weight"',
+        '"w2_weight"',
+        '"w13_weight_scale"',
+        '"w2_weight_scale"',
     ),
     "srt/model_executor/forward_batch_info.py": ("mrope_positions",),
     "srt/model_executor/forward_context.py": (
@@ -288,7 +301,7 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
         o = layer.o_proj
         if not layer.attn_output_gate or layer.q_size != L.CORE:
             reasons.append("needs the gated attention output with one rank's heads")
-        if _mxfp4(o):
+        if not _bf16(o.weight):
             reasons.append("needs o_proj in bf16")
         layer_eps = (layer.input_layernorm.variance_epsilon, None)
     if not _mxfp4(o) and tuple(o.weight.shape) != (L.HIDDEN, L.CORE):
@@ -316,8 +329,6 @@ def _layers(model) -> list:
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     reasons = []
-    if model.model.layers_to_capture:
-        reasons.append("auxiliary hidden states: the launches keep none")
     layers = _layers(model)
     eps = _eps(layers)
     pending = []
@@ -385,7 +396,14 @@ class _Built:
         **kwargs,
     ):
         lm = self.lm
-        if input_embeds is not None or pp_proxy_tensors is not None or kwargs:
+        # SGLang sets layers_to_capture (EAGLE3 / DFlash targets) after the build,
+        # and the launches keep no auxiliary hidden states
+        if (
+            input_embeds is not None
+            or pp_proxy_tensors is not None
+            or kwargs
+            or lm.model.layers_to_capture
+        ):
             return type(lm).forward(
                 lm,
                 input_ids,

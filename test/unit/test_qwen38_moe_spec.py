@@ -178,6 +178,24 @@ def test_model_reasons_name_the_layer():
     layers[1] = _layer(1, eps=1e-5)
     layers[2].linear_attn.A_log = _meta(16)
     layers[3].mlp.experts.w13_weight.is_shuffled = False
+    layers[7].o_proj = _w(8192, 2048, dtype=torch.float8_e4m3fn)
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    assert [r.split(":")[0] for r in reasons] == ["layer 1", "layer 2", "layer 3"]
+    assert [r.split(":")[0] for r in reasons] == [
+        "layer 1",
+        "layer 2",
+        "layer 3",
+        "layer 7",
+    ]
     assert "eps" in reasons[0] and "A_log" in reasons[1] and "shuffled" in reasons[2]
+    assert "o_proj in bf16" in reasons[3]
+
+
+def test_aux_hidden_states_run_sglangs_forward():
+    class LM:
+        def forward(self, *args):
+            return "sglang"
+
+    built = qwen._Built.__new__(qwen._Built)
+    built.lm = LM()
+    built.lm.model = SimpleNamespace(layers_to_capture=[2])
+    assert built.forward(None, None, None, None) == "sglang"
