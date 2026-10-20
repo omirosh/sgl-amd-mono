@@ -2,16 +2,24 @@
 and widths, and its config and model refusal reasons. The fused shared expert and
 MXFP4 GDN projections refuse at startup with the SGLang PR each needs."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.monokernels import spec as registry
 
 import sgl_amd_mono
 from sgl_amd_mono.qwen38_moe import HF_CONFIG
 from sgl_amd_mono.qwen38_moe import spec as qwen
+
+try:
+    from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
+except RuntimeError:  # the module needs a GPU at import; the spec checks only the class
+    Qwen2MoeSparseMoeBlock = type("Qwen2MoeSparseMoeBlock", (torch.nn.Module,), {})
+    sys.modules["sglang.srt.models.qwen2_moe"] = SimpleNamespace(
+        Qwen2MoeSparseMoeBlock=Qwen2MoeSparseMoeBlock
+    )
 
 QWEN = SimpleNamespace(**HF_CONFIG, num_hidden_layers=8)
 
