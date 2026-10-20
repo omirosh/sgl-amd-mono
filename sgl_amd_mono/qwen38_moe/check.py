@@ -6,7 +6,9 @@ code runs on the launch's input, and the launch's outputs are checked against it
   they were (restored after): the core, the residual, and the conv and SSM state
   rows of the step's requests.
 - K2: SGLang's o_proj, TP reduce, post-attention norm and MoE block with its TP
-  reduce, on K2's own input: the layer output and the residual.
+  reduce, on K2's own input: the layer output and the residual. The MoE block
+  runs one row at a time: in a batch of 8, SGLang's router picks other experts
+  for some rows than for the same row alone.
 
 Each value is checked against its ``spec.NUMERICS`` bound on TP rank 0. Every
 check is logged; a miss is logged as a violation."""
@@ -92,7 +94,12 @@ def k2_reference(layer, o_proj, core, residual, forward_batch) -> dict:
     a, _ = o_proj(core)
     a = tensor_model_parallel_all_reduce(a)
     x, res = layer.post_attention_layernorm(a, residual.clone())
-    out = tensor_model_parallel_all_reduce(layer.mlp(x, forward_batch))
+    out = torch.cat(
+        [
+            tensor_model_parallel_all_reduce(layer.mlp(x[i : i + 1], forward_batch))
+            for i in range(x.shape[0])
+        ]
+    )
     return {"out": out.clone(), "res_out": res.clone()}
 
 
