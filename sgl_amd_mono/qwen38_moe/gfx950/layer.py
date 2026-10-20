@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm#60833 at 3346929b27 (Apache-2.0), by way of
+# sgl-project/sglang#43516: vllm/models/qwen3_5/amd/mono/layer.py
 """K2 ``layer_post``: one Qwen3.8 decoder layer from the attention's core
 output (the out_proj / o_proj input, the same shape on GDN and full-attention
 layers) to the layer's MoE output, every TP reduction inside the kernel.
 
-One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode rows:
+One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode or verify rows:
 
     o_proj   (512 x 16 rows, K 2048 a rank; every CTA, tasks bid, bid + 256):
              bf16 GEMV of the core rows -> bf16 partial -> every rank's AR

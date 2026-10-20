@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm#60833 at 3346929b27 (Apache-2.0), by way of
+# sgl-project/sglang#43516: vllm/models/qwen3_5/amd/mono/gdn.py
 """K1 ``gdn_pre``: one Qwen3.8 GDN (linear-attention) layer of a decode step from
 the layer's input to the gated core output (the out_proj input, K2's), S <= 8
 rows, one token a request.
@@ -27,8 +29,8 @@ in_proj_ba stays bf16 on the unquantized rows, as 16 tasks (2 row groups x 8
 K parts) on CTAs 0 .. 15 whose weights go out at the start; the gates sum the
 parts.
 
-Rounding follows the stock decode path (AITER's Triton conv update and fused
-gated delta rule, RMSNormGated) where it is elementwise: every conv product
+Rounding follows SGLang's decode path (the Triton conv update, the fused gated
+delta rule, RMSNormGated) where it is elementwise: every conv product
 rounded to bf16 as Triton's bf16 multiply does, the bf16 conv output, the bf16
 core before the gated norm. Split-K reductions differ only in their order.
 
@@ -845,8 +847,9 @@ def gdn_pre(
     None on the first layer (``key.first``). ``conv_state`` [slots, dim, 3] or a
     transposed view of [slots, 3, dim] (strides read); ``rstate`` [slots, 16,
     128, 128] fp32 (bf16 with ``key.state_bf16``), a slot dense, slots strided;
-    ``st_idx`` [>= S] int32, <= 0 a pad row; ``epoch`` a device int32 bumped
-    once a step, ``layer`` this launch's slot below ``TAG_SLOTS``."""
+    ``st_idx`` [>= S] int32, <= 0 a pad row; ``epoch`` the ``common/guard.py``
+    block (word 0 the step epoch, bumped once a step), ``layer`` this launch's
+    slot below ``TAG_SLOTS``."""
     s = key.tokens
     bf = torch.bfloat16
     need((residual is None) == key.first, "residual given iff not the first layer")

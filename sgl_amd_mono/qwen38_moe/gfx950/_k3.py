@@ -11,9 +11,10 @@ sgl-project/sglang#43481 (``kernels/ops/moe/k3_mono_flydsl`` at 1ebfeb251c):
 (``KernelAbi``), ``common/sync.py`` (``shift``), ``common/ranks.py`` and
 ``stages/gemv.py`` (the bf16 GEMV stage, imported as ``gemv``).
 
-Every other name the kernels use comes from ``sgl_amd_mono.common``, whose
-bodies equal #43481's. This module goes away once these names land in
-``common`` (one PR for the Kimi-K3, Qwen3.8 MoE and Qwen3.8 dense specs).
+Every other name the kernels use comes from ``sgl_amd_mono.common``: #43481's,
+except that every wait runs under ``common/guard.py`` and ``Mailbox`` stores the
+tag as given (#43481 stores tag + 1). This module goes away once these names
+land in ``common`` (sgl-project/sgl-amd-mono#13).
 """
 
 import inspect

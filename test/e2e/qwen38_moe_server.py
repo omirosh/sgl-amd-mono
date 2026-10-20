@@ -12,8 +12,8 @@ ENV = {
     "ROCM_QUICK_REDUCE_QUANTIZATION": "INT4",
     "SAFETENSORS_FAST_GPU": "1",
 }
-# The plugin A/B's server, without NEXTN. Without --monokernel-backend, so a test
-# can launch the normal path too.
+# The benchmark server of the PR, with up to 16 running requests and graphs to 16.
+# Without --monokernel-backend, so a test can launch the normal path too.
 ARGS = [
     "--trust-remote-code",
     "--tp-size",
@@ -40,7 +40,7 @@ ARGS = [
     "--reasoning-parser",
     "qwen3",
 ]
-# The A/B's NEXTN: verify steps of up to 2 requests (8 rows) run K2
+# NEXTN as benchmarked: verify steps of up to 2 requests (8 rows) run K2
 NEXTN = [
     "--speculative-algorithm",
     "NEXTN",

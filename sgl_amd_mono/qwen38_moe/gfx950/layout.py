@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from vllm-project/vllm#60833 at 3346929b27 (Apache-2.0), by way of
+# sgl-project/sglang#43516: vllm/models/qwen3_5/amd/mono/layout.py
 """Qwen3.8-2.4T at TP8: the shapes the mono kernels are built for and the
 addresses of the weights they read in place.
 
