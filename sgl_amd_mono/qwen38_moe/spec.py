@@ -150,16 +150,23 @@ SGLANG_READS = {
 }
 
 # K1 and K2 against SGLang's layer on the same input and state (check.py,
-# SGLANG_AMD_MONO_CHECK; the bounds of vLLM's Qwen3.8 mono tests). The kernels
-# quantize the expert inputs to MXFP8 and SGLang's AITER MoE its own way, so the
-# layer output differs by about the MoE's error.
+# SGLANG_AMD_MONO_CHECK). The kernels quantize the expert inputs to MXFP8 and
+# SGLang's AITER MoE its own way, so the layer output differs by about the MoE's
+# error. Each bound is twice the worst gap at 1, 3 and 8 rows on MI355X, rounded
+# out; a gap of 0 stays 0.
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
-        "k1.core.cosine": 0.9999,
-        "k1.conv.cosine": 0.9999,
-        "k1.state.cosine": 0.9999,
-        "k2.out.cosine": 0.99,
+        "k1.core.cosine": 0.99997,
+        "k1.core.rel": 0.015,
+        "k1.res_out.rel": 0.0,
+        "k1.conv.cosine": 0.99999,
+        "k1.conv.rel": 0.002,
+        "k1.state.cosine": 0.99998,
+        "k1.state.rel": 0.015,
+        "k2.out.cosine": 0.999,
+        "k2.out.rel": 0.06,
+        "k2.res_out.rel": 0.0005,
     },
 )
 
