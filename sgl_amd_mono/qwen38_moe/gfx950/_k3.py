@@ -4,17 +4,20 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc.:
 # atom/mono/device/ops.py, atom/mono/device/sync.py, atom/mono/device/ranks.py,
 # atom/mono/runtime/abi.py
-"""The Kimi-K3 mono framework names the Qwen3.8 kernels use that
-``sgl_amd_mono.common`` does not have yet, copied unchanged from
-sgl-project/sglang#43481 (``kernels/ops/moe/k3_mono_flydsl`` at 1ebfeb251c):
+"""The Kimi-K3 mono framework names the Qwen3.8 kernels use, copied unchanged
+from sgl-project/sglang#43481 (``kernels/ops/moe/k3_mono_flydsl`` at 1ebfeb251c):
 ``common/ops.py`` (wave reductions, the CTA scan), ``common/plan.py``
 (``KernelAbi``), ``common/sync.py`` (``shift``), ``common/ranks.py`` and
 ``stages/gemv.py`` (the bf16 GEMV stage, imported as ``gemv``).
 
+``sgl_amd_mono.common`` has ``peer_bases`` and ``sum_partials`` with the same
+bodies, and a ``wave_max`` with another body. sgl-project/sgl-amd-mono#13 adds
+``wave_sum``, the scan, ``shift`` and ``KernelAbi`` to ``common``, and keeps the
+GEMV stage in ``kimi_k3``.
+
 Every other name the kernels use comes from ``sgl_amd_mono.common``: #43481's,
 except that every wait runs under ``common/guard.py`` and ``Mailbox`` stores the
-tag as given (#43481 stores tag + 1). This module goes away once these names
-land in ``common`` (sgl-project/sgl-amd-mono#13).
+tag as given (#43481 stores tag + 1).
 """
 
 import inspect
