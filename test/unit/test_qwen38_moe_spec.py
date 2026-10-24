@@ -1,6 +1,6 @@
 """The Qwen3.8 MoE gfx950 monokernel spec on CPU (RFC #43949): its registry entry
-and widths, and its config and model refusal reasons. The fused shared expert and
-MXFP4 GDN projections refuse at startup with the SGLang PR each needs."""
+and widths, and its config and model refusal reasons. The fused shared expert
+refuses at startup with the SGLang PR it needs. MXFP4 GDN projections run."""
 
 import sys
 from types import SimpleNamespace
@@ -63,7 +63,7 @@ MTP = {
 def test_config_reasons(monkeypatch):
     import sglang.srt.configs.mamba_utils as mamba_utils
 
-    monkeypatch.delenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", raising=False)
+    monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
     monkeypatch.setattr(
         mamba_utils,
         "mamba2_state_dtype",
@@ -74,10 +74,6 @@ def test_config_reasons(monkeypatch):
     assert reasons(_cfg(**MTP, enable_linear_replayssm=True), QWEN) == []
     assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == [qwen.PENDING_FSE]
     assert "sglang#41899" in qwen.PENDING_FSE
-    monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
-    assert reasons(_cfg(), QWEN) == [qwen.PENDING_MXFP4]
-    assert "sglang#43839" in qwen.PENDING_MXFP4
-    monkeypatch.delenv("SGLANG_ROCM_GDN_ONLINE_MXFP4")
     other = SimpleNamespace(**{**vars(QWEN), "hidden_size": 4096})
     joined = " | ".join(
         reasons(_cfg(**{**MTP, "speculative_eagle_topk": 4}), other)
@@ -127,15 +123,19 @@ def _layer(i, gdn=True, fse=False, mxfp4=False, eps=1e-6):
     if not gdn:
         layer.o_proj, layer.attn_output_gate, layer.q_size = _w(8192, 2048), True, 2048
         return layer
-    out = _w(8192, 2048)
+    out, qkvz = _w(8192, 2048), _w(4608, 8192)
     if mxfp4:
         out = SimpleNamespace(
             weight=_meta(8192, 1024, dtype=torch.uint8),
             weight_scale=_meta(8192, 64, dtype=torch.uint8),
         )
+        qkvz = SimpleNamespace(
+            weight=_meta(4608, 4096, dtype=torch.uint8),
+            weight_scale=_meta(4608, 256, dtype=torch.uint8),
+        )
     layer.linear_attn = SimpleNamespace(
         layer_id=i,
-        in_proj_qkvz=_w(4608, 8192),
+        in_proj_qkvz=qkvz,
         in_proj_ba=_w(32, 8192),
         conv1d=SimpleNamespace(weight=_meta(2560, 1, 4), bias=None),
         A_log=_meta(16, dtype=torch.float32),
@@ -165,12 +165,9 @@ def test_model_reasons(kw):
     # Qwen3.8's pattern: three GDN layers, then a full-attention layer
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    want = {
-        "fse": [qwen.PENDING_FSE],
-        "mxfp4": [qwen.PENDING_MXFP4],
-    }
-    # each pending variant refuses once, not once a layer
-    assert reasons == want.get(next(iter(kw), None), []), reasons
+    # the fused shared expert refuses once, not once a layer; MXFP4 GDN runs
+    want = [qwen.PENDING_FSE] if kw.get("fse") else []
+    assert reasons == want, reasons
 
 
 def test_model_reasons_name_the_layer():

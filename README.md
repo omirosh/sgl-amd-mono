@@ -35,7 +35,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - ROCm with FlyDSL and AITER, as included in SGLang's ROCm images
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--monokernel-backend amd` refuses MiniMax-M3 and names them.
-- Qwen3.8 MoE refuses the fused shared expert (`--enforce-shared-experts-fusion`) until [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899) merges, and the MXFP4 GDN projections until [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839) merges.
+- Qwen3.8 MoE refuses the fused shared expert (`--enforce-shared-experts-fusion`) until [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899) merges. It runs the MXFP4 GDN projections of [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839).
 
 ### Installation
 
