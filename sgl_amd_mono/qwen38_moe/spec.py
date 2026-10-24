@@ -19,8 +19,8 @@ layers.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sglang#43839) run K1
-``qq`` and K2 ``oq``. The kernels also have the fused shared expert (K2
-``fse``). Until SGLang serves it (sglang#41899), the spec refuses it at startup.
+``qq`` and K2 ``oq``. The fused shared expert (``--enforce-shared-experts-fusion``,
+MXFP4 with sglang#41899) runs K2 ``fse``: the shared expert is routed expert 512.
 """
 
 from __future__ import annotations
@@ -54,17 +54,10 @@ WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
 
-# Refused until SGLang serves the variant; each names the PR that does
-PENDING_FSE = (
-    "the fused shared expert is not supported yet: it needs sglang#41899; "
-    "start without --enforce-shared-experts-fusion"
-)
-
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "enable_linear_replayssm",
-        "enforce_shared_experts_fusion",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
@@ -228,8 +221,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"--speculative-num-steps + 1, got topk {topk}, {tokens} tokens, "
                 f"{steps} steps"
             )
-    if cfg.enforce_shared_experts_fusion:
-        reasons.append(PENDING_FSE)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -247,20 +238,18 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
     if not isinstance(mlp, Qwen2MoeSparseMoeBlock):
         return [f"needs the sparse MoE block, got {type(mlp).__name__}"]
     reasons = []
-    pending = _fse(mlp) or mlp.shared_expert is None
-    if pending:
-        reasons.append(PENDING_FSE)
-    else:
-        se = mlp.shared_expert
-        if not _bf16(se.gate_up_proj.weight, se.down_proj.weight):
-            reasons.append("needs the shared expert in bf16")
+    se = mlp.shared_expert
+    if se is None and not _fse(mlp):
+        reasons.append("needs the shared expert")
+    elif se is not None and not _bf16(se.gate_up_proj.weight, se.down_proj.weight):
+        reasons.append("needs the shared expert in bf16")
     ex = mlp.experts
     e = L.E + _fse(mlp)
     if not getattr(ex.w13_weight, "is_shuffled", False):
         reasons.append("needs the routed experts in AITER's shuffled layout")
     if ex.w13_weight.dtype != torch.uint8 or ex.w2_weight.dtype != torch.uint8:
         reasons.append("needs MXFP4 routed experts")
-    if not pending and tuple(ex.w13_weight.shape) != (e, 2 * L.RI, L.HIDDEN // 2):
+    if tuple(ex.w13_weight.shape) != (e, 2 * L.RI, L.HIDDEN // 2):
         reasons.append(
             f"routed w13 shape {tuple(ex.w13_weight.shape)}: the kernels take the "
             f"experts TP-sharded, unpadded"
@@ -320,17 +309,13 @@ def _layers(model) -> list:
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    reasons = []
     layers = _layers(model)
     eps = _eps(layers)
-    pending = []
-    for layer in layers:
-        for why in _layer_reasons(layer, eps):
-            if why == PENDING_FSE:
-                pending.append(why)
-            else:
-                reasons.append(f"layer {layer.layer_id}: {why}")
-    return list(dict.fromkeys(pending)) + reasons
+    return [
+        f"layer {layer.layer_id}: {why}"
+        for layer in layers
+        for why in _layer_reasons(layer, eps)
+    ]
 
 
 class _Identity(torch.nn.Module):
