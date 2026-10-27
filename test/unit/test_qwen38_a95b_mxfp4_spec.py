@@ -55,15 +55,25 @@ def _cfg(**kw):
     )
 
 
+MTP = {
+    "speculative_algorithm": "NEXTN",
+    "speculative_eagle_topk": 1,
+    "speculative_num_steps": 3,
+    "speculative_num_draft_tokens": 4,
+}
+
+
 def test_config_reasons(monkeypatch):
     monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
     reasons = qwen.SPEC.config_disable_reasons
     assert reasons(_cfg(), QWEN) == []
     assert reasons(_cfg(enable_linear_replayssm=True), QWEN) == []
+    assert reasons(_cfg(**MTP, enable_linear_replayssm=True), QWEN) == []
     assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == []
     other = SimpleNamespace(**{**vars(QWEN), "hidden_size": 4096})
-    joined = " | ".join(reasons(_cfg(), other))
-    assert "hidden_size = 8192" in joined, joined
+    joined = " | ".join(reasons(_cfg(**{**MTP, "speculative_eagle_topk": 4}), other))
+    for want in ("hidden_size = 8192", "one draft chain"):
+        assert want in joined, joined
 
 
 def _meta(*shape, dtype=torch.bfloat16):
