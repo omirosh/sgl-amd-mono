@@ -2,6 +2,9 @@
 """SGLANG_AMD_MONO_CHECK=1 (eager only): next to each launch, SGLang's own layer
 code runs on the launch's input, and the launch's outputs are checked against it.
 
+- K1: SGLang's input norm and GDN up to out_proj's input, on the state rows as
+  they were (restored after): the core, the residual, and the conv and SSM state
+  rows of the step's requests.
 - K2: SGLang's o_proj, TP reduce, post-attention norm and MoE block with its TP
   reduce, on K2's own input: the layer output and the residual. The MoE block
   runs one row at a time: in a batch of 8, SGLang's router picks other experts
@@ -27,7 +30,15 @@ SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
     "srt/layers/moe/topk.py": ("topk_ids",),
     "srt/models/qwen2_moe.py": ("experts", "gate", "topk_output"),
-    "srt/models/qwen3_5.py": ("post_attention_layernorm", "mlp"),
+    "srt/models/qwen3_5.py": (
+        "input_layernorm",
+        "post_attention_layernorm",
+        "mlp",
+        "linear_attn",
+        "out_proj",
+        "o_proj",
+        "layer_id",
+    ),
     "srt/runtime_context.py": ("get_parallel", '"tp_rank"'),
 }
 
@@ -41,6 +52,42 @@ def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict[str, float]:
         "cosine": 1.0 if torch.equal(a, b) else F.cosine_similarity(a, b, dim=0).item(),
         "rel": ((a - b).norm() / b.norm().clamp_min(1e-30)).item(),
         "max_abs": (a - b).abs().max().item(),
+    }
+
+
+def _live(idx: torch.Tensor) -> torch.Tensor:
+    return idx[idx > 0].long()
+
+
+def k1_reference(layer, h, residual, conv, temporal, idx, forward_batch) -> dict:
+    """SGLang's input norm and GDN on K1's input; the state rows are restored."""
+    from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _proj_input
+
+    rows = _live(idx)
+    saved = conv[rows].clone(), temporal[rows].clone()
+    if residual is None:
+        res, x = h.clone(), layer.input_layernorm(h.clone())
+    else:
+        x, res = layer.input_layernorm(h.clone(), residual.clone())
+    with _proj_input(layer.linear_attn, "out_proj"):
+        core = layer.linear_attn(x, forward_batch)
+    ref = {
+        "core": core.clone(),
+        "res_out": res.clone(),
+        "conv": conv[rows].clone(),
+        "state": temporal[rows].clone(),
+    }
+    conv[rows], temporal[rows] = saved
+    return ref
+
+
+def k1_outputs(core, res_out, conv, temporal, idx) -> dict:
+    rows = _live(idx)
+    return {
+        "core": core,
+        "res_out": res_out,
+        "conv": conv[rows],
+        "state": temporal[rows],
     }
 
 
