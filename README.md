@@ -20,10 +20,11 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
+| Qwen3.8-2.4T-A95B (MXFP4 experts) | MI355X (gfx950) | 8 | The layer tail (K2) of all 92 layers, after SGLang's attention or GDN, in decode steps of up to 8 rows |
 
 ### Design
 
-- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch; GLM-5.3-Flash also runs the final norm, the LM head and the logits all-gather as one tail launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch. MiniMax-M3.1-Flash keeps SGLang's attention and runs the rest of each sparse layer as one launch: o_proj, the attention all-reduce and residual add, the post-attention norm, the router, the shared and routed experts and the MoE all-reduce. DeepSeek-V4-Pro runs each layer as one launch, its KV compressors and the CSA lightning indexer (its compressor, scores and an exact top-k) included, over SGLang's unified KV, compressor states and FP4 index keys.
+- **One or two launches per layer.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch; GLM-5.3-Flash also runs the final norm, the LM head and the logits all-gather as one tail launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch. MiniMax-M3.1-Flash keeps SGLang's attention and runs the rest of each sparse layer as one launch: o_proj, the attention all-reduce and residual add, the post-attention norm, the router, the shared and routed experts and the MoE all-reduce. DeepSeek-V4-Pro runs each layer as one launch, its KV compressors and the CSA lightning indexer (its compressor, scores and an exact top-k) included, over SGLang's unified KV, compressor states and FP4 index keys. Qwen3.8-2.4T keeps SGLang's attention and Gated DeltaNet and runs the rest of each layer as one launch, K2: out_proj (o_proj on the attention layers), the post-attention norm, the router, the experts and both all-reduces.
 - **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8; MiniMax-M3.1-Flash's shared expert keeps the checkpoint's MXFP8 values; DeepSeek-V4-Pro's attention and shared-expert matrices, packed from the checkpoint into its tiles, about 6 GB a rank) are copied once at startup, and each copy is logged.
@@ -37,6 +38,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 - MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
+- Qwen3.8-2.4T needs `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`: since [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839), SGLang quantizes the GDN projections to MXFP4 by default, and the kernels read them in bf16. It also refuses the fused shared expert (`--enforce-shared-experts-fusion`).
 
 ### Installation
 
@@ -127,6 +129,21 @@ AITER_BF16_FP8_MOE_BOUND=0 python -m sglang.launch_server \
 `AITER_BF16_FP8_MOE_BOUND=0` makes SGLang's decode run the routed experts on
 MXFP8 activations, as the kernels do.
 
+Qwen3.8-2.4T-A95B, with bf16 GDN projections:
+
+```bash
+SGLANG_USE_AITER=1 SGLANG_ROCM_GDN_ONLINE_MXFP4=0 python -m sglang.launch_server \
+  --model-path amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 \
+  --tp 8 \
+  --trust-remote-code \
+  --attention-backend aiter \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --monokernel-backend amd
+```
+
+The serving test uses more flags (`test/e2e/qwen38_a95b_mxfp4_server.py`).
+
 For MoRI PD, enable monokernels only on the decode server
 (`--disaggregation-mode decode --disaggregation-transfer-backend mori`): TP8 for
 DeepSeek-V4-Pro, TP2 or TP4 for DeepSeek-V4.1-Flash. Leave the flag off on prefill;
@@ -168,7 +185,10 @@ sgl-amd-mono/
 │   │   ├── a16w4.py     # routed experts' MXFP4 GEMV steps
 │   │   ├── a16w8.py     # the shared expert's MXFP8 GEMV steps
 │   │   └── runner.py    # launch runner
-│   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
+│   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4
+│   │   ├── spec.py      # spec and forward
+│   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
+│   │   └── gfx950/      # kernels and launch runner
 │   └── qwen38_flash_next/   # Qwen3.8-Flash-Next; spec and kernels land in its PR
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
@@ -180,12 +200,13 @@ sgl-amd-mono/
 
 ```bash
 pytest test/unit                                                # CPU only
-pytest test/kernels test/e2e -k "not glm53 and not minimax_m3"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k "not glm53 and not minimax_m3 and not qwen38"  # 4 x MI350X or MI355X, DEEPSEEK_V41_FLASH_MODEL_PATH set
 pytest test/kernels -k "deepseek_v4 and not deepseek_v41"      # one MI355X: every DeepSeek-V4-Pro launch compiles
 pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_MODEL_PATH set: kernels on 8 GPUs, server at TP4
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
+pytest test/kernels test/e2e -k qwen38_a95b_mxfp4               # 8 x MI355X, QWEN38_A95B_MXFP4_MODEL_PATH set: K2 on 8 GPUs, server at TP8
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).
