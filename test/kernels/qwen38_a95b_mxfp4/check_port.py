@@ -3,8 +3,11 @@ against the kernels of sgl-project/sglang#43516, bit for bit, on 8 gfx950 GPUs
 (torchrun). Needs both packages: ``sglang.kernels.ops.moe.qwen3_5_mono_flydsl``
 (the #43516 head, 51b0c592b2) and ``sgl_amd_mono.qwen38_a95b_mxfp4.gfx950``.
 
-1. K2: out and res_out on every rank, for widths 1 .. 8.
-2. ``--time``: the time a launch, #43516 against the port, widths 1 .. 8, from a
+1. K1: core, res_out and the conv / SSM state slots, for widths 1 .. 8, fp32 /
+   bf16 state, first layer at widths 1 and 8, a pad row at each odd width from 3.
+   One GPU a case; the cases spread over the ranks.
+2. K2: out and res_out on every rank, for widths 1 .. 8.
+3. ``--time``: the time a launch, #43516 against the port, widths 1 .. 8, from a
    CUDA graph of launches.
 """
 
@@ -18,7 +21,19 @@ import time
 
 import torch
 import torch.distributed as dist
-from inputs import CORE, HIDDEN, MAXT, epoch, errors, gen, k2_weights, rnd
+from inputs import (
+    BF,
+    CORE,
+    HIDDEN,
+    MAXT,
+    epoch,
+    errors,
+    gen,
+    k1_state,
+    k1_weights,
+    k2_weights,
+    rnd,
+)
 
 TP = 8
 TIME_ITERS = 200
@@ -33,13 +48,15 @@ dist.init_process_group("gloo", timeout=datetime.timedelta(hours=2))  # the comp
 from sglang.kernels.ops.moe.k3_mono_flydsl.common.peer_memory import (  # noqa: E402
     PeerBuffer as OldPeer,
 )
+from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import gdn as og  # noqa: E402
 from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import layer as ol  # noqa: E402
 
 from sgl_amd_mono.common.peer import PeerBuffer as NewPeer  # noqa: E402
+from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn as ng  # noqa: E402
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as nl  # noqa: E402
 
 failures: list[str] = []
-report: dict = {"rank": rank, "k2": [], "time": {}}
+report: dict = {"rank": rank, "k1": [], "k2": [], "time": {}}
 
 
 def log(msg):
@@ -54,6 +71,87 @@ def all_ok(flag: bool) -> bool:
 
 def old_epoch():
     return torch.zeros(1, dtype=torch.int32, device=dev)
+
+
+# ---------------------------------------------------------------- K1
+
+
+def k1_cases():
+    out = []
+    for s in range(1, MAXT + 1):
+        for b in (False, True):
+            out.append(dict(tokens=s, first=False, state_bf16=b))
+    for s in (1, MAXT):
+        out.append(dict(tokens=s, first=True, state_bf16=False))
+    return out
+
+
+def k1_inputs(case, seed):
+    g = gen(dev, seed)
+    s = case["tokens"]
+    w = k1_weights(g)
+    conv, state = k1_state(g, MAXT + 2, bf16=case["state_bf16"])
+    hidden = rnd(g, s, HIDDEN, scale=2.0)
+    residual = None if case["first"] else rnd(g, s, HIDDEN, scale=2.0)
+    idx = list(range(1, s + 1))
+    if s >= 3 and s % 2 == 1:
+        idx[-1] = 0  # a pad row
+    st_idx = torch.tensor(idx, dtype=torch.int32, device=dev)
+    return w, conv, state, hidden, residual, st_idx
+
+
+_K1_BUF: dict = {}
+
+
+def run_k1(mod, case, inputs, ep, fresh=True):
+    """One K1 launch; ``fresh``: on copies of the state, synced, with new
+    outputs (the compare), else in place on reused buffers (the timing)."""
+    w, conv, state, hidden, residual, st_idx = inputs
+    s = case["tokens"]
+    key = mod.K1Build(**case)
+    if fresh or (mod, key) not in _K1_BUF:
+        _K1_BUF[(mod, key)] = (
+            torch.zeros(s, CORE, dtype=BF, device=dev),
+            torch.zeros(s, HIDDEN, dtype=BF, device=dev),
+            torch.zeros(mod.scratch_bytes(key), dtype=torch.uint8, device=dev),
+        )
+    core, res_out, scratch = _K1_BUF[(mod, key)]
+    if fresh:
+        conv, state = conv.clone(), state.clone()
+    ep[:1].add_(1)
+    mod.gdn_pre(
+        key,
+        **w,
+        hidden=hidden,
+        residual=residual,
+        res_out=res_out,
+        conv_state=conv,
+        rstate=state,
+        st_idx=st_idx,
+        core=core,
+        scratch=scratch,
+        epoch=ep,
+        layer=0,
+    )
+    if fresh:
+        torch.cuda.synchronize()
+        return {"core": core, "res_out": res_out, "conv": conv, "state": state}
+
+
+def check_k1():
+    cases = k1_cases()[rank::TP]
+    eo, en = old_epoch(), epoch(dev)
+    for i, case in enumerate(cases):
+        inputs = k1_inputs(case, 1000 + 97 * rank + i)
+        a = run_k1(og, case, inputs, eo)
+        b = run_k1(ng, case, inputs, en)
+        bad = [k for k in a if not torch.equal(a[k], b[k])]
+        report["k1"].append({**case, "bad": bad})
+        if bad:
+            failures.append(f"K1 {case}: {bad}")
+        log(f"K1 {case} {'OK' if not bad else 'DIFF ' + str(bad)}")
+    if any(errors(en).values()):
+        failures.append(f"K1 error words {errors(en)}")
 
 
 # ---------------------------------------------------------------- K2
@@ -226,6 +324,22 @@ def time_arms(name, arms, sync=lambda: None):
     )
 
 
+def time_k1():
+    if rank != 0:
+        return
+    eo, en = old_epoch(), epoch(dev)
+    for s in range(1, MAXT + 1):
+        case = dict(tokens=s, first=False, state_bf16=True)
+        inputs = k1_inputs(case, 4242)
+        time_arms(
+            f"k1_s{s}",
+            {
+                "old": lambda: run_k1(og, case, inputs, eo, fresh=False),
+                "new": lambda: run_k1(ng, case, inputs, en, fresh=False),
+            },
+        )
+
+
 def time_k2(old, new, w):
     """``old_nb``: the #43516 kernel on the port's buffers. old against old_nb
     is the placement of the buffers; old_nb against new is the code."""
@@ -254,6 +368,11 @@ def main():
     ap.add_argument("--out", default=os.environ.get("CHECK_OUT"), help="per-rank JSON")
     args = ap.parse_args()
     t0 = time.time()
+    check_k1()
+    dist.barrier()
+    if args.time:
+        time_k1()
+        dist.barrier()
     check_k2(args.time)
     report["failures"] = failures
     report["seconds"] = round(time.time() - t0)
