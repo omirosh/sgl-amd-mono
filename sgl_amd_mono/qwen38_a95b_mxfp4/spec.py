@@ -126,6 +126,7 @@ SGLANG_READS = {
 # K2 against SGLang's layer on the same input (check.py, SGLANG_AMD_MONO_CHECK).
 # K2 quantizes the expert inputs to MXFP4 as SGLang's AITER MoE does but sums in
 # another order, so the layer output differs by about the MoE's rounding error.
+# The bound holds on the rows that K2 and SGLang route alike (check.k2_alike).
 NUMERICS = Numerics(NumericsKind.TOLERANCE, {"k2.out.cosine": 0.99})
 
 
@@ -343,7 +344,7 @@ class _Built:
         mlp = layer.mlp
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
         if check_batch is not None:
-            ref = check.k2_reference(layer, o, core, residual, check_batch)
+            ref, ids, logits = check.k2_reference(layer, o, core, residual, check_batch)
         oq, fse = _mxfp4(o), _fse(mlp)
         se, ex = mlp.shared_expert, mlp.experts
         out = torch.empty_like(residual)
@@ -372,8 +373,14 @@ class _Built:
             w_sd=None if se is None else se.down_proj.weight,
         )
         if check_batch is not None:
+            # ROUTE: (value, tag) pairs; token t's experts at 2 k t, then its weights
+            off, n = k2.scratch_layout(self.k2_keys[s, fse, oq])["route"]
+            route = (
+                self.k2_scratch[s][off : off + n].view(torch.int32).view(s, 2, -1, 2)
+            )
+            alike = check.k2_alike(layer.layer_id, ids, logits, route[:, 0, :, 0])
             got = {"out": out, "res_out": res_out}
-            check.compare("k2", layer.layer_id, s, ref, got)
+            check.compare("k2", layer.layer_id, s, ref, got, alike)
         return out, res_out
 
 
