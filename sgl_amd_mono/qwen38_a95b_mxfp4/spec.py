@@ -18,11 +18,9 @@ input there. SGLang's embedding, final norm and logits processor run around the
 layers.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
-in_proj_qkvz after the build). The fused shared expert
-(``--enforce-shared-experts-fusion``, MXFP4 with sglang#41899) runs K2 ``fse``: the
-shared expert is routed expert 512. The kernels also have MXFP4 GDN projections (K1
-``qq``, K2 ``oq``). Until SGLang serves them (sglang#43839), the spec refuses them
-at startup.
+in_proj_qkvz after the build). MXFP4 GDN projections (sglang#43839) run K1
+``qq`` and K2 ``oq``. The fused shared expert (``--enforce-shared-experts-fusion``,
+MXFP4 with sglang#41899) runs K2 ``fse``: the shared expert is routed expert 512.
 """
 
 from __future__ import annotations
@@ -66,12 +64,6 @@ WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
-
-# Refused until SGLang serves the variant; it names the PR that does
-PENDING_MXFP4 = (
-    "MXFP4 GDN projections are not supported yet: they need sglang#43839 with the "
-    "quantization in the load path; unset SGLANG_ROCM_GDN_ONLINE_MXFP4"
-)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -241,8 +233,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
                 f"--speculative-num-steps + 1, got topk {topk}, {tokens} tokens, "
                 f"{steps} steps"
             )
-    if os.environ.get("SGLANG_ROCM_GDN_ONLINE_MXFP4"):
-        reasons.append(PENDING_MXFP4)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -286,10 +276,8 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
     if _is_gdn(layer):
         a = layer.linear_attn
         o = a.out_proj
-        if _mxfp4(a.in_proj_qkvz) or _mxfp4(o):
-            reasons.append(PENDING_MXFP4)
-        elif not _bf16(a.in_proj_qkvz.weight, o.weight):
-            reasons.append("needs in_proj_qkvz and out_proj in bf16")
+        if not all(_mxfp4(p) or _bf16(p.weight) for p in (a.in_proj_qkvz, o)):
+            reasons.append("needs in_proj_qkvz and out_proj in bf16 or MXFP4")
         if not _bf16(a.in_proj_ba.weight, a.conv1d.weight, a.dt_bias, a.norm.weight):
             reasons.append("needs the GDN in_proj_ba, conv, dt_bias and norm in bf16")
         if a.A_log.dtype != torch.float32:
@@ -335,14 +323,11 @@ def _layers(model) -> list:
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     layers = _layers(model)
     eps = _eps(layers)
-    reasons, pending = [], []
-    for layer in layers:
-        for why in _layer_reasons(layer, eps):
-            if why == PENDING_MXFP4:
-                pending.append(why)
-            else:
-                reasons.append(f"layer {layer.layer_id}: {why}")
-    return list(dict.fromkeys(pending)) + reasons
+    return [
+        f"layer {layer.layer_id}: {why}"
+        for layer in layers
+        for why in _layer_reasons(layer, eps)
+    ]
 
 
 class _Identity(torch.nn.Module):
