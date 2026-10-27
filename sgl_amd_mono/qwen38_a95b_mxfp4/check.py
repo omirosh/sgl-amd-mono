@@ -47,22 +47,32 @@ def k2_reference(layer, o_proj, core, residual, forward_batch) -> dict:
     a, _ = o_proj(core)
     a = tensor_model_parallel_all_reduce(a)
     x, res = layer.post_attention_layernorm(a, residual.clone())
-    out = torch.cat(
-        [
-            tensor_model_parallel_all_reduce(layer.mlp(x[i : i + 1], forward_batch))
-            for i in range(x.shape[0])
-        ]
+    # the top-k the MoE block hands its experts, a row an entry (log_routes)
+    routes = []
+    hook = layer.mlp.experts.register_forward_pre_hook(
+        lambda _, args: routes.append(args[1] if len(args) > 1 else None)
     )
-    return {"out": out.clone(), "res_out": res.clone()}
+    try:
+        out = torch.cat(
+            [
+                tensor_model_parallel_all_reduce(layer.mlp(x[i : i + 1], forward_batch))
+                for i in range(x.shape[0])
+            ]
+        )
+    finally:
+        hook.remove()
+    return {"out": out.clone(), "res_out": res.clone(), "x": x, "routes": routes}
 
 
-def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> None:
+def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> bool:
+    """Log the values; False if one misses its bound (on TP rank 0 only)."""
     from sglang.srt.runtime_context import get_parallel
 
     from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS
 
     if get_parallel().tp_rank != 0:
-        return
+        return True
+    ok_all = True
     values = {
         f"{kind}.{name}.{metric}": v
         for name in ref
@@ -81,6 +91,7 @@ def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> None:
             continue
         ok = v >= bound if name.endswith(".cosine") else v <= bound
         if not ok:
+            ok_all = False
             logger.error(
                 "monokernel check violation: layer %d %s = %.6g, bound %g",
                 layer_id,
@@ -88,3 +99,42 @@ def compare(kind: str, layer_id: int, rows: int, ref: dict, got: dict) -> None:
                 v,
                 bound,
             )
+    return ok_all
+
+
+def log_routes(layer, layer_id: int, x, routes, k2_ids, k2_w, every_row: bool) -> None:
+    """Each row's top-k by K2 (ROUTE) and by SGLang's MoE block, on TP rank 0. A row
+    whose experts differ (every row if ``every_row``) is logged with the experts only
+    one side picked and the bf16 router logits at ranks k - 2 .. k + 2 (torch fp32
+    in brackets): a near-tie at rank k swaps the last expert."""
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().tp_rank != 0:
+        return
+    k = k2_ids.shape[1]
+    lg = x.float() @ layer.mlp.gate.weight.float().t()
+    top = lg.bfloat16().float().topk(k + 2, dim=-1)
+    for i, r in enumerate(routes):
+        if getattr(r, "topk_ids", None) is None:
+            continue
+        ref_ids, got_ids = r.topk_ids[0, :k].tolist(), k2_ids[i].tolist()
+        if set(ref_ids) == set(got_ids) and not every_row:
+            continue
+        cut = " ".join(
+            f"#{j + 1} {e}:{top.values[i, j].item():.6g}({lg[i, e].item():.8g})"
+            for j, e in enumerate(top.indices[i].tolist())
+            if j >= k - 3
+        )
+        logger.info(
+            "monokernel check route layer %d row %d: k2 only %s, sglang only %s; "
+            "k2 %s w %s; sglang %s w %s; logits %s",
+            layer_id,
+            i,
+            sorted(set(got_ids) - set(ref_ids)),
+            sorted(set(ref_ids) - set(got_ids)),
+            got_ids,
+            [round(w, 5) for w in k2_w[i].tolist()],
+            ref_ids,
+            [round(w, 5) for w in r.topk_weights[0, :k].tolist()],
+            cut,
+        )

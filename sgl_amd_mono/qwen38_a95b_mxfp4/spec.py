@@ -373,7 +373,12 @@ class _Built:
         )
         if check_batch is not None:
             got = {"out": out, "res_out": res_out}
-            check.compare("k2", layer.layer_id, s, ref, got)
+            x, routes = ref.pop("x"), ref.pop("routes")
+            ok = check.compare("k2", layer.layer_id, s, ref, got)
+            # ROUTE: (value, tag) pairs; token t's experts at 2 k t, then its weights
+            off, n = k2.scratch_layout(self.k2_keys[s, fse, oq])["route"]
+            v = self.k2_scratch[s][off : off + n].view(torch.int32).view(s, 2, -1, 2)[..., 0]
+            check.log_routes(layer, layer.layer_id, x, routes, v[:, 0], v[:, 1].view(torch.float32), not ok)
         return out, res_out
 
 
