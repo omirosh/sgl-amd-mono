@@ -1,5 +1,5 @@
 """Qwen3.8 MoE with --monokernel-backend amd on MI355X, TP8, across the switch
-points: decode steps of 1 to 8 rows run K2, wider ones the normal path, and
+points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path, and
 requests join and leave a running batch that steps past 8 rows and back (a short
 GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
 tokens of covered steps scored again by the normal prefill path (KL consistency);
@@ -160,7 +160,7 @@ class TestMonokernelCheck(CustomTestCase):
             out.seek(0)
             log = err.read() + out.read()
         checks = re.findall(
-            r"monokernel check layer \d+ \((k2), (\d+) rows\): (.*)", log
+            r"monokernel check layer \d+ \((k1|k2), (\d+) rows\): (.*)", log
         )
         values = {}
         for _, _, fields in checks:
@@ -169,12 +169,12 @@ class TestMonokernelCheck(CustomTestCase):
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _ in checks}
-        want = {("k2", rows) for rows in (1, 3, 8)}
+        want = {(kind, rows) for kind in ("k1", "k2") for rows in (1, 3, 8)}
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
         # a bf16 tie at the 10th logit routes a row elsewhere; a router bug, many
-        rows = sum(int(n) for _, n, _ in checks)
+        rows = sum(int(n) for kind, n, _ in checks if kind == "k2")
         routes = re.findall(r"monokernel check route .*", log)
         print(f"rows routed elsewhere: {len(routes)} of {rows}")
         self.assertLessEqual(len(routes), rows // 100, "\n".join(routes[:20]))
