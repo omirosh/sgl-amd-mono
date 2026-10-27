@@ -1,9 +1,10 @@
 """The Qwen3.8 MoE gfx950 monokernels (RFC #43949) on random weights in SGLang's
 layouts: the routed experts' fp4 tiles and e8m0 scales where K2 reads them (on
-the host); K2 on 8 GPUs (``qwen38_a95b_mxfp4/check_k2.py``): every build key
-compiles, pad rows, batch invariance, graph replay across widths and an injected
-wait fault; and the refactor proof against the sgl-project/sglang#43516 kernels,
-bit for bit (``check_port.py``, where that SGLang is installed)."""
+the host); K1 on one GPU and K2 on 8 (``qwen38_a95b_mxfp4/check_k1.py``,
+``check_k2.py``): every build key compiles, pad rows, the bf16 state, batch
+invariance, graph replay across widths and an injected wait fault; and the
+refactor proof against the sgl-project/sglang#43516 kernels, bit for bit
+(``check_port.py``, where that SGLang is installed)."""
 
 import importlib.util
 import subprocess
@@ -111,6 +112,12 @@ def _run(script: str, *args: str, ranks: int = 0) -> int:
     return subprocess.run(
         [*launcher, str(CHECKS / script), *args], timeout=3600
     ).returncode
+
+
+@unittest.skipIf(_gfx950_gpus() < 1, "needs a gfx950 GPU")
+class TestQwen38MoeK1(CustomTestCase):
+    def test_k1(self):
+        self.assertEqual(_run("check_k1.py", "--replays", "200"), 0)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
