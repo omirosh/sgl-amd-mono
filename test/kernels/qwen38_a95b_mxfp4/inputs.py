@@ -10,8 +10,8 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 
 BF = torch.bfloat16
 DEADLINE_S = 30.0
-HIDDEN, CORE = L.HIDDEN, L.CORE
-E, RI, SI, MAXT = L.E, L.RI, L.SI, L.MAX_TOKENS
+HIDDEN, CORE, QKVZ, BA, CONV = L.HIDDEN, L.CORE, L.QKVZ, L.BA, L.CONV
+NV, HD, E, RI, SI, MAXT = L.NV, L.HD, L.E, L.RI, L.SI, L.MAX_TOKENS
 
 
 def gen(dev, seed):
@@ -38,6 +38,32 @@ def epoch(dev, seconds=DEADLINE_S):
 
 def errors(e):
     return {w: int(e[w]) for w in guard.ERROR_WORDS}
+
+
+def k1_weights(g, qq=False):
+    """``gdn_pre``'s weights; ``qq``: an MXFP4 in_proj_qkvz."""
+    w = {
+        "ln_w": rnd(g, HIDDEN, scale=0.1),
+        "w_ba": rnd(g, BA, HIDDEN, scale=0.05),
+        "conv_w": rnd(g, CONV, 1, 4, scale=0.4),
+        "a_log": rnd(g, NV, scale=0.5, dtype=torch.float32),
+        "dt_bias": rnd(g, NV, scale=0.5),
+        "norm_w": (1 + rnd(g, HD, scale=0.1, dtype=torch.float32)).to(BF),
+    }
+    if qq:
+        w["w_qkvz"] = codes(g, QKVZ, HIDDEN // 2)
+        w["w_qkvzs"] = codes(g, QKVZ * HIDDEN // 32, lo=117, hi=121)
+    else:
+        w["w_qkvz"] = rnd(g, QKVZ, HIDDEN, scale=0.02)
+    return w
+
+
+def k1_state(g, slots, bf16=False):
+    """The conv state (slots, dim, 3) and the SSM state (slots, HV, V, K), as
+    SGLang's mamba pool holds them."""
+    return rnd(g, slots, CONV, 3), rnd(
+        g, slots, NV, HD, HD, scale=0.05, dtype=BF if bf16 else torch.float32
+    )
 
 
 def k2_weights(dev, rank, seed, fse=False, oq=False):

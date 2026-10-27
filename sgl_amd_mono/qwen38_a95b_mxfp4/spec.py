@@ -2,20 +2,27 @@
 """Qwen3.8 MoE on gfx950: the monokernel spec and its forward (RFC
 sgl-project/sglang#43949).
 
-A decode step runs each decoder layer's tail as one launch, K2
-(``gfx950/layer.py``): o_proj (out_proj on a GDN layer) and its TP reduce, the
-post-attention norm, the router, the shared and routed MXFP4 experts and the MoE
-TP reduce. It writes the layer output and the residual.
+A decode step runs each decoder layer as at most two launches:
 
-In front of K2, each layer runs SGLang's input norm and its attention or GDN up to
-the projection's input. A target-verify step (speculative decoding) runs the same
-way on its draft tokens. SGLang's embedding, final norm and logits processor run
-around the layers.
+- K1 (``gfx950/gdn.py``, GDN layers): input norm, in_proj_qkvz and in_proj_ba,
+  the conv and the gated delta rule with their state updates, and the gated norm.
+  It writes the core output (o_proj's input) and the residual.
+- K2 (``gfx950/layer.py``, every layer): o_proj and its TP reduce, the
+  post-attention norm, the router, the shared and routed MXFP4 experts and the MoE
+  TP reduce. It writes the layer output and the residual.
 
-The kernels read SGLang's weights in place at each launch. The fused shared expert
+A full-attention layer runs SGLang's attention up to o_proj's input, then K2. A
+target-verify step (speculative decoding) runs K2 only: K1 keeps no state per
+draft token for the rollback, so a GDN layer runs SGLang's GDN up to out_proj's
+input there. SGLang's embedding, final norm and logits processor run around the
+layers.
+
+The kernels read SGLang's weights in place at each launch (SGLang repacks
+in_proj_qkvz after the build). The fused shared expert
 (``--enforce-shared-experts-fusion``, MXFP4 with sglang#41899) runs K2 ``fse``: the
-shared expert is routed expert 512. K2 also has an MXFP4 out_proj (``oq``). Until
-SGLang serves it (sglang#43839), the spec refuses it at startup.
+shared expert is routed expert 512. The kernels also have MXFP4 GDN projections (K1
+``qq``, K2 ``oq``). Until SGLang serves them (sglang#43839), the spec refuses them
+at startup.
 """
 
 from __future__ import annotations
@@ -56,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 # a launch takes 1 to MAX_TOKENS rows: decode requests, or verify tokens
 WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
-# the mailbox tags K2 writes: TAG_SLOTS // 2 + i, as in sglang#43516 (its K1 has i)
+# the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
 
@@ -69,12 +76,31 @@ PENDING_MXFP4 = (
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
+        "enable_linear_replayssm",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
         "speculative_num_draft_tokens",
     ),
+    "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
+    "srt/layers/attention/hybrid_linear_attn_backend.py": (
+        "linear_attn_backend",
+        "forward_metadata",
+    ),
+    "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
+    "kernels/ops/attention/fla/layernorm_gated.py": (
+        "eps",
+        "group_size",
+        "norm_before_gate",
+        "activation",
+    ),
     "srt/layers/layernorm.py": ("variance_epsilon",),
+    "srt/mem_cache/memory_pool.py": (
+        "mamba2_layer_cache",
+        "conv",
+        "temporal",
+        "replayssm_d",
+    ),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
         "is_shuffled",
         '"w13_weight"',
@@ -83,6 +109,10 @@ SGLANG_READS = {
         '"w2_weight_scale"',
     ),
     "srt/model_executor/forward_batch_info.py": ("mrope_positions",),
+    "srt/model_executor/forward_context.py": (
+        "get_attn_backend",
+        "get_req_to_token_pool",
+    ),
     "srt/models/qwen2_moe.py": (
         "Qwen2MoeSparseMoeBlock",
         "gate",
@@ -104,7 +134,13 @@ SGLANG_READS = {
         "post_attention_layernorm",
         "mlp",
         "linear_attn",
+        "in_proj_qkvz",
+        "in_proj_ba",
+        "conv1d",
+        "A_log",
+        "dt_bias",
         "out_proj",
+        "activation",
         "layer_id",
         "self_attention",
         "o_proj",
@@ -127,16 +163,26 @@ SGLANG_READS = {
     ),
     "srt/runtime_context.py": (
         "get_parallel",
+        "get_spec",
         '"tp_rank"',
         '"tp_size"',
         '"tp_group"',
     ),
 }
 
-# K2 against SGLang's layer on the same input (check.py, SGLANG_AMD_MONO_CHECK).
-# K2 quantizes the expert inputs to MXFP4 as SGLang's AITER MoE does but sums in
-# another order, so the layer output differs by about the MoE's rounding error.
-NUMERICS = Numerics(NumericsKind.TOLERANCE, {"k2.out.cosine": 0.99})
+# K1 and K2 against SGLang's layer on the same input and state (check.py,
+# SGLANG_AMD_MONO_CHECK). K2 quantizes the expert inputs to MXFP4 as SGLang's
+# AITER MoE does but sums in another order, so the layer output differs by about
+# the MoE's rounding error.
+NUMERICS = Numerics(
+    NumericsKind.TOLERANCE,
+    {
+        "k1.core.cosine": 0.9999,
+        "k1.conv.cosine": 0.9999,
+        "k1.state.cosine": 0.9999,
+        "k2.out.cosine": 0.99,
+    },
+)
 
 
 def _text(config):
@@ -160,6 +206,8 @@ def _fse(mlp) -> bool:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
     text = _text(hf_config)
     reasons = [
         f"needs Qwen3.8's {key} = {want!r}, got {getattr(text, key, None)!r}"
@@ -171,7 +219,18 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     layers = getattr(text, "num_hidden_layers", 0)
     if layers > MAX_LAYERS:
         reasons.append(f"{layers} layers: the mailbox tags hold {MAX_LAYERS}")
-    if cfg.speculative_algorithm is not None:
+    dtypes = mamba2_state_dtype(hf_config)
+    if dtypes.temporal not in (torch.float32, torch.bfloat16):
+        reasons.append(f"needs the SSM state in f32 or bf16, got {dtypes.temporal}")
+    if dtypes.conv != torch.bfloat16:
+        reasons.append(f"needs the conv state in bf16, got {dtypes.conv}")
+    if cfg.speculative_algorithm is None:
+        if cfg.enable_linear_replayssm:
+            reasons.append(
+                "--enable-linear-replayssm: K1 updates the SSM state in place; "
+                "ReplaySSM defers it to a ring"
+            )
+    else:
         topk = cfg.speculative_eagle_topk or 1
         tokens, steps = cfg.speculative_num_draft_tokens, cfg.speculative_num_steps
         if topk != 1 or tokens != (steps or 0) + 1:
@@ -192,7 +251,7 @@ def _bf16(*tensors) -> bool:
     return all(t.dtype == torch.bfloat16 for t in tensors)
 
 
-def _layer_reasons(layer, eps: float) -> list[str]:
+def _layer_reasons(layer, eps: tuple) -> list[str]:
     """Why the kernels cannot run one decoder layer as SGLang loaded it."""
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 
@@ -217,33 +276,54 @@ def _layer_reasons(layer, eps: float) -> list[str]:
             f"experts TP-sharded, unpadded"
         )
     if not _bf16(
+        layer.input_layernorm.weight,
         layer.post_attention_layernorm.weight,
         mlp.gate.weight,
         mlp.shared_expert_gate.weight,
     ):
-        reasons.append("needs the norm, router and shared-expert gate in bf16")
+        reasons.append("needs the norms, router and shared-expert gate in bf16")
     if _is_gdn(layer):
-        o = layer.linear_attn.out_proj
-        if _mxfp4(o):
+        a = layer.linear_attn
+        o = a.out_proj
+        if _mxfp4(a.in_proj_qkvz) or _mxfp4(o):
             reasons.append(PENDING_MXFP4)
-        elif not _bf16(o.weight):
-            reasons.append("needs out_proj in bf16")
+        elif not _bf16(a.in_proj_qkvz.weight, o.weight):
+            reasons.append("needs in_proj_qkvz and out_proj in bf16")
+        if not _bf16(a.in_proj_ba.weight, a.conv1d.weight, a.dt_bias, a.norm.weight):
+            reasons.append("needs the GDN in_proj_ba, conv, dt_bias and norm in bf16")
+        if a.A_log.dtype != torch.float32:
+            reasons.append("needs A_log in f32")
+        if a.activation != "silu" or a.conv1d.bias is not None:
+            reasons.append("needs the GDN conv without bias and with silu")
+        norm = a.norm
+        if norm.activation not in ("silu", "swish") or norm.group_size is not None:
+            reasons.append("needs the GDN gated norm over the head with silu")
+        if not norm.norm_before_gate:
+            reasons.append("needs the GDN norm before the gate")
+        layer_eps = (layer.input_layernorm.variance_epsilon, norm.eps)
     else:
         o = layer.o_proj
         if not layer.attn_output_gate or layer.q_size != L.CORE:
             reasons.append("needs the gated attention output with one rank's heads")
         if not _bf16(o.weight):
             reasons.append("needs o_proj in bf16")
+        layer_eps = (layer.input_layernorm.variance_epsilon, None)
     if not _mxfp4(o) and tuple(o.weight.shape) != (L.HIDDEN, L.CORE):
         reasons.append(f"o_proj shape {tuple(o.weight.shape)}")
-    if layer.post_attention_layernorm.variance_epsilon != eps:
+    want = (eps[0], eps[1] if _is_gdn(layer) else None)
+    if layer_eps != want or layer.post_attention_layernorm.variance_epsilon != eps[2]:
         reasons.append("its norm eps differ from the first layer's")
     return reasons
 
 
-def _eps(layers) -> float:
-    """The post-attention norm eps: one for all layers."""
-    return layers[0].post_attention_layernorm.variance_epsilon
+def _eps(layers) -> tuple:
+    """(input norm, GDN gated norm, post-attention norm) eps: one for all layers."""
+    gdn = next((x.linear_attn for x in layers if _is_gdn(x)), None)
+    return (
+        layers[0].input_layernorm.variance_epsilon,
+        None if gdn is None else gdn.norm.eps,
+        layers[0].post_attention_layernorm.variance_epsilon,
+    )
 
 
 def _layers(model) -> list:
@@ -252,10 +332,9 @@ def _layers(model) -> list:
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    reasons = []
     layers = _layers(model)
     eps = _eps(layers)
-    pending = []
+    reasons, pending = [], []
     for layer in layers:
         for why in _layer_reasons(layer, eps):
             if why == PENDING_MXFP4:
@@ -290,9 +369,22 @@ class _Built:
     """One rank's launches: the build keys per (width, variant), the scratch per
     width, the guard block (word 0 the step epoch) and the peer buffer."""
 
-    def __init__(self, lm, rank, k2_keys, k2_scratch, epoch, peer):
+    def __init__(
+        self,
+        lm,
+        rank,
+        state_bf16,
+        k1_keys,
+        k2_keys,
+        k1_scratch,
+        k2_scratch,
+        epoch,
+        peer,
+    ):
         self.lm, self.rank = lm, rank
-        self.k2_keys, self.k2_scratch = k2_keys, k2_scratch
+        self.state_dtype = torch.bfloat16 if state_bf16 else torch.float32
+        self.k1_keys, self.k2_keys = k1_keys, k2_keys
+        self.k1_scratch, self.k2_scratch = k1_scratch, k2_scratch
         self.epoch, self.peer = epoch, peer
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
 
@@ -328,6 +420,7 @@ class _Built:
             positions = forward_batch.mrope_positions
         m = lm.model
         s = plan.key.rows
+        verify = plan.key.forward_mode == "target_verify"
         fb = (
             forward_batch
             if self.check_layers and not torch.cuda.is_current_stream_capturing()
@@ -336,13 +429,17 @@ class _Built:
         self.epoch[:1].add_(1)
         h = m.embed_tokens(input_ids)
         residual = None
+        idx = None if verify else self._state_indices(s)
         for i in range(m.start_layer, m.end_layer):
             layer = m.layers[i]
-            if residual is None:
-                res_attn, x = h, layer.input_layernorm(h)
+            if _is_gdn(layer) and not verify:
+                core, res_attn = self._k1(i, layer, h, residual, idx, s, fb)
             else:
-                x, res_attn = layer.input_layernorm(h, residual)
-            core = self._core(layer, positions, x, forward_batch)
+                if residual is None:
+                    res_attn, x = h, layer.input_layernorm(h)
+                else:
+                    x, res_attn = layer.input_layernorm(h, residual)
+                core = self._core(layer, positions, x, forward_batch)
             h, residual = self._k2(i, layer, core, res_attn, s, fb)
         h, _ = m.norm(h, residual)
         return lm.logits_processor(input_ids, h, lm.lm_head, forward_batch, None)
@@ -355,8 +452,81 @@ class _Built:
         with _proj_input(layer, "o_proj"):
             return layer.self_attention(positions, x, forward_batch).contiguous()
 
-    def _k2(self, i, layer, core, residual, s, check_batch=None):
+    @staticmethod
+    def _state_indices(s):
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        md = get_attn_backend().linear_attn_backend.forward_metadata
+        idx = md.mamba_cache_indices
+        if idx.dtype != torch.int32 or not idx.is_contiguous() or idx.numel() < s:
+            raise RuntimeError(
+                f"Qwen3.8 monokernel: K1 needs {s} contiguous int32 state indices, "
+                f"got {idx.dtype} {tuple(idx.shape)}"
+            )
+        return idx
+
+    def _state(self, a):
+        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+
+        st = get_req_to_token_pool().mamba2_layer_cache(a.layer_id)
+        conv, temporal = st.conv[0], st.temporal
+        want = self.state_dtype
+        if (
+            getattr(st, "replayssm_d", None) is not None
+            or temporal.dtype != want
+            or conv.dtype != torch.bfloat16
+            or tuple(conv.shape[1:]) != (L.CONV, L.CONV_W - 1)
+            or not temporal[0].is_contiguous()
+        ):
+            raise RuntimeError(
+                f"Qwen3.8 monokernel: layer {a.layer_id}: K1 needs the {want} SSM "
+                f"state and the bf16 (slots, {L.CONV}, {L.CONV_W - 1}) conv state, "
+                f"got {temporal.dtype} {tuple(temporal.shape)} and {conv.dtype} "
+                f"{tuple(conv.shape)}"
+            )
+        return conv, temporal
+
+    def _k1(self, i, layer, h, residual, idx, s, check_batch=None):
         """``check_batch``: the forward batch in check mode, else None."""
+        from sgl_amd_mono.qwen38_a95b_mxfp4 import check
+        from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
+
+        a = layer.linear_attn
+        conv, temporal = self._state(a)
+        if check_batch is not None:
+            ref = check.k1_reference(
+                layer, h, residual, conv, temporal, idx[:s], check_batch
+            )
+        qq = _mxfp4(a.in_proj_qkvz)
+        core = torch.empty(s, L.CORE, dtype=h.dtype, device=h.device)
+        res_out = torch.empty_like(h)
+        gdn.gdn_pre(
+            self.k1_keys[s, residual is None, qq],
+            hidden=h,
+            residual=residual,
+            res_out=res_out,
+            ln_w=layer.input_layernorm.weight,
+            w_qkvz=a.in_proj_qkvz.weight,
+            w_ba=a.in_proj_ba.weight,
+            conv_w=a.conv1d.weight,
+            conv_state=conv,
+            a_log=a.A_log,
+            dt_bias=a.dt_bias,
+            norm_w=a.norm.weight,
+            rstate=temporal,
+            st_idx=idx,
+            core=core,
+            scratch=self.k1_scratch[s],
+            epoch=self.epoch,
+            layer=i,
+            w_qkvzs=a.in_proj_qkvz.weight_scale if qq else None,
+        )
+        if check_batch is not None:
+            got = check.k1_outputs(core, res_out, conv, temporal, idx[:s])
+            check.compare("k1", layer.layer_id, s, ref, got)
+        return core, res_out
+
+    def _k2(self, i, layer, core, residual, s, check_batch=None):
         from sgl_amd_mono.qwen38_a95b_mxfp4 import check
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 
@@ -434,10 +604,12 @@ def _scratch(keys: dict, size, device) -> dict:
 
 
 def _build(model, hf_config, ctx) -> _Built:
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+    from sglang.srt.runtime_context import get_parallel, get_spec
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
+    from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
     from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 
     _writable_flydsl_cache()
@@ -445,12 +617,32 @@ def _build(model, hf_config, ctx) -> _Built:
     tp, rank = p.tp_size, p.tp_rank
     layers = _layers(model)
     device = layers[0].input_layernorm.weight.device
+    e1, e_norm, e2 = _eps(layers)
     fault_site, fault_after = guard.fault_injection(rank) or (0, 0)
+    # the target model runs no plain decode step under speculative decoding
+    verify = get_spec().speculative_algorithm is not None
+    gdns = [x for x in layers if _is_gdn(x)]
+    bf16 = mamba2_state_dtype(hf_config).temporal == torch.bfloat16
+    k1_keys = {}
+    if not verify:
+        for w in ctx.widths:
+            for first in sorted({x is layers[0] for x in gdns}):
+                for qq in sorted({_mxfp4(x.linear_attn.in_proj_qkvz) for x in gdns}):
+                    k1_keys[w, first, qq] = gdn.K1Build(
+                        tokens=w,
+                        first=first,
+                        eps=e1,
+                        norm_eps=e_norm,
+                        state_bf16=bf16,
+                        qq=qq,
+                        fault_site=fault_site,
+                        fault_after=fault_after,
+                    )
     outs = {x.linear_attn.out_proj if _is_gdn(x) else x.o_proj for x in layers}
     k2_keys = {
         (w, fse, oq): k2.K2Build(
             tokens=w,
-            eps=_eps(layers),
+            eps=e2,
             fse=fse,
             oq=oq,
             fault_site=fault_site,
@@ -474,23 +666,29 @@ def _build(model, hf_config, ctx) -> _Built:
     built = _Built(
         model,
         rank,
+        bf16,
+        k1_keys,
         k2_keys,
+        _scratch(k1_keys, gdn.scratch_bytes, device),
         _scratch(k2_keys, k2.scratch_bytes, device),
         epoch,
         peer,
     )
     # Every rank builds every key. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
-    launches = [k2.build(k) for k in k2_keys.values()]
+    launches = [gdn.build(k) for k in k1_keys.values()]
+    launches += [k2.build(k) for k in k2_keys.values()]
     start = len(launches) * rank // tp
     t0 = time.monotonic()
     for launch in launches[start:] + launches[:start]:
         _compile_only(launch)
     torch.cuda.synchronize()
     logger.info(
-        "Qwen3.8 monokernel: %d K2 launches (widths %s) in %.0f s",
+        "Qwen3.8 monokernel: %d K1 and %d K2 launches (widths %s, %s) in %.0f s",
+        len(k1_keys),
         len(k2_keys),
         list(ctx.widths),
+        "verify" if verify else "decode",
         time.monotonic() - t0,
     )
     return built
