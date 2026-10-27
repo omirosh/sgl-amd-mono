@@ -1,6 +1,6 @@
 """The Qwen3.8 MoE gfx950 monokernel spec on CPU (RFC #43949): its registry entry
-and widths, and its config and model refusal reasons. The fused shared expert and
-an MXFP4 out_proj refuse at startup with the SGLang PR each needs."""
+and widths, and its config and model refusal reasons. The fused shared expert runs.
+An MXFP4 out_proj refuses at startup with the SGLang PR it needs."""
 
 import sys
 from types import SimpleNamespace
@@ -50,7 +50,6 @@ def _cfg(**kw):
             "speculative_num_steps": None,
             "speculative_num_draft_tokens": None,
             "enable_linear_replayssm": False,
-            "enforce_shared_experts_fusion": False,
             **kw,
         }
     )
@@ -61,8 +60,7 @@ def test_config_reasons(monkeypatch):
     reasons = qwen.SPEC.config_disable_reasons
     assert reasons(_cfg(), QWEN) == []
     assert reasons(_cfg(enable_linear_replayssm=True), QWEN) == []
-    assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == [qwen.PENDING_FSE]
-    assert "sglang#41899" in qwen.PENDING_FSE
+    assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == []
     monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
     assert reasons(_cfg(), QWEN) == [qwen.PENDING_MXFP4]
     assert "sglang#43839" in qwen.PENDING_MXFP4
@@ -145,17 +143,28 @@ def _model(layers):
     return SimpleNamespace(model=body)
 
 
-@pytest.mark.parametrize("kw", [{}, {"fse": True}, {"mxfp4": True}])
+@pytest.mark.parametrize(
+    "kw", [{}, {"fse": True}, {"mxfp4": True}, {"fse": True, "mxfp4": True}]
+)
 def test_model_reasons(kw):
     # Qwen3.8's pattern: three GDN layers, then a full-attention layer
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    want = {
-        "fse": [qwen.PENDING_FSE],
-        "mxfp4": [qwen.PENDING_MXFP4],
-    }
-    # each pending variant refuses once, not once a layer
-    assert reasons == want.get(next(iter(kw), None), []), reasons
+    # an MXFP4 out_proj refuses once, not once a layer; the fused shared expert runs
+    want = [qwen.PENDING_MXFP4] if kw.get("mxfp4") else []
+    assert reasons == want, reasons
+
+
+def test_the_shared_expert_is_unfused_or_expert_512():
+    layers = [_layer(i, gdn=i % 4 != 3, fse=True) for i in range(8)]
+    layers[1].mlp = _mlp()
+    layers[1].mlp.shared_expert = None
+    layers[2].mlp = _mlp()
+    layers[2].mlp.shared_expert, layers[2].mlp.num_fused_shared_experts = None, 1
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    assert reasons[0] == "layer 1: needs the shared expert", reasons
+    assert reasons[1].startswith("layer 2: routed w13 shape (512,"), reasons
+    assert len(reasons) == 2, reasons
 
 
 def test_model_reasons_name_the_layer():
