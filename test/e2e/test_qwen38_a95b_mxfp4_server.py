@@ -155,6 +155,11 @@ class TestMonokernelCheck(CustomTestCase):
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
+        # a bf16 tie at the 10th logit routes a row elsewhere; a router bug, many
+        rows = sum(int(n) for _, n, _ in checks)
+        routes = re.findall(r"monokernel check route .*", log)
+        print(f"rows routed elsewhere: {len(routes)} of {rows}")
+        self.assertLessEqual(len(routes), rows // 100, "\n".join(routes[:20]))
         return log
 
 

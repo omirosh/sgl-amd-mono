@@ -167,6 +167,15 @@ def test_the_shared_expert_is_unfused_or_expert_512():
     assert len(reasons) == 2, reasons
 
 
+def test_check_compares_the_rows_routed_alike():
+    from sgl_amd_mono.qwen38_a95b_mxfp4 import check
+
+    k2 = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+    # SGLang's order differs, and FSE puts the shared slot after the top-k
+    ids = torch.tensor([[3, 1, 2, 512], [4, 5, 7, 512]], dtype=torch.int32)
+    assert check.routed_alike(ids, k2).tolist() == [True, False]
+
+
 def test_model_reasons_name_the_layer():
     layers = [_layer(i, gdn=i % 4 != 3) for i in range(8)]
     layers[1].post_attention_layernorm = _norm(1e-5)
