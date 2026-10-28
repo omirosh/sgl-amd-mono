@@ -1,6 +1,6 @@
 """The Qwen3.8 MoE gfx950 monokernel spec on CPU (RFC #43949): its registry entry
-and widths, and its config and model refusal reasons. The fused shared expert runs.
-An MXFP4 out_proj refuses at startup with the SGLang PR it needs."""
+and widths, and its config and model refusal reasons. The fused shared expert and
+an MXFP4 out_proj run."""
 
 import sys
 from types import SimpleNamespace
@@ -56,15 +56,11 @@ def _cfg(**kw):
 
 
 def test_config_reasons(monkeypatch):
-    monkeypatch.delenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", raising=False)
+    monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
     reasons = qwen.SPEC.config_disable_reasons
     assert reasons(_cfg(), QWEN) == []
     assert reasons(_cfg(enable_linear_replayssm=True), QWEN) == []
     assert reasons(_cfg(enforce_shared_experts_fusion=True), QWEN) == []
-    monkeypatch.setenv("SGLANG_ROCM_GDN_ONLINE_MXFP4", "1")
-    assert reasons(_cfg(), QWEN) == [qwen.PENDING_MXFP4]
-    assert "sglang#43839" in qwen.PENDING_MXFP4
-    monkeypatch.delenv("SGLANG_ROCM_GDN_ONLINE_MXFP4")
     other = SimpleNamespace(**{**vars(QWEN), "hidden_size": 4096})
     joined = " | ".join(reasons(_cfg(), other))
     assert "hidden_size = 8192" in joined, joined
@@ -150,9 +146,7 @@ def test_model_reasons(kw):
     # Qwen3.8's pattern: three GDN layers, then a full-attention layer
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    # an MXFP4 out_proj refuses once, not once a layer; the fused shared expert runs
-    want = [qwen.PENDING_MXFP4] if kw.get("mxfp4") else []
-    assert reasons == want, reasons
+    assert reasons == [], reasons
 
 
 def test_the_shared_expert_is_unfused_or_expert_512():

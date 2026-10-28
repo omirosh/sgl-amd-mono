@@ -13,8 +13,7 @@ around the layers.
 
 The kernels read SGLang's weights in place at each launch. The fused shared expert
 (``--enforce-shared-experts-fusion``, MXFP4 with sglang#41899) runs K2 ``fse``: the
-shared expert is routed expert 512. K2 also has an MXFP4 out_proj (``oq``). Until
-SGLang serves it (sglang#43839), the spec refuses it at startup.
+shared expert is routed expert 512. An MXFP4 out_proj (sglang#43839) runs K2 ``oq``.
 """
 
 from __future__ import annotations
@@ -56,12 +55,6 @@ WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
 # the mailbox tags K2 writes: TAG_SLOTS // 2 + i, as in sglang#43516 (its K1 has i)
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
-
-# Refused until SGLang serves the variant; it names the PR that does
-PENDING_MXFP4 = (
-    "MXFP4 GDN projections are not supported yet: they need sglang#43839 with the "
-    "quantization in the load path; unset SGLANG_ROCM_GDN_ONLINE_MXFP4"
-)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -162,8 +155,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     layers = getattr(text, "num_hidden_layers", 0)
     if layers > MAX_LAYERS:
         reasons.append(f"{layers} layers: the mailbox tags hold {MAX_LAYERS}")
-    if os.environ.get("SGLANG_ROCM_GDN_ONLINE_MXFP4"):
-        reasons.append(PENDING_MXFP4)
     if importlib.util.find_spec("flydsl") is None:
         reasons.append("needs FlyDSL")
     return reasons
@@ -205,10 +196,8 @@ def _layer_reasons(layer, eps: float) -> list[str]:
         reasons.append("needs the norm, router and shared-expert gate in bf16")
     if _is_gdn(layer):
         o = layer.linear_attn.out_proj
-        if _mxfp4(o):
-            reasons.append(PENDING_MXFP4)
-        elif not _bf16(o.weight):
-            reasons.append("needs out_proj in bf16")
+        if not (_mxfp4(o) or _bf16(o.weight)):
+            reasons.append("needs out_proj in bf16 or MXFP4")
     else:
         o = layer.o_proj
         if not layer.attn_output_gate or layer.q_size != L.CORE:
@@ -233,17 +222,13 @@ def _layers(model) -> list:
 
 
 def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    reasons = []
     layers = _layers(model)
     eps = _eps(layers)
-    pending = []
-    for layer in layers:
-        for why in _layer_reasons(layer, eps):
-            if why == PENDING_MXFP4:
-                pending.append(why)
-            else:
-                reasons.append(f"layer {layer.layer_id}: {why}")
-    return list(dict.fromkeys(pending)) + reasons
+    return [
+        f"layer {layer.layer_id}: {why}"
+        for layer in layers
+        for why in _layer_reasons(layer, eps)
+    ]
 
 
 class _Identity(torch.nn.Module):
