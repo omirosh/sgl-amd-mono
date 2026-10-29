@@ -3,9 +3,10 @@ points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path, a
 requests join and leave a running batch that steps past 8 rows and back (a short
 GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
 tokens of covered steps scored again by the normal prefill path (KL consistency);
-each covered layer against SGLang's layer (check mode), also with the fused shared
-expert of sgl-project/sglang#41899; and a fault on one rank that stops the server
-before any token of the failed step is sent."""
+each covered layer against SGLang's layer (check mode), with the MXFP4 GDN
+projections of sgl-project/sglang#43839, also with the fused shared expert of
+sgl-project/sglang#41899; and a fault on one rank that stops the server before any
+token of the failed step is sent."""
 
 import os
 import re
@@ -117,7 +118,10 @@ class TestMonokernelVerify(CustomTestCase):
 
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
-        self._check()
+        # SGLang quantizes the GDN projections to MXFP4 by default
+        # (sgl-project/sglang#43839), so K1 runs qq and K2 oq
+        log = self._check()
+        self.assertRegex(log, r"Online MXFP4 GDN in_proj_qkvz,out_proj: [1-9]")
 
     def test_each_covered_layer_with_the_fused_shared_expert(self):
         # sgl-project/sglang#41899 quantizes the BF16 shared expert and fuses it as
