@@ -37,7 +37,17 @@ in, but runs x and silu(g) u through MXFP4, 1 x 32 blocks, RCEIL scales). Their
 weights are ``AITER_MXFP4_MXFP4``'s shuffled ones (``layout``). Peer regions are
 double-buffered by the step epoch's parity.
 
-At one row the union U is the token's picks in top-k order (no union pass).
+Two schedule choices follow the width: at one row the union U is the token's
+picks in top-k order (no union pass); with the fused shared expert and at
+least 4 rows, its gate | up tasks run before the route (they don't depend
+on it).
+
+One variant follows the stock flags:
+
+- ``fse`` (a fused shared expert, ``num_fused_shared_experts`` 1): the shared expert is
+  expert 512 of w13 / w2, a pick of every token at top-k index 10 with weight
+  sigmoid(bf16(x . w_sg)) (fp32, the top-k kernel's fused sigmoid); no sgu
+  stage, no shared down rows.
 """
 
 import math
@@ -108,6 +118,8 @@ G_TASKS = 2 * SI // ROWS  # 32
 R0 = NRED  # 64: router CTAs
 G0 = R0 + R_TASKS  # 80: shared gate | up CTAs
 RT0 = G0 + G_TASKS  # 112: shared gate (SGATE) CTAs, a token each
+PS0 = G0  # the fused shared expert's early ug CTAs (the idle gate | up ones)
+PS_MIN = 4  # rows from which the fused shared expert's ug runs before the route
 UG_AHEAD = 1  # ug tasks a CTA prefetches past the running one
 DB = 4  # a wave's down slots whose w2 is in flight together
 UG_COLS = 16  # intermediate columns an ug task
@@ -115,7 +127,7 @@ UG_GROUPS = RI // UG_COLS  # 16
 W13_STEPS = HIDDEN // L.FP4_STEP  # 64
 UG_STEPS = W13_STEPS // 4  # a wave's K quarter: 16 steps
 W2_STEPS = RI // L.FP4_STEP  # 2
-MAX_U = L.MAX_U
+MAX_U = L.MAX_U + 1  # + the fused shared expert
 LOG2E = 1.0 / math.log(2.0)
 TAG_SLOTS = 256
 
@@ -128,6 +140,7 @@ _STREAM = fx.Stream(None)
 class K2Build(msgspec.Struct, frozen=True):
     tokens: int
     eps: float = 1e-6  # post_attention_layernorm
+    fse: bool = False  # the shared expert fused as expert 512
     # o_proj's input is core x sigmoid(gate) (bf16; the attention output gate
     # as Qwen3NextAttention applies it)
     og: bool = False
@@ -139,9 +152,19 @@ class K2Build(msgspec.Struct, frozen=True):
     stop: bool = True
 
     @property
+    def picks(self) -> int:
+        """Expert picks a token: the top-k (+ the fused shared expert)."""
+        return TOPK + int(self.fse)
+
+    @property
     def u1(self) -> bool:
         """One row: U is the token's picks in top-k order (no union pass)."""
         return self.tokens == 1
+
+    @property
+    def ps(self) -> bool:
+        """The fused shared expert's ug tasks run before the route."""
+        return self.fse and self.tokens >= PS_MIN
 
 
 ABI = KernelAbi(
@@ -207,7 +230,7 @@ def scratch_layout(key: K2Build) -> dict:
         "sgu": s * SI,  # 2 SI bf16 a token, two a pair
         "sgate": s,
         "route": s * 2 * TOPK,
-        "inter": s * TOPK * RI,
+        "inter": s * key.picks * RI,
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -628,7 +651,8 @@ def stage_sgu(c, g, ops):
 @flyc.jit
 def stage_sgate(c, t):
     """Token t's shared-expert gate: sigmoid(bf16(x . w_sg)) as bf16 -> SGATE
-    (ReplicatedLinear then torch.sigmoid, both bf16 out)."""
+    (ReplicatedLinear then torch.sigmoid, both bf16 out); fused (``fse``), the
+    sigmoid stays fp32: the top-k kernel's on the combined gate's bf16 logit."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     wait_x(c, HIDDEN, 0)
@@ -656,7 +680,7 @@ def stage_sgate(c, t):
         for w in range_constexpr(1, WAVES):
             tot = tot + fx.ptr_load(red + w)
         g = sigmoid(bf16_round(tot))
-        c["put"](c["sgate"], t, bf16_round(g))
+        c["put"](c["sgate"], t, g if c["fse"] else bf16_round(g))
     gpu.barrier()
 
 
@@ -765,15 +789,25 @@ def local_route(c):
 def load_route(c):
     """The LDS route (ids, weights; a token's ``KT`` picks) -> the union U in
     expert order: flag[e] -> slot, expert[slot], kof[slot][t] (the token's pick
-    index, -1 if not picked). Returns |U|."""
+    index, -1 if not picked); fused, the shared expert is U's last slot, every
+    token's pick ``TOPK`` with its SGATE weight. Returns |U|."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt, kt = c["rt"], c["KT"]
+    if const_expr(c["fse"]):  # noqa: SIM102 (traced: `and` does not combine traced values)
+        if tid < s:
+            g = c["poll"]([(c["sgate"], tid, 1)])[0][0]
+            fx.ptr_store(fx.Int32(E), rt["route"] + (tid * 2 * kt + TOPK))
+            fx.ptr_store(g, rt["route"] + (tid * 2 * kt + kt + TOPK))
     if const_expr(c["u1"]):
         # local_route's stores are this wave's (wave 0): no barrier first
         if tid < TOPK:
             e = fx.max(fx.min(fx.ptr_load(rt["route"] + tid), E - 1), 0)
             fx.ptr_store(e, rt["expert"] + tid)
             fx.ptr_store(fx.Int32(tid), rt["kof"] + tid * 8)
+        if const_expr(c["fse"]):  # noqa: SIM102
+            if tid == 0:
+                fx.ptr_store(fx.Int32(E), rt["expert"] + TOPK)
+                fx.ptr_store(fx.Int32(TOPK), rt["kof"] + TOPK * 8)
         gpu.barrier()
         return fx.Int32(kt)
     for i in range_constexpr((E + THREADS - 1) // THREADS):
@@ -805,15 +839,22 @@ def load_route(c):
         e = fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * kt + k)), E - 1), 0)
         slot = fx.ptr_load(rt["flag"] + e)
         fx.ptr_store(fx.Int32(k), rt["kof"] + (slot * 8 + t))
+    if const_expr(c["fse"]):
+        if tid < s:
+            fx.ptr_store(fx.Int32(TOPK), rt["kof"] + (tot * 8 + tid))
+        if tid == 0:
+            fx.ptr_store(fx.Int32(E), rt["expert"] + tot)
+        tot = tot + 1
     gpu.barrier()
     return uniform(tot)
 
 
 # ---------------------------------------------------------------- ug
-def ug_loads(c, task, live):
+def ug_loads(c, task, live, shared=False):
     """Task ``task``'s w13 operands for this wave (gate or up by wave % 2, K
     quarter wave / 2: 16 steps) and its scale words (a word: two steps); out of
-    bounds (no memory access, zeros) where ``live`` is false."""
+    bounds (no memory access, zeros) where ``live`` is false. ``shared``: the
+    fused shared expert's task ``task`` (no union yet)."""
     lane, wave = c["lane"], c["wave"]
     a, rt = c["args"], c["rt"]
     slot = task // UG_GROUPS
@@ -822,9 +863,16 @@ def ug_loads(c, task, live):
     kq = wave // 2
     rg = L.w13_group(gu, g)
     wb, sb = RI * HIDDEN, 2 * RI * HIDDEN // 32
-    e = uniform(fx.ptr_load(rt["expert"] + slot))
-    r_w = rsrc(a["w13"], live.select(fx.Int32(E * wb), fx.Int32(0)))
-    r_s = rsrc(a["w13s"], live.select(fx.Int32(E * sb), fx.Int32(0)))
+    if const_expr(shared):
+        e = 0
+        r_w = rsrc(a["w13"] + fx.Int64(E * wb), live.select(fx.Int32(wb), fx.Int32(0)))
+        r_s = rsrc(a["w13s"] + fx.Int64(E * sb), live.select(fx.Int32(sb), fx.Int32(0)))
+    else:
+        e = uniform(fx.ptr_load(rt["expert"] + slot))
+        # + the fused shared expert, expert E
+        n_w, n_s = (E + 1) * wb, (E + 1) * sb
+        r_w = rsrc(a["w13"], live.select(fx.Int32(n_w), fx.Int32(0)))
+        r_s = rsrc(a["w13s"], live.select(fx.Int32(n_s), fx.Int32(0)))
     base = L.w13_base(e)
     tiles = [
         fp4_tile(r_w, L.fp4_tile_dword(base, rg, HIDDEN, kq * UG_STEPS + i, lane))
@@ -841,10 +889,10 @@ def ug_loads(c, task, live):
 
 
 @flyc.jit
-def stage_ug(c, task, ops):
+def stage_ug(c, task, ops, shared=False):
     """Slot task / 16, columns 16 (task % 16) ..: the gate and up rows against
     the x rows' MXFP4 codes in LDS (``ops``: ``ug_loads``); silu(g) u -> fp32 ->
-    INTER of each picking token."""
+    INTER of each picking token (``shared``: every token's pick ``TOPK``)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt = c["rt"]
     slot = task // UG_GROUPS
@@ -873,7 +921,10 @@ def stage_ug(c, task, ops):
     if tid < s * (UG_COLS // 2):
         tt = tid // (UG_COLS // 2)
         cp = tid % (UG_COLS // 2)
-        k = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
+        if const_expr(shared):
+            k = fx.Int32(TOPK)
+        else:
+            k = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
         gw = (0, 2, 4, 6)
         uw = (1, 3, 5, 7)
         v = [
@@ -989,11 +1040,12 @@ def stage_down(c, rgd, nu, ops0, rgd_next=None):
     bf16 partial -> every rank's FINAL. The last batch's prefetch is row group
     ``rgd_next``'s first batch, returned (the loop runs: |U| >= TOPK > WAVES)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    rt, kt = c["rt"], c["KT"]
+    rt, kt, fse = c["rt"], c["KT"], c["fse"]
     t = fx.min(lane % 16, s - 1)
     nt = DB * W2_STEPS
-    # the shared down's operands first: K 256 is two chunks (waves 0, 1)
-    sops = gemv.loads(lane, wave, c["args"]["w_sd"], rgd * ROWS, SI)
+    if const_expr(not fse):
+        # the shared down's operands first: K 256 is two chunks (waves 0, 1)
+        sops = gemv.loads(lane, wave, c["args"]["w_sd"], rgd * ROWS, SI)
     for i in range_constexpr((s * kt * ROWS + THREADS - 1) // THREADS):
         j = tid + THREADS * i
         if j < s * kt * ROWS:
@@ -1047,22 +1099,27 @@ def stage_down(c, rgd, nu, ops0, rgd_next=None):
                     )
         b0 = nb
         ops = ops_n
-    # the shared down: rows 16 rgd .. against h
-    acc = gemv.mfmas(lane, wave, c["hl"], SI + gemv.LDS_PAD, SI, s, sops)
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    if const_expr(not fse):
+        # the shared down: rows 16 rgd .. against h
+        acc = gemv.mfmas(lane, wave, c["hl"], SI + gemv.LDS_PAD, SI, s, sops)
+        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
-        sg = f32_of(c["poll"]([(c["sgate"], tt, 1)])[0][0])
+        if const_expr(not fse):
+            sg = f32_of(c["poll"]([(c["sgate"], tt, 1)])[0][0])
         ys = []
         for d in range_constexpr(2):
             r = 2 * rp + d
             y = fx.Float32(0.0)
             for k in range_constexpr(kt):
                 y = y + fx.ptr_load(c["contrib"] + ((tt * kt + k) * ROWS + r))
-            sd = bf16_round(bf16_round(row_sum(red, r, tt)) * sg)
-            ys.append(bf16_round(bf16_round(y) + sd))
+            if const_expr(fse):
+                ys.append(bf16_round(y))
+            else:
+                sd = bf16_round(bf16_round(row_sum(red, r, tt)) * sg)
+                ys.append(bf16_round(bf16_round(y) + sd))
         for p in range_constexpr(TP):
             c["put_bf"](
                 c["peer"]["final"][p],
@@ -1112,7 +1169,7 @@ def build(key: K2Build):
     play = peer_layout(L.MAX_TOKENS)
     half = peer_bytes(L.MAX_TOKENS) // 2
 
-    kt = TOPK
+    kt = key.picks
 
     @fx.struct
     class RouteLds:
@@ -1129,7 +1186,7 @@ def build(key: K2Build):
     @fx.struct
     class DownLds:
         il: fx.Array[fx.Int32, s * kt * (RI + gemv.LDS_PAD) // 2, 16]
-        hl: fx.Array[fx.Int32, s * (SI + gemv.LDS_PAD) // 2, 16]
+        hl: fx.Array[fx.Int32, 16 if key.fse else s * (SI + gemv.LDS_PAD) // 2, 16]
         contrib: fx.Array[fx.Float32, s * kt * ROWS, 16]
 
     @fx.union
@@ -1143,7 +1200,7 @@ def build(key: K2Build):
         rs: fx.Array[fx.Float32, 16, 16]
 
     keyed = key_tuple(key, SOURCES)
-    name = f"qwen38_mono_k2_s{s}_a{int(key.og)}"
+    name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_a{int(key.og)}"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -1212,6 +1269,7 @@ def build(key: K2Build):
                 "wave": tid // 64,
                 "rank": rank,
                 "eps": key.eps,
+                "fse": key.fse,
                 "KT": kt,
                 "put": mb.put,
                 "put_bf": mb.put_bf,
@@ -1278,19 +1336,28 @@ def build(key: K2Build):
                 run_oproj(c, [o_loads(c, j) for j in range(nj)])
             if bid < NRED:
                 stage_norm(c, bid)
-            if is_g:
-                gi = bid - G0
-                gops = gemv.loads(c["lane"], c["wave"], w_sgu, gi * ROWS, HIDDEN)
-                stage_sgu(c, gi, gops)
+            if const_expr(not key.fse):  # noqa: SIM102 (traced: `and` does not combine traced values)
+                if is_g:
+                    gi = bid - G0
+                    gops = gemv.loads(c["lane"], c["wave"], w_sgu, gi * ROWS, HIDDEN)
+                    stage_sgu(c, gi, gops)
             if (bid >= RT0) & (bid < RT0 + s):
                 stage_sgate(c, bid - RT0)
             # ---- the routed experts: x in and quantized while the route's logits
-            # come in
+            # come in; the fused shared expert's tasks need no route
+            is_ps = (bid >= PS0) & (bid < PS0 + UG_GROUPS)
+            if const_expr(key.ps):
+                sops = ug_loads(
+                    c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True
+                )
             wait_x(c, HIDDEN, 0)
             quant_x_fp4(c)
+            if const_expr(key.ps):  # noqa: SIM102
+                if is_ps:
+                    stage_ug(c, bid - PS0, sops, True)
             local_route(c)
             nu = load_route(c)
-            total = nu * UG_GROUPS
+            total = (nu - int(key.ps)) * UG_GROUPS
             last = total - 1
             # reversed placement: the round's leftover tasks go to the high
             # CTAs, past the norm / router / sgate ones; a prefetch past the last
@@ -1307,7 +1374,8 @@ def build(key: K2Build):
                 task = task + BLOCKS
                 ops = ops[1:] + [ops_n]
             dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
-            load_h(c)
+            if const_expr(not key.fse):
+                load_h(c)
             load_inter(c, nu)
             dops2 = stage_down(c, bid, nu, dops, bid + BLOCKS)
             stage_down(c, bid + BLOCKS, nu, dops2)
@@ -1376,8 +1444,6 @@ def layer_post(
     ln_w,
     w_gate,
     w_sg,
-    w_sgu,
-    w_sd,
     w13,
     w13s,
     w2,
@@ -1389,16 +1455,19 @@ def layer_post(
     rank,
     epoch,
     layer,
+    w_sgu=None,
+    w_sd=None,
     gate=None,
 ):
     """Host launcher; every weight as SGLang holds it after loading, the experts'
-    shuffled (``layout``). ``w_sgu`` / ``w_sd``: the shared expert; ``gate``: the
-    attention output gate (``key.og``), core's shape.
+    shuffled (``layout``). ``w_sgu`` / ``w_sd``: the unfused shared expert (not
+    ``key.fse``); ``gate``: the attention output gate (``key.og``), core's shape.
     ``peers``: the int64 table of every rank's peer buffer
     (``peer_buffer_bytes()`` each)."""
     s = key.tokens
     bf = torch.bfloat16
     fp4 = (torch.uint8, torch.float4_e2m1fn_x2)
+    ne = E + int(key.fse)
     need(
         core.shape == (s, OK) and residual.shape == (s, HIDDEN),
         "core / residual shape",
@@ -1411,24 +1480,28 @@ def layer_post(
     need(ln_w.shape == (HIDDEN,), "norm shape")
     need(w_o.shape == (HIDDEN, OK) and w_o.dtype == bf, "o_proj: bf16 [8192, 2048]")
     need(w_gate.shape == (E, HIDDEN) and w_sg.numel() == HIDDEN, "router shape")
+    if not key.fse:
+        need(
+            w_sgu is not None
+            and w_sd is not None
+            and w_sgu.shape == (2 * SI, HIDDEN)
+            and w_sd.shape == (HIDDEN, SI),
+            "shared expert shape",
+        )
     need(
-        w_sgu.shape == (2 * SI, HIDDEN) and w_sd.shape == (HIDDEN, SI),
-        "shared expert shape",
+        w13.shape == (ne, 2 * RI, HIDDEN // 2) and w13.dtype in fp4,
+        f"w13: fp4x2 [{ne}, 512, 4096]",
     )
     need(
-        w13.shape == (E, 2 * RI, HIDDEN // 2) and w13.dtype in fp4,
-        "w13: fp4x2 [512, 512, 4096]",
+        w2.shape == (ne, HIDDEN, RI // 2) and w2.dtype in fp4,
+        f"w2: fp4x2 [{ne}, 8192, 128]",
     )
     need(
-        w2.shape == (E, HIDDEN, RI // 2) and w2.dtype in fp4,
-        "w2: fp4x2 [512, 8192, 128]",
-    )
-    need(
-        w13s.numel() == E * 2 * RI * HIDDEN // 32 and w13s.element_size() == 1,
+        w13s.numel() == ne * 2 * RI * HIDDEN // 32 and w13s.element_size() == 1,
         "w13 scales: e8m0, one a 32-block",
     )
     need(
-        w2s.numel() == E * HIDDEN * RI // 32 and w2s.element_size() == 1,
+        w2s.numel() == ne * HIDDEN * RI // 32 and w2s.element_size() == 1,
         "w2 scales: e8m0, one a 32-block",
     )
     used = [w_o, w_gate, w_sg, w_sgu, w_sd, w13, w13s, w2, w2s]
@@ -1437,7 +1510,7 @@ def layer_post(
     need(all(t.is_contiguous() for t in tensors), "a non-contiguous input")
     dense = [core, residual, out, res_out, ln_w, w_gate, w_sg]
     dense += [gate] if gate is not None else []
-    dense += [w_sgu, w_sd]
+    dense += [w for w in (w_sgu, w_sd) if w is not None and not key.fse]
     need(all(t.dtype == bf for t in dense), "activations and dense weights: bf16")
 
     def ptr(t):
@@ -1453,8 +1526,8 @@ def layer_post(
                 "ln_w": ln_w.data_ptr(),
                 "w_gate": w_gate.data_ptr(),
                 "w_sg": w_sg.data_ptr(),
-                "w_sgu": w_sgu.data_ptr(),
-                "w_sd": w_sd.data_ptr(),
+                "w_sgu": 0 if key.fse else ptr(w_sgu),
+                "w_sd": 0 if key.fse else ptr(w_sd),
                 "w13": w13.data_ptr(),
                 "w13s": w13s.data_ptr(),
                 "w2": w2.data_ptr(),

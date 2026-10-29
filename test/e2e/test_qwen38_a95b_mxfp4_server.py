@@ -3,8 +3,9 @@ points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path, a
 requests join and leave a running batch that steps past 8 rows and back (a short
 GSM8K run, for gross failures); NEXTN verify steps of up to 8 rows run K2; the
 tokens of covered steps scored again by the normal prefill path (KL consistency);
-each covered layer against SGLang's layer (check mode); and a fault on one rank
-that stops the server before any token of the failed step is sent."""
+each covered layer against SGLang's layer (check mode), also with the fused shared
+expert of sgl-project/sglang#41899; and a fault on one rank that stops the server
+before any token of the failed step is sent."""
 
 import os
 import re
@@ -116,6 +117,15 @@ class TestMonokernelVerify(CustomTestCase):
 
 class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
+        self._check()
+
+    def test_each_covered_layer_with_the_fused_shared_expert(self):
+        # sgl-project/sglang#41899 quantizes the BF16 shared expert and fuses it as
+        # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
+        log = self._check(["--enforce-shared-experts-fusion"])
+        self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
+
+    def _check(self, extra_args=()):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
         # 1, 3 and 8 rows run widths 1, 3 and 8
         para = "The river valley archive lists the flood height of every year. "
@@ -126,7 +136,11 @@ class TestMonokernelCheck(CustomTestCase):
             process = _launch(
                 extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
                 # ARGS' --cuda-graph-config wins over --disable-cuda-graph
-                extra_args=["--cuda-graph-config", '{"decode":{"backend":"disabled"}}'],
+                extra_args=[
+                    "--cuda-graph-config",
+                    '{"decode":{"backend":"disabled"}}',
+                    *extra_args,
+                ],
                 log=(out, err),
             )
             try:
@@ -164,6 +178,7 @@ class TestMonokernelCheck(CustomTestCase):
         routes = re.findall(r"monokernel check route .*", log)
         print(f"rows routed elsewhere: {len(routes)} of {rows}")
         self.assertLessEqual(len(routes), rows // 100, "\n".join(routes[:20]))
+        return log
 
 
 class TestMonokernelFault(CustomTestCase):

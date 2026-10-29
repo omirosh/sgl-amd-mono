@@ -18,9 +18,10 @@ input there. SGLang's embedding, final norm and logits processor run around the
 layers.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
-in_proj_qkvz after the build). The spec refuses the fused shared expert
-(``--enforce-shared-experts-fusion``) and the MXFP4 GDN projections
-(``SGLANG_ROCM_GDN_ONLINE_MXFP4``) at startup.
+in_proj_qkvz after the build). The fused shared expert
+(``--enforce-shared-experts-fusion``, MXFP4 with sgl-project/sglang#41899) runs K2
+``fse``: the shared expert is routed expert 512. The spec refuses the MXFP4 GDN
+projections (``SGLANG_ROCM_GDN_ONLINE_MXFP4``) at startup.
 """
 
 from __future__ import annotations
@@ -65,11 +66,7 @@ WIDTHS = tuple(range(1, L.MAX_TOKENS + 1))
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
 
-# The variants the kernels do not run yet, refused once a model
-PENDING_FSE = (
-    "the kernels do not run the fused shared expert yet; "
-    "start without --enforce-shared-experts-fusion"
-)
+# The variant the kernels do not run yet, refused once a model
 PENDING_MXFP4 = (
     "the kernels do not run the MXFP4 GDN projections yet; "
     "start with SGLANG_ROCM_GDN_ONLINE_MXFP4=0"
@@ -79,7 +76,6 @@ PENDING_MXFP4 = (
 SGLANG_READS = {
     "srt/arg_groups/fields/*.py": (
         "enable_linear_replayssm",
-        "enforce_shared_experts_fusion",
         "speculative_algorithm",
         "speculative_eagle_topk",
         "speculative_num_steps",
@@ -223,8 +219,6 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     layers = getattr(text, "num_hidden_layers", 0)
     if layers > MAX_LAYERS:
         reasons.append(f"{layers} layers: the mailbox tags hold {MAX_LAYERS}")
-    if cfg.enforce_shared_experts_fusion:
-        reasons.append(PENDING_FSE)
     dtypes = mamba2_state_dtype(hf_config)
     if dtypes.temporal not in (torch.float32, torch.bfloat16):
         reasons.append(f"needs the SSM state in f32 or bf16, got {dtypes.temporal}")
@@ -263,19 +257,18 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
     if not isinstance(mlp, Qwen2MoeSparseMoeBlock):
         return [f"needs the sparse MoE block, got {type(mlp).__name__}"]
     reasons = []
-    pending = _fse(mlp) or mlp.shared_expert is None
-    if pending:
-        reasons.append(PENDING_FSE)
-    else:
-        se = mlp.shared_expert
-        if not _bf16(se.gate_up_proj.weight, se.down_proj.weight):
-            reasons.append("needs the shared expert in bf16")
+    se = mlp.shared_expert
+    if se is None and not _fse(mlp):
+        reasons.append("needs the shared expert")
+    elif se is not None and not _bf16(se.gate_up_proj.weight, se.down_proj.weight):
+        reasons.append("needs the shared expert in bf16")
     ex = mlp.experts
+    e = L.E + _fse(mlp)
     if not getattr(ex.w13_weight, "is_shuffled", False):
         reasons.append("needs the routed experts in AITER's shuffled layout")
     if ex.w13_weight.dtype != torch.uint8 or ex.w2_weight.dtype != torch.uint8:
         reasons.append("needs MXFP4 routed experts")
-    if not pending and tuple(ex.w13_weight.shape) != (L.E, 2 * L.RI, L.HIDDEN // 2):
+    if tuple(ex.w13_weight.shape) != (e, 2 * L.RI, L.HIDDEN // 2):
         reasons.append(
             f"routed w13 shape {tuple(ex.w13_weight.shape)}: the kernels take the "
             f"experts TP-sharded, unpadded"
@@ -343,7 +336,7 @@ def _model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
     pending = []
     for layer in layers:
         for why in _layer_reasons(layer, eps):
-            if why in (PENDING_FSE, PENDING_MXFP4):
+            if why == PENDING_MXFP4:
                 pending.append(why)
             else:
                 reasons.append(f"layer {layer.layer_id}: {why}")
@@ -538,11 +531,12 @@ class _Built:
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
         if check_batch is not None:
             ref, ids, logits = check.k2_reference(layer, o, core, residual, check_batch)
+        fse = _fse(mlp)
         se, ex = mlp.shared_expert, mlp.experts
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
         k2.layer_post(
-            self.k2_keys[s],
+            self.k2_keys[s, fse],
             core=core,
             residual=residual,
             w_o=o.weight,
@@ -560,12 +554,12 @@ class _Built:
             rank=self.rank,
             epoch=self.epoch,
             layer=TAG_SLOTS // 2 + i,
-            w_sgu=se.gate_up_proj.weight,
-            w_sd=se.down_proj.weight,
+            w_sgu=None if se is None else se.gate_up_proj.weight,
+            w_sd=None if se is None else se.down_proj.weight,
         )
         if check_batch is not None:
             # ROUTE: (value, tag) pairs; token t's experts at 2 k t, then its weights
-            off, n = k2.scratch_layout(self.k2_keys[s])["route"]
+            off, n = k2.scratch_layout(self.k2_keys[s, fse])["route"]
             route = (
                 self.k2_scratch[s][off : off + n].view(torch.int32).view(s, 2, -1, 2)
             )
@@ -645,13 +639,15 @@ def _build(model, hf_config, ctx) -> _Built:
                     fault_after=fault_after,
                 )
     k2_keys = {
-        w: k2.K2Build(
+        (w, fse): k2.K2Build(
             tokens=w,
             eps=e2,
+            fse=fse,
             fault_site=fault_site,
             fault_after=fault_after,
         )
         for w in ctx.widths
+        for fse in sorted({_fse(x.mlp) for x in layers})
     }
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
     ticks = guard.deadline_ticks(ctx.deadline_s)
