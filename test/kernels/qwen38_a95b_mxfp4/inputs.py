@@ -62,18 +62,20 @@ def k1_state(g, slots, bf16=False):
     )
 
 
-def k2_weights(dev, rank, seed):
+def k2_weights(dev, rank, seed, fse=False):
     """``layer_post``'s weights: this rank's shards, then the replicated ones."""
+    ne = E + int(fse)
     g = gen(dev, seed + rank)
     w = {
-        "w13": codes(g, E, 2 * RI, HIDDEN // 2),
-        "w13s": codes(g, E * 2 * RI * HIDDEN // 32, lo=117, hi=121),
-        "w2": codes(g, E, HIDDEN, RI // 2),
-        "w2s": codes(g, E * HIDDEN * RI // 32, lo=117, hi=121),
+        "w13": codes(g, ne, 2 * RI, HIDDEN // 2),
+        "w13s": codes(g, ne * 2 * RI * HIDDEN // 32, lo=117, hi=121),
+        "w2": codes(g, ne, HIDDEN, RI // 2),
+        "w2s": codes(g, ne * HIDDEN * RI // 32, lo=117, hi=121),
     }
     w["w_o"] = rnd(g, HIDDEN, CORE, scale=0.02)
-    w["w_sgu"] = rnd(g, 2 * SI, HIDDEN, scale=0.02)
-    w["w_sd"] = rnd(g, HIDDEN, SI, scale=0.02)
+    if not fse:
+        w["w_sgu"] = rnd(g, 2 * SI, HIDDEN, scale=0.02)
+        w["w_sd"] = rnd(g, HIDDEN, SI, scale=0.02)
     g = gen(dev, seed)
     w["ln_w"] = rnd(g, HIDDEN, scale=0.1)
     w["w_gate"] = rnd(g, E, HIDDEN, scale=0.02)

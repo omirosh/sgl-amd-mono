@@ -130,8 +130,10 @@ def k2_reference(layer, o_proj, core, residual, forward_batch):
 
 
 def routed_alike(ids: torch.Tensor, k2_ids: torch.Tensor) -> torch.Tensor:
-    """The rows whose K2 experts are SGLang's top-k as a set."""
-    return (ids.sort(dim=-1).values == k2_ids.sort(dim=-1).values).all(dim=-1)
+    """The rows whose K2 experts are SGLang's top-k as a set. With FSE, SGLang's
+    shared slot comes after the top-k and is not compared."""
+    k = k2_ids.shape[1]
+    return (ids[:, :k].sort(dim=-1).values == k2_ids.sort(dim=-1).values).all(dim=-1)
 
 
 def k2_alike(layer_id: int, ids, logits, k2_ids: torch.Tensor):
