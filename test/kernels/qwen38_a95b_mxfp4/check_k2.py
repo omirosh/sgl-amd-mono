@@ -2,8 +2,8 @@
 experts, the MoE TP reduce) on 8 gfx950 GPUs (torchrun), on random TP8 shards in
 SGLang's layouts:
 
-- compile: every build key the spec can make (widths 1 .. 8) compiles on every
-  rank;
+- compile: every build key the spec can make (widths 1 .. 8, fused shared
+  expert) compiles on every rank;
 - batch invariance: a probe row's out and res_out do not change with the step's
   other rows (other requests, zero rows, copies of the probe) or the width, on
   every rank, and every rank has the same out;
@@ -72,7 +72,10 @@ class Side:
 
     def run(self, key, w, core, residual, out, res_out):
         if key.tokens not in self.scratch:
-            n = k2.scratch_bytes(key)
+            n = max(
+                k2.scratch_bytes(k2.K2Build(tokens=key.tokens, fse=f))
+                for f in (False, True)
+            )
             self.scratch[key.tokens] = torch.zeros(n, dtype=torch.uint8, device=DEV)
         self.epoch[:1].add_(1)
         k2.layer_post(
@@ -110,7 +113,9 @@ def compile_keys(keys):
 
 
 def check_compile():
-    keys = [k2.K2Build(tokens=s) for s in range(1, MAXT + 1)]
+    keys = [
+        k2.K2Build(tokens=s, fse=f) for s in range(1, MAXT + 1) for f in (False, True)
+    ]
     t0 = time.time()
     ok = compile_keys(keys)
     log(
