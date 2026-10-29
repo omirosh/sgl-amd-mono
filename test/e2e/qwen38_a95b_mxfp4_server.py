@@ -8,8 +8,6 @@ MODEL = os.environ.get(
 )
 ENV = {
     "SGLANG_USE_AITER": "1",
-    # bf16 GDN projections: SGLang quantizes them to MXFP4 by default
-    "SGLANG_ROCM_GDN_ONLINE_MXFP4": "0",
     "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
     "SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION": "1",
     "AITER_USE_FLYDSL_MOE_SORTING": "1",
