@@ -6,7 +6,8 @@ against the kernels of sgl-project/sglang#43516, bit for bit, on 8 gfx950 GPUs
 1. K1: core, res_out and the conv / SSM state slots, for widths 1 .. 8, fp32 /
    bf16 state, first layer at widths 1 and 8, a pad row at each odd width from 3.
    One GPU a case; the cases spread over the ranks.
-2. K2: out and res_out on every rank, for widths 1 .. 8.
+2. K2: out and res_out on every rank, for widths 1 .. 8, and fused shared expert
+   (``fse``) at widths 1, 4 and 8.
 3. ``--time``: the time a launch, #43516 against the port, widths 1 .. 8, from a
    CUDA graph of launches.
 """
@@ -158,7 +159,10 @@ def check_k1():
 
 
 def k2_cases():
-    return [dict(tokens=s) for s in range(1, MAXT + 1)]
+    out = [dict(tokens=s, fse=False) for s in range(1, MAXT + 1)]
+    for s in (1, 4, MAXT):
+        out.append(dict(tokens=s, fse=True))
+    return out
 
 
 class K2Side:
@@ -185,7 +189,7 @@ class K2Side:
 
     def scratch_for(self, key):
         if self.base is not None:
-            k = self.base.mod.K2Build(tokens=key.tokens)
+            k = self.base.mod.K2Build(tokens=key.tokens, fse=key.fse)
             assert self.mod.scratch_bytes(key) <= self.base.mod.scratch_bytes(k)
             return self.base.scratch_for(k)
         if key not in self.scratch:
@@ -245,14 +249,14 @@ def compile_all(launches):
 
 def check_k2(timing):
     cases = k2_cases()
-    weights = k2_weights(dev, rank, 5000)
+    weights = {f: k2_weights(dev, rank, 5000 + 2 * f, fse=f) for f in (False, True)}
     old = K2Side(ol, OldPeer, ol.peer_bytes(MAXT), old_epoch())
     new = K2Side(nl, NewPeer, nl.peer_buffer_bytes(), epoch(dev))
 
     def args(i, case):
         residual = rnd(gen(dev, 9000 + i), case["tokens"], HIDDEN)
         core = rnd(gen(dev, 9500 + 1000 * rank + i), case["tokens"], CORE)
-        return weights, core, residual
+        return weights[case["fse"]], core, residual
 
     t0 = time.time()
     compile_all(
@@ -279,7 +283,7 @@ def check_k2(timing):
         if any(errors(new.epoch).values()):
             failures.append(f"K2 error words {errors(new.epoch)}")
         if timing:
-            time_k2(old, new, weights)
+            time_k2(old, new, weights[False])
     finally:
         old.close()
         new.close()
@@ -345,7 +349,7 @@ def time_k2(old, new, w):
     is the placement of the buffers; old_nb against new is the code."""
     old_nb = K2Side.on(ol, new)
     for s in range(1, MAXT + 1):
-        case = dict(tokens=s)
+        case = dict(tokens=s, fse=False)
         residual = rnd(gen(dev, 6100), s, HIDDEN)
         core = rnd(gen(dev, 6200 + rank), s, CORE)
         time_arms(

@@ -39,7 +39,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 - AMD Instinct MI350X or MI355X
 - MiniMax-M3 also needs SGLang's page16 SHUFFLE K / V for AITER sparse attention ([sgl-project/sglang#41998](https://github.com/sgl-project/sglang/pull/41998), on [#41708](https://github.com/sgl-project/sglang/pull/41708)). Until both merge, `--enable-amd-monokernel` refuses MiniMax-M3 and names them.
 - MiniMax-M3.1-Flash needs SGLang's MiniMax-M3.1-Flash support ([sgl-project/sglang#45925](https://github.com/sgl-project/sglang/pull/45925)) and its gfx950 path ([#45936](https://github.com/sgl-project/sglang/pull/45936)).
-- Qwen3.8-2.4T needs `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`: since [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839), SGLang quantizes the GDN projections to MXFP4 by default, and the kernels read them in bf16. It also refuses the fused shared expert (`--enforce-shared-experts-fusion`).
+- Qwen3.8-2.4T needs `SGLANG_ROCM_GDN_ONLINE_MXFP4=0`: since [sgl-project/sglang#43839](https://github.com/sgl-project/sglang/pull/43839), SGLang quantizes the GDN projections to MXFP4 by default, and the kernels read them in bf16. It runs the fused shared expert (`--enforce-shared-experts-fusion`) in MXFP4 with [sgl-project/sglang#41899](https://github.com/sgl-project/sglang/pull/41899).
 
 ### Installation
 
