@@ -1,6 +1,6 @@
 """The Qwen3.8 MoE gfx950 monokernel spec on CPU (RFC #43949): its registry entry
-and widths, and its config and model refusal reasons. The fused shared expert runs.
-The MXFP4 GDN projections refuse at startup, once a model."""
+and widths, and its config and model refusal reasons. The fused shared expert and
+the MXFP4 GDN projections run."""
 
 import sys
 from types import SimpleNamespace
@@ -169,9 +169,7 @@ def test_model_reasons(kw):
     # Qwen3.8's pattern: three GDN layers, then a full-attention layer
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
-    # the MXFP4 GDN projections refuse once, not once a layer; FSE runs
-    want = [qwen.PENDING_MXFP4] if kw.get("mxfp4") else []
-    assert reasons == want, reasons
+    assert reasons == [], reasons
 
 
 def test_the_shared_expert_is_unfused_or_expert_512():
