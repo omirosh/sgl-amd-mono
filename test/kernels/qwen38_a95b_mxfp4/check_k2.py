@@ -71,13 +71,16 @@ class Side:
         self.scratch = {}
 
     def run(self, key, w, core, residual, out, res_out):
-        if key.tokens not in self.scratch:
+        sk = key.tokens, key.timeline
+        if sk not in self.scratch:
             n = max(
-                k2.scratch_bytes(k2.K2Build(tokens=key.tokens, fse=f, oq=q))
+                k2.scratch_bytes(
+                    k2.K2Build(tokens=key.tokens, fse=f, oq=q, timeline=key.timeline)
+                )
                 for f in (False, True)
                 for q in (False, True)
             )
-            self.scratch[key.tokens] = torch.zeros(n, dtype=torch.uint8, device=DEV)
+            self.scratch[sk] = torch.zeros(n, dtype=torch.uint8, device=DEV)
         self.epoch[:1].add_(1)
         k2.layer_post(
             key,
@@ -86,7 +89,7 @@ class Side:
             **w,
             out=out,
             res_out=res_out,
-            scratch=self.scratch[key.tokens],
+            scratch=self.scratch[sk],
             peers=self.peer.addresses,
             rank=rank,
             epoch=self.epoch,
@@ -237,6 +240,65 @@ def check_graph_replay(side, replays):
     )
 
 
+def check_timeline(side, launches=60, warm=10):
+    """``SGLANG_AMD_MONO_TIMELINE=1``: K2's phases with the serving key (fused
+    shared expert, MXFP4 o_proj) at 1, 4 and 8 rows. A phase's time is when its
+    last CTA ends it, from the first CTA's start (s_memrealtime, 100 MHz), the
+    median of the launches on rank 0; ``event`` is the launch's event time. The
+    timeline build's out and res_out must equal the plain build's."""
+    w = k2_weights(DEV, rank, 300, fse=True, oq=True)
+    keys = {
+        s: k2.K2Build(tokens=s, fse=True, oq=True, timeline=True) for s in (1, 4, 8)
+    }
+    if not compile_keys(keys.values()):
+        return ["timeline: compile"]
+    cols, same = {}, True
+    for s, key in keys.items():
+        residual = rnd(gen(DEV, 500 + s), s, HIDDEN)  # replicated
+        core = rnd(gen(DEV, 600 + 8 * s + rank), s, CORE)
+        out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
+        res_out = torch.empty_like(out)
+        off, n = k2.scratch_layout(key)["timeline"]
+        ends, us, nus = [], [], []
+        for i in range(launches):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            side.run(key, w, core, residual, out, res_out)
+            e1.record()
+            torch.cuda.synchronize()
+            if i < warm:
+                continue
+            tl = side.scratch[s, True][off : off + n].view(torch.int64)
+            tl = tl.view(k2.BLOCKS, k2.TL_POINTS)
+            m = tl[:, : len(k2.TL_K2)].double()
+            ends.append((m.max(0).values - m[:, 0].min()) / 100)
+            us.append(e0.elapsed_time(e1) * 1000)
+            nus.append(int(tl[0, k2.TL_U]))
+        plain = torch.empty_like(out), torch.empty_like(out)
+        side.run(k2.K2Build(tokens=s, fse=True, oq=True), w, core, residual, *plain)
+        torch.cuda.synchronize()
+        same &= torch.equal(out, plain[0]) and torch.equal(res_out, plain[1])
+        cols[s] = (
+            torch.stack(ends).median(0).values.tolist(),
+            torch.tensor(us).median().item(),
+            "/".join(map(str, sorted(set(nus)))),
+        )
+    lines = [
+        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {launches - warm} launches, us"
+        " from the first CTA's start to the last CTA's end of each phase",
+        f"{'phase':<10}" + "".join(f"{f's={s}':>9}" for s in cols),
+    ]
+    for i, name in enumerate(k2.TL_K2):
+        lines.append(f"{name:<10}" + "".join(f"{v[0][i]:9.2f}" for v in cols.values()))
+    lines.append(f"{'event':<10}" + "".join(f"{v[1]:9.2f}" for v in cols.values()))
+    lines.append(f"{'|U|':<10}" + "".join(f"{v[2]:>9}" for v in cols.values()))
+    log("\n".join(lines))
+    ok = all_ok(same)
+    log(f"timeline: out and res_out equal the plain build's: {'OK' if ok else 'FAIL'}")
+    return [] if ok else ["timeline: out differs from the plain build"]
+
+
 def check_fault():
     fault = dict(fault_site=1) if rank == 3 else {}
     key = k2.K2Build(tokens=1, stop=False, **fault)
@@ -281,6 +343,8 @@ def main():
     try:
         fails += check_batch_invariance(side)
         fails += check_graph_replay(side, args.replays)
+        if os.environ.get("SGLANG_AMD_MONO_TIMELINE") == "1":
+            fails += check_timeline(side)
     finally:
         side.close()
     dist.barrier()

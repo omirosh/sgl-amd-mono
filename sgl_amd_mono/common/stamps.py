@@ -31,3 +31,16 @@ def stamp(c, point: int):
                 fx.Pointer[fx.Int64, fx.AddressSpace.Global, 8].ir_type, at
             )
             fx.generic_store(ptr, clock())
+
+
+@flyc.jit
+def mark(c, point: int, value):
+    """Store ``value`` (a count, not the clock) at ``point`` of this CTA's row, if
+    the build has one."""
+    if const_expr(c.get("tl") is not None):  # noqa: SIM102
+        if c["tid"] == 0:
+            at = c["tl"] + fx.Int64(point * 8)
+            ptr = fx.inttoptr(
+                fx.Pointer[fx.Int64, fx.AddressSpace.Global, 8].ir_type, at
+            )
+            fx.generic_store(ptr, fx.Int64(value))

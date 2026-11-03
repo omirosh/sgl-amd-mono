@@ -93,6 +93,7 @@ from sgl_amd_mono.common.plan import (
     key_tuple,
     pair_layout,
 )
+from sgl_amd_mono.common.stamps import TL_POINTS, mark, stamp, timeline_row
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import _k3 as gemv
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
@@ -141,6 +142,22 @@ assert RT0 + L.MAX_TOKENS <= BLOCKS and OTASKS == 2 * BLOCKS and L.BLOCKS == BLO
 
 _STREAM = fx.Stream(None)
 
+# a timeline build's points: the end of each phase, in launch order
+TL_K2 = (
+    "start",
+    "o_proj",
+    "norm",
+    "shared",
+    "x in",
+    "x quant",
+    "route",
+    "gate-up",
+    "inter in",
+    "down",
+    "final",
+)
+TL_U = 15  # |U| of the launch (a count)
+
 
 class K2Build(msgspec.Struct, frozen=True):
     tokens: int
@@ -156,6 +173,9 @@ class K2Build(msgspec.Struct, frozen=True):
     fault_after: int = 0
     # False: a failed wait keeps the launch running and leaves its error words (tests)
     stop: bool = True
+    # SGLANG_AMD_MONO_TIMELINE: each CTA marks the end of each phase (TL_K2) in a
+    # scratch timeline, and |U| at TL_U
+    timeline: bool = False
 
     @property
     def picks(self) -> int:
@@ -242,6 +262,9 @@ def scratch_layout(key: K2Build) -> dict:
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
     lay["xrow"] = ((end + 15) // 16 * 16, s * HIDDEN * 2)
+    if key.timeline:
+        end = sum(lay["xrow"])
+        lay["timeline"] = ((end + 15) // 16 * 16, BLOCKS * TL_POINTS * 8)
     return lay
 
 
@@ -1314,6 +1337,8 @@ def build(key: K2Build):
 
     keyed = key_tuple(key, SOURCES)
     name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_o{int(key.oq)}_a{int(key.og)}"
+    if key.timeline:
+        name += "_tl"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -1435,6 +1460,9 @@ def build(key: K2Build):
                 "inter",
             ):
                 c[region] = sreg(scratch, lay[region][0], region)
+            if const_expr(key.timeline):
+                c["tl"] = timeline_row(scratch, lay["timeline"][0], bid)
+            stamp(c, 0)
             r0, r_tasks = R0, R_TASKS
             is_r = (bid >= r0) & (bid < r0 + r_tasks)
             is_g = (bid >= G0) & (bid < G0 + G_TASKS)
@@ -1450,8 +1478,10 @@ def build(key: K2Build):
                 stage_router(c, ri // R_PARTS, ri % R_PARTS, rops)
             if ~is_r:
                 run_oproj(c, [o_loads(c, j) for j in range(nj)])
+            stamp(c, 1)
             if bid < NRED:
                 stage_norm(c, bid)
+            stamp(c, 2)
             if const_expr(not key.fse):  # noqa: SIM102 (traced: `and` does not combine traced values)
                 if is_g:
                     gi = bid - G0
@@ -1459,6 +1489,7 @@ def build(key: K2Build):
                     stage_sgu(c, gi, gops)
             if (bid >= RT0) & (bid < RT0 + s):
                 stage_sgate(c, bid - RT0)
+            stamp(c, 3)
             # ---- the routed experts: x in and quantized while the route's logits
             # come in; the fused shared expert's tasks need no route
             is_ps = (bid >= PS0) & (bid < PS0 + UG_GROUPS)
@@ -1467,12 +1498,16 @@ def build(key: K2Build):
                     c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True
                 )
             wait_x(c, HIDDEN, 0)
+            stamp(c, 4)
             quant_x_fp4(c)
+            stamp(c, 5)
             if const_expr(key.ps):  # noqa: SIM102
                 if is_ps:
                     stage_ug(c, bid - PS0, sops, True)
             local_route(c)
             nu = load_route(c)
+            stamp(c, 6)
+            mark(c, TL_U, nu)
             total = (nu - int(key.ps)) * UG_GROUPS
             last = total - 1
             # reversed placement: the round's leftover tasks go to the high
@@ -1489,14 +1524,18 @@ def build(key: K2Build):
                 stage_ug(c, task, ops[0])
                 task = task + BLOCKS
                 ops = ops[1:] + [ops_n]
+            stamp(c, 7)
             dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
             if const_expr(not key.fse):
                 load_h(c)
             load_inter(c, nu)
+            stamp(c, 8)
             dops2 = stage_down(c, bid, nu, dops, bid + BLOCKS)
             stage_down(c, bid + BLOCKS, nu, dops2)
+            stamp(c, 9)
             if bid < NRED:
                 stage_final(c, bid)
+            stamp(c, 10)
 
     @flyc.jit
     def launch(
