@@ -240,13 +240,16 @@ def check_graph_replay(side, replays):
     )
 
 
-def check_timeline(side, replays=50):
+def check_timeline(side, replays=50, chain=4):
     """``SGLANG_AMD_MONO_TIMELINE=1``: K2's phases with the serving key (fused
     shared expert, MXFP4 o_proj) at 1, 4 and 8 rows, on rank 0, the median of
-    graph replays. A phase's time is when the last CTA of its group ends it (p50:
-    the median CTA), from the first CTA's start (s_memrealtime, 100 MHz). ``copy``
-    rows are copies of one row, so |U| stays at one row's. ``graph`` is a replay's
-    event time (the epoch add, then K2). The timeline build's out and res_out must
+    graph replays. A graph runs ``chain`` launches back to back, as a step's
+    layers do, and the marks are the last launch's: the ranks start it together,
+    so its waits hold no start skew of the ranks. A phase's time is when the last
+    CTA of its group ends it (p50: the median CTA), from the first CTA's start
+    (s_memrealtime, 100 MHz). ``copy`` rows are copies of one row, so |U| stays at
+    one row's. ``graph`` is a replay's event time over ``chain`` (with the epoch
+    adds and the first launch's skew). The timeline build's out and res_out must
     equal the plain build's."""
     w = k2_weights(DEV, rank, 300, fse=True, oq=True)
     keys = {
@@ -281,7 +284,8 @@ def check_timeline(side, replays=50):
         side.run(key, w, core, residual, out, res_out)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            side.run(key, w, core, residual, out, res_out)
+            for _ in range(chain):
+                side.run(key, w, core, residual, out, res_out)
         dist.barrier()
         off, nb = k2.scratch_layout(key)["timeline"]
         tl = side.scratch[s, True][off : off + nb].view(torch.int64)
@@ -297,7 +301,7 @@ def check_timeline(side, replays=50):
             m = tl.cpu()
             m = (m - m[:, 0].min()).double() / 100
             ends.append([getattr(m[c, p], r)().item() for _, p, c, r in rows(s)])
-            us.append(e0.elapsed_time(e1) * 1000)
+            us.append(e0.elapsed_time(e1) * 1000 / chain)
         plain = torch.empty_like(out), torch.empty_like(out)
         side.run(k2.K2Build(tokens=s, fse=True, oq=True), w, core, residual, *plain)
         torch.cuda.synchronize()
@@ -308,8 +312,9 @@ def check_timeline(side, replays=50):
             int(tl[0, k2.TL_U]),
         )
     lines = [
-        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {replays} graph replays, us"
-        " from the first CTA's start to the last CTA's end of each phase",
+        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {replays} graph replays of"
+        f" {chain} launches, the last launch's marks, us from the first CTA's start"
+        " to the last CTA's end of each phase",
         f"{'phase':<12}" + "".join(f"{c:>9}" for c in cols),
     ]
     for i, (name, *_) in enumerate(rows(1)):
