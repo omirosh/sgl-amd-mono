@@ -240,59 +240,82 @@ def check_graph_replay(side, replays):
     )
 
 
-def check_timeline(side, launches=60, warm=10):
+def check_timeline(side, replays=50):
     """``SGLANG_AMD_MONO_TIMELINE=1``: K2's phases with the serving key (fused
-    shared expert, MXFP4 o_proj) at 1, 4 and 8 rows. A phase's time is when its
-    last CTA ends it, from the first CTA's start (s_memrealtime, 100 MHz), the
-    median of the launches on rank 0; ``event`` is the launch's event time. The
-    timeline build's out and res_out must equal the plain build's."""
+    shared expert, MXFP4 o_proj) at 1, 4 and 8 rows, on rank 0, the median of
+    graph replays. A phase's time is when the last CTA of its group ends it (p50:
+    the median CTA), from the first CTA's start (s_memrealtime, 100 MHz). ``copy``
+    rows are copies of one row, so |U| stays at one row's. ``graph`` is a replay's
+    event time (the epoch add, then K2). The timeline build's out and res_out must
+    equal the plain build's."""
     w = k2_weights(DEV, rank, 300, fse=True, oq=True)
     keys = {
         s: k2.K2Build(tokens=s, fse=True, oq=True, timeline=True) for s in (1, 4, 8)
     }
     if not compile_keys(keys.values()):
         return ["timeline: compile"]
+    b = torch.arange(k2.BLOCKS)
+    every, router = b >= 0, (b >= k2.R0) & (b < k2.R0 + k2.R_TASKS)
+
+    def rows(
+        s,
+    ):  # (name, point, CTAs, reduce): a router CTA ends mark 1 after the router
+        return [
+            ("launch", 0, every, "max"),
+            ("o_proj", 1, ~router, "max"),
+            ("norm", 2, b < k2.NRED, "max"),
+            ("router", 1, router, "max"),
+            ("sgate", 3, (b >= k2.RT0) & (b < k2.RT0 + s), "max"),
+            *[(n, i, every, "max") for i, n in enumerate(k2.TL_K2) if i >= 4],
+            ("gate-up p50", 7, every, "median"),
+            ("down p50", 9, every, "median"),
+        ]
+
     cols, same = {}, True
-    for s, key in keys.items():
-        residual = rnd(gen(DEV, 500 + s), s, HIDDEN)  # replicated
-        core = rnd(gen(DEV, 600 + 8 * s + rank), s, CORE)
+    for s, kind in ((1, "rand"), (4, "copy"), (4, "rand"), (8, "copy"), (8, "rand")):
+        key, n = keys[s], s if kind == "rand" else 1
+        residual = rnd(gen(DEV, 500 + s), n, HIDDEN).expand(s, -1).contiguous()
+        core = rnd(gen(DEV, 600 + 8 * s + rank), n, CORE).expand(s, -1).contiguous()
         out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
         res_out = torch.empty_like(out)
-        off, n = k2.scratch_layout(key)["timeline"]
-        ends, us, nus = [], [], []
-        for i in range(launches):
+        side.run(key, w, core, residual, out, res_out)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            side.run(key, w, core, residual, out, res_out)
+        dist.barrier()
+        off, nb = k2.scratch_layout(key)["timeline"]
+        tl = side.scratch[s, True][off : off + nb].view(torch.int64)
+        tl = tl.view(k2.BLOCKS, k2.TL_POINTS)
+        ends, us = [], []
+        for _ in range(replays):
             e0 = torch.cuda.Event(enable_timing=True)
             e1 = torch.cuda.Event(enable_timing=True)
             e0.record()
-            side.run(key, w, core, residual, out, res_out)
+            graph.replay()
             e1.record()
             torch.cuda.synchronize()
-            if i < warm:
-                continue
-            tl = side.scratch[s, True][off : off + n].view(torch.int64)
-            tl = tl.view(k2.BLOCKS, k2.TL_POINTS)
-            m = tl[:, : len(k2.TL_K2)].double()
-            ends.append((m.max(0).values - m[:, 0].min()) / 100)
+            m = tl.cpu()
+            m = (m - m[:, 0].min()).double() / 100
+            ends.append([getattr(m[c, p], r)().item() for _, p, c, r in rows(s)])
             us.append(e0.elapsed_time(e1) * 1000)
-            nus.append(int(tl[0, k2.TL_U]))
         plain = torch.empty_like(out), torch.empty_like(out)
         side.run(k2.K2Build(tokens=s, fse=True, oq=True), w, core, residual, *plain)
         torch.cuda.synchronize()
         same &= torch.equal(out, plain[0]) and torch.equal(res_out, plain[1])
-        cols[s] = (
-            torch.stack(ends).median(0).values.tolist(),
+        cols[f"{s} {kind}"] = (
+            torch.tensor(ends).median(0).values.tolist(),
             torch.tensor(us).median().item(),
-            "/".join(map(str, sorted(set(nus)))),
+            int(tl[0, k2.TL_U]),
         )
     lines = [
-        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {launches - warm} launches, us"
+        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {replays} graph replays, us"
         " from the first CTA's start to the last CTA's end of each phase",
-        f"{'phase':<10}" + "".join(f"{f's={s}':>9}" for s in cols),
+        f"{'phase':<12}" + "".join(f"{c:>9}" for c in cols),
     ]
-    for i, name in enumerate(k2.TL_K2):
-        lines.append(f"{name:<10}" + "".join(f"{v[0][i]:9.2f}" for v in cols.values()))
-    lines.append(f"{'event':<10}" + "".join(f"{v[1]:9.2f}" for v in cols.values()))
-    lines.append(f"{'|U|':<10}" + "".join(f"{v[2]:>9}" for v in cols.values()))
+    for i, (name, *_) in enumerate(rows(1)):
+        lines.append(f"{name:<12}" + "".join(f"{v[0][i]:9.2f}" for v in cols.values()))
+    lines.append(f"{'graph':<12}" + "".join(f"{v[1]:9.2f}" for v in cols.values()))
+    lines.append(f"{'|U|':<12}" + "".join(f"{v[2]:9d}" for v in cols.values()))
     log("\n".join(lines))
     ok = all_ok(same)
     log(f"timeline: out and res_out equal the plain build's: {'OK' if ok else 'FAIL'}")
