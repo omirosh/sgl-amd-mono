@@ -2752,8 +2752,19 @@ def build_flash_kernel(key: FlashBuild):
                 val = parts[0]
                 for e in range_constexpr(1, 4):
                     val = (e_w == e).select(parts[e], val)
-                if (e_w < 4) & (pw < n_pools):
-                    put(mb("iscores"), s * MAXP + pw, val * ksc)
+                # every lane stores, the others past num_records (dropped): FlyDSL's
+                # lowering merges a divergent store here with the first tile's, and
+                # the tile loop's MFMAs then run with the storing lanes off and
+                # overwrite their index (https://github.com/ROCm/FlyDSL/issues/1358)
+                keep = (e_w < 4) & (pw < n_pools)
+                bo.buffer_store(
+                    fx.Vector.from_elements(
+                        [(val * ksc).bitcast(fx.Int32), tag], fx.Int32
+                    ),
+                    _rsrc(mb("iscores"), S * MAXP * 8),
+                    keep.select(s * MAXP + pw, fx.Int32(S * MAXP)) * 2,
+                    cache_modifier=CM_DEV,
+                )
 
             for s in range_constexpr(S):
                 pos = row_word(s, ROW_POS)
