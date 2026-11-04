@@ -8,8 +8,9 @@ layers) to the layer's MoE output, every TP reduction inside the kernel.
 
 One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode or verify rows:
 
-    o_proj   (512 x 16 rows, K 2048 a rank; every CTA, tasks bid, bid + 256):
-             bf16 GEMV of the core rows -> bf16 partial -> every rank's AR
+    o_proj   (512 x 16 rows, K 2048 a rank; every CTA, tasks 2 bid, 2 bid + 1):
+             bf16 GEMV of the core rows -> bf16 partial -> every rank's AR,
+             the CTA's 32 rows of a token in one 128 B line
     norm     (CTAs 0 .. 63, 128 columns each): the ranks' partials in rank
              order (fp32 -> bf16), + residual (bf16) -> ``res_out``; the AR
              sums (bf16) and the columns' sums of squares (MSQ), from which
@@ -25,7 +26,8 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode or verify r
     ug       (|U| x 16, every CTA): the union U of the step's picks; an
              expert's 16 gate + 16 up rows against the x rows' MXFP4 codes on
              the scaled fp4 MFMA; silu(g) u (fp32) -> INTER a pick
-    down     (512 x 16 hidden rows, every CTA): w2 of every expert of U
+    down     (512 x 16 hidden rows, every CTA, tasks 2 bid, 2 bid + 1, pushed
+             as o_proj's): w2 of every expert of U
              against its picks' INTER through MXFP4 (fp4 MFMA), times the route
              weight, summed in top-k order; + the shared down rows of silu(g) u
              (SGU) times SGATE -> bf16 partial -> every rank's FINAL
@@ -430,32 +432,46 @@ def fp4_gemv(lane, wave, xl, xrow, k, s, rg, ops):
 
 # ---------------------------------------------------------------- o_proj
 @flyc.jit
-def stage_o(c, rg, ops):
-    """Rows 16 rg ..: GEMV of the LDS core rows -> bf16 partials -> every rank's
-    AR region, this rank's slot (thread: token, row pair)."""
+def push_rows(c, region, v0, v1):
+    """Rows 32 bid .. of every token -> every rank's ``region``, this rank's
+    slot. Thread q stores the bf16 pair of token q // 16, rows 2 (q % 16) ..:
+    ``v0`` of task 2 bid (q % 16 < 8), ``v1`` of task 2 bid + 1. A token's 16
+    pairs fill one 128 B line in one store instruction: a line written in
+    halves costs twice the XGMI writes."""
+    s, tid = c["S"], c["tid"]
+    first = (tid % ROWS) < (ROWS // 2)
+    vs = [first.select(a, b) for a, b in zip(v0, v1)]
+    if tid < s * ROWS:
+        q = tid % ROWS
+        at = (c["rank"] * s + tid // ROWS) * HIDDEN + 2 * c["bid"] * ROWS + 2 * q
+        for p in range_constexpr(TP):
+            c["put_bf"](region[p], at, vs)
+
+
+@flyc.jit
+def stage_o(c, j, ops):
+    """Rows 16 (2 bid + j) ..: GEMV of the LDS core rows -> bf16, thread q's
+    pair of ``push_rows`` (token q // 16, rows 2 (q % 8) ..)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    rg = 2 * c["bid"] + j
     if const_expr(c["oq"]):
         acc = fp4_gemv(lane, wave, c["xl"], OK + gemv.LDS_PAD, OK, s, rg, ops)
     else:
         acc = gemv.mfmas(lane, wave, c["xl"], OK + gemv.LDS_PAD, OK, s, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < s * (ROWS // 2):
-        tt = tid // (ROWS // 2)
-        rp = tid % (ROWS // 2)
-        v0 = bf16_round(row_sum(red, 2 * rp, tt))
-        v1 = bf16_round(row_sum(red, 2 * rp + 1, tt))
-        at = (c["rank"] * s + tt) * HIDDEN + rg * ROWS + 2 * rp
-        for p in range_constexpr(TP):
-            c["put_bf"](c["peer"]["ar"][p], at, [v0, v1])
+    tt = fx.min(tid // ROWS, s - 1)
+    rp = tid % (ROWS // 2)
+    v = [bf16_round(row_sum(red, 2 * rp + d, tt)) for d in range(2)]
     gpu.barrier()
+    return v
 
 
 def o_loads(c, j):
-    """o_proj task bid + 256 j's weights for this wave (fp4: its two K steps'
+    """o_proj task 2 bid + j's weights for this wave (fp4: its two K steps'
     tiles and their scale word)."""
     lane, wave, a = c["lane"], c["wave"], c["args"]
-    rg = c["bid"] + BLOCKS * j
+    rg = 2 * c["bid"] + j
     if const_expr(c["oq"]):
         return fp4_gemv_loads(lane, wave, a["w_o"], a["w_os"], rg, OK)
     return gemv.loads(lane, wave, a["w_o"], rg * ROWS, OK)
@@ -491,8 +507,9 @@ def gated_rows_to_lds(c, core, gate):
 
 @flyc.jit
 def run_oproj(c, oops):
-    """This CTA's o_proj tasks (bid, bid + 256) on the core rows (plain loads:
-    the previous launch wrote them), their weights ``oops`` already in flight."""
+    """This CTA's o_proj tasks (2 bid, 2 bid + 1) on the core rows (plain loads:
+    the previous launch wrote them), their weights ``oops`` already in flight
+    -> every rank's AR region."""
     core = c["args"]["core"]
     if const_expr(c["og"]):
         gated_rows_to_lds(c, core, c["args"]["gate"])
@@ -500,8 +517,9 @@ def run_oproj(c, oops):
         gemv.rows_to_lds(c["tid"], core, OK, c["S"], c["xl"], OK + gemv.LDS_PAD)
     if const_expr(c["oq"]):
         quant_x(c, OK)
-    for j in range_constexpr(OTASKS // BLOCKS):
-        stage_o(c, c["bid"] + BLOCKS * j, oops[j])
+    v0 = stage_o(c, 0, oops[0])
+    v1 = stage_o(c, 1, oops[1])
+    push_rows(c, c["peer"]["ar"], v0, v1)
 
 
 # ---------------------------------------------------------------- norm
@@ -1173,8 +1191,9 @@ def stage_down(c, rgd, nu, ops0, rgd_next=None):
     the slots w, w + 8, ...; a batch in flight under the last one's MFMAs)
     -> fp32 (t, k) contributions times the route weight in LDS -> summed in
     top-k order -> bf16; + the shared down rows against h, times SGATE ->
-    bf16 partial -> every rank's FINAL. The last batch's prefetch is row group
-    ``rgd_next``'s first batch, returned (the loop runs: |U| >= TOPK > WAVES)."""
+    thread q's bf16 pair of ``push_rows`` (token q // 16, rows 2 (q % 8) ..).
+    The last batch's prefetch is row group ``rgd_next``'s first batch,
+    returned with the pair (the loop runs: |U| >= TOPK > WAVES)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt, kt, fse = c["rt"], c["KT"], c["fse"]
     t = fx.min(lane % 16, s - 1)
@@ -1240,30 +1259,23 @@ def stage_down(c, rgd, nu, ops0, rgd_next=None):
         acc = gemv.mfmas(lane, wave, c["hl"], SI + gemv.LDS_PAD, SI, s, sops)
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < (ROWS // 2) * s:
-        rp = tid % (ROWS // 2)
-        tt = tid // (ROWS // 2)
-        if const_expr(not fse):
-            sg = f32_of(c["poll"]([(c["sgate"], tt, 1)])[0][0])
-        ys = []
-        for d in range_constexpr(2):
-            r = 2 * rp + d
-            y = fx.Float32(0.0)
-            for k in range_constexpr(kt):
-                y = y + fx.ptr_load(c["contrib"] + ((tt * kt + k) * ROWS + r))
-            if const_expr(fse):
-                ys.append(bf16_round(y))
-            else:
-                sd = bf16_round(bf16_round(row_sum(red, r, tt)) * sg)
-                ys.append(bf16_round(bf16_round(y) + sd))
-        for p in range_constexpr(TP):
-            c["put_bf"](
-                c["peer"]["final"][p],
-                (c["rank"] * s + tt) * HIDDEN + rgd * ROWS + 2 * rp,
-                ys,
-            )
+    rp = tid % (ROWS // 2)
+    tt = fx.min(tid // ROWS, s - 1)
+    if const_expr(not fse):
+        sg = f32_of(c["poll"]([(c["sgate"], tt, 1)])[0][0])
+    ys = []
+    for d in range_constexpr(2):
+        r = 2 * rp + d
+        y = fx.Float32(0.0)
+        for k in range_constexpr(kt):
+            y = y + fx.ptr_load(c["contrib"] + ((tt * kt + k) * ROWS + r))
+        if const_expr(fse):
+            ys.append(bf16_round(y))
+        else:
+            sd = bf16_round(bf16_round(row_sum(red, r, tt)) * sg)
+            ys.append(bf16_round(bf16_round(y) + sd))
     gpu.barrier()
-    return ops
+    return ops, ys
 
 
 # ---------------------------------------------------------------- final
@@ -1525,13 +1537,14 @@ def build(key: K2Build):
                 task = task + BLOCKS
                 ops = ops[1:] + [ops_n]
             stamp(c, 7)
-            dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
+            dops = down_loads(c, 2 * bid, nu, fx.min(c["wave"], nu - 1))
             if const_expr(not key.fse):
                 load_h(c)
             load_inter(c, nu)
             stamp(c, 8)
-            dops2 = stage_down(c, bid, nu, dops, bid + BLOCKS)
-            stage_down(c, bid + BLOCKS, nu, dops2)
+            dops2, y0 = stage_down(c, 2 * bid, nu, dops, 2 * bid + 1)
+            _, y1 = stage_down(c, 2 * bid + 1, nu, dops2)
+            push_rows(c, peer["final"], y0, y1)
             stamp(c, 9)
             if bid < NRED:
                 stage_final(c, bid)
