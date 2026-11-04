@@ -24,9 +24,11 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode or verify r
              sums of squares, so no x or route hand-off
     ug       (|U| x 16, every CTA): the union U of the step's picks; an
              expert's 16 gate + 16 up rows against the x rows' MXFP4 codes on
-             the scaled fp4 MFMA; silu(g) u (fp32) -> INTER a pick
+             the scaled fp4 MFMA; silu(g) u (fp32) -> INTER a pick; each
+             1 x 32 block of INTER through MXFP4 once, by one CTA -> IQ, IQS
     down     (512 x 16 hidden rows, every CTA): w2 of every expert of U
-             against its picks' INTER through MXFP4 (fp4 MFMA), times the route
+             against its picks' INTER through MXFP4 (fp4 MFMA; one thread group
+             quantizes a 1 x 32 block for all CTAs: IQ, IQS), times the route
              weight, summed in top-k order; + the shared down rows of silu(g) u
              (SGU) times SGATE -> bf16 partial -> every rank's FINAL
     final    (CTAs 0 .. 63, 128 columns): FINAL in rank order -> bf16 ``out``
@@ -258,6 +260,8 @@ def scratch_layout(key: K2Build) -> dict:
         "sgate": s,
         "route": s * 2 * TOPK,
         "inter": s * key.picks * RI,
+        "iq": s * key.picks * RI // 8,  # the MXFP4 INTER image: 8 codes a word
+        "iqs": s * key.picks * RI // 32,  # its e8m0 codes, one a 1 x 32 block
     }
     lay = pair_layout(pairs.items())
     end = max(o + n for o, n in lay.values())
@@ -1079,36 +1083,60 @@ def stage_ug(c, task, ops, shared=False):
 
 # ---------------------------------------------------------------- down
 @flyc.jit
-def load_inter(c, nu):
-    """Every pick's INTER (fp32) through MXFP4 by 32 columns (RCEIL scale, the
-    block's 16 column pairs on 16 lanes of a row), as the stock decode kernel
-    quantizes its intermediate -> LDS (fp4 rows of RI, padded, then the e8m0
-    codes); one poll batch."""
+def quant_inter(c):
+    """This CTA's blocks of the MXFP4 INTER image: block bid + BLOCKS g (a
+    pick's 32 columns) on thread group g (16 lanes of a row, a column pair a
+    lane), through MXFP4 (RCEIL scale) as the stock decode kernel quantizes its
+    intermediate -> IQ (4 fp4 words) and IQS (the e8m0 code). Each block is
+    quantized once, so a down CTA reads the image, not every pick's fp32."""
     s, tid = c["S"], c["tid"]
-    n = s * c["KT"] * RI // 2
-    per = (n + THREADS - 1) // THREADS
-    got = c["poll"](
-        [(c["inter"], 2 * fx.min(tid + THREADS * i, n - 1), 2) for i in range(per)]
-    )
-    for i in range_constexpr(per):
-        p = fx.min(tid + THREADS * i, n - 1)
-        pick = p // (RI // 2)
-        cp = p % (RI // 2)
-        h0, h1 = f32_of(got[i][0]), f32_of(got[i][1])
+    nb = s * c["KT"] * (RI // 32)
+    q = tid % 16
+    blk = c["bid"] + BLOCKS * (tid // 16)
+    if blk < nb:
+        pick = blk // (RI // 32)
+        cp = (blk % (RI // 32)) * 16 + q
+        got = c["poll"]([(c["inter"], 2 * (pick * (RI // 2) + cp), 2)])
+        h0, h1 = f32_of(got[0][0]), f32_of(got[0][1])
         amax = fx.max(fx.Float32(fmath.absf(h0)), fx.Float32(fmath.absf(h1)))
         for off in range_constexpr(4):
             amax = xred(amax, 1 << off, fx.max)
         e = mx_scale(amax)
-        # a lane's byte; four lanes' bytes -> a word, the block's code
+        # a lane's byte; four lanes' bytes -> a word
         v = pk_fp4_f32(fx.Int32(0), h0, h1, pow2(e), 0)
-        v = v << (8 * (cp % 4))
+        v = v << (8 * (q % 4))
         for off in range_constexpr(2):
             v = xred(v, 1 << off, lambda a, b: a | b)
-        ok = tid + THREADS * i < n
-        if ok & (cp % 4 == 0):
-            fx.ptr_store(v, c["il"] + (pick * IQ_ROW + cp) // 4)
-        if ok & (cp % 16 == 0):
-            fx.ptr_store(e, c["il"] + (iq_scales(s, c["KT"]) + pick * 8 + cp // 16))
+        if q % 4 == 0:
+            c["put_words"](c["iq"], pick * (RI // 8) + cp // 4, [v])
+        if q == 0:
+            c["put_words"](c["iqs"], blk, [e])
+
+
+@flyc.jit
+def load_inter(c, nu):
+    """The MXFP4 INTER image (``quant_inter``) -> LDS: the fp4 rows of RI
+    (padded), then the e8m0 codes; one poll batch of 2 words a poll."""
+    s, tid = c["S"], c["tid"]
+    nw = s * c["KT"] * (RI // 8) // 2
+    ns = s * c["KT"] * (RI // 32) // 2
+    pw = (nw + THREADS - 1) // THREADS
+    ps = (ns + THREADS - 1) // THREADS
+    got = c["poll"](
+        [(c["iq"], 2 * fx.min(tid + THREADS * i, nw - 1), 2) for i in range(pw)]
+        + [(c["iqs"], 2 * fx.min(tid + THREADS * i, ns - 1), 2) for i in range(ps)]
+    )
+    for i in range_constexpr(pw):
+        w = 2 * (tid + THREADS * i)
+        at = (w // (RI // 8)) * (IQ_ROW // 4) + w % (RI // 8)
+        if tid + THREADS * i < nw:
+            for d in range_constexpr(2):
+                fx.ptr_store(got[i][d], c["il"] + at + d)
+    for i in range_constexpr(ps):
+        at = iq_scales(s, c["KT"]) + 2 * (tid + THREADS * i)
+        if tid + THREADS * i < ns:
+            for d in range_constexpr(2):
+                fx.ptr_store(got[pw + i][d], c["il"] + at + d)
     gpu.barrier()
 
 
@@ -1458,6 +1486,8 @@ def build(key: K2Build):
                 "sgate",
                 "route",
                 "inter",
+                "iq",
+                "iqs",
             ):
                 c[region] = sreg(scratch, lay[region][0], region)
             if const_expr(key.timeline):
@@ -1528,6 +1558,7 @@ def build(key: K2Build):
             dops = down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
             if const_expr(not key.fse):
                 load_h(c)
+            quant_inter(c)
             load_inter(c, nu)
             stamp(c, 8)
             dops2 = stage_down(c, bid, nu, dops, bid + BLOCKS)
