@@ -13,22 +13,22 @@ One launch a layer and rank, ``BLOCKS`` x ``THREADS``, S <= 8 decode or verify r
     norm     (CTAs 0 .. 63, 128 columns each): the ranks' partials in rank
              order (fp32 -> bf16), + residual (bf16) -> ``res_out``; the AR
              sums (bf16) and the columns' sums of squares (MSQ), from which
-             every consumer builds x: post_attention_layernorm (Gemma, 1 + w)
+             the router and the shared gate build x: post_attention_layernorm
+             (Gemma, 1 + w); with every task's MSQ in, the columns' x through
+             MXFP4 once -> XQ, XQS (the routed experts' x)
     router   (CTAs 64 .. 79: 4 x 16 of this rank's 64 experts x K quarters):
              fp32 parts -> bf16 logits -> every rank's RLOG
     sgu      (CTAs 80 .. 111: 32 x 16 rows of the shared gate | up) -> SGU
     sgate    (CTAs 112 .. 112+S-1, token t): sigmoid(x . w_sg) -> SGATE
     route    (every CTA, wave t token t): the 512 logits' top-10 (ties: the
-             lower expert), in descending order, softmax-renormalized; x is
-             built by every consumer from the AR sums and the norm tasks'
-             sums of squares, so no x or route hand-off
+             lower expert), in descending order, softmax-renormalized; no
+             route hand-off
     ug       (|U| x 16, every CTA): the union U of the step's picks; an
              expert's 16 gate + 16 up rows against the x rows' MXFP4 codes on
              the scaled fp4 MFMA; silu(g) u (fp32) -> INTER a pick; each
              1 x 32 block of INTER through MXFP4 once, by one CTA -> IQ, IQS
     down     (512 x 16 hidden rows, every CTA): w2 of every expert of U
-             against its picks' INTER through MXFP4 (fp4 MFMA; one thread group
-             quantizes a 1 x 32 block for all CTAs: IQ, IQS), times the route
+             against its picks' IQ, IQS (fp4 MFMA), times the route
              weight, summed in top-k order; + the shared down rows of silu(g) u
              (SGU) times SGATE -> bf16 partial -> every rank's FINAL
     final    (CTAs 0 .. 63, 128 columns): FINAL in rank order -> bf16 ``out``
@@ -255,6 +255,8 @@ def scratch_layout(key: K2Build) -> dict:
     s = key.tokens
     pairs = {
         "msq": NRED * s,
+        "xq": s * HIDDEN // 8,  # the MXFP4 x image: 8 codes a word
+        "xqs": s * HIDDEN // 32,  # its e8m0 codes, one a 1 x 32 block
         "rpart": R_TASKS * s * ROWS,
         "sgu": s * SI,  # 2 SI bf16 a token, two a pair
         "sgate": s,
@@ -513,7 +515,11 @@ def run_oproj(c, oops):
 def stage_norm(c, j):
     """Columns 128 j ..: the AR sum (rank order, fp32 -> bf16) + residual (fp32;
     bf16 -> ``res_out``); the bf16 AR sums -> the x buffer, the columns' sums
-    of squares -> MSQ. The consumers build x from them (``wait_x``)."""
+    of squares -> MSQ. The router and the shared gate build x from them
+    (``wait_x``). Then, with every task's sums in, the columns' x through
+    MXFP4 as ``x_rows_to_lds`` and ``quant_x`` make it (a 1 x 32 block on 16
+    lanes) -> XQ (a word of 8 codes) and XQS (the e8m0 code): the routed
+    experts' x, made once for every CTA (``load_xq``)."""
     s, tid, lane = c["S"], c["tid"], c["lane"]
     a = c["args"]
     mine = tid < s * 64
@@ -549,6 +555,30 @@ def stage_norm(c, j):
     rocdl.s_waitcnt(vmcnt=0)
     if mine & (lane == 0):
         c["put"](c["msq"], j * s + t, sq)
+    load_rstd(c)
+    if mine:
+        r = fx.ptr_load(c["rs"] + t)
+        wv = fx.Int32(
+            bo.buffer_load(rsrc(a["ln_w"]), col // 2, vec_width=1, dtype=T.i32)
+        )
+        w0 = fx.Float32(1.0) + bf_lo(wv)
+        w1 = fx.Float32(1.0) + bf_hi(wv)
+        xw = bf16_pair(z0 * r * w0, z1 * r * w1).bitcast(fx.Int32)
+        amax = fx.max(
+            fx.Float32(fmath.absf(bf_lo(xw))), fx.Float32(fmath.absf(bf_hi(xw)))
+        )
+        for off in range_constexpr(4):
+            amax = xred(amax, 1 << off, fx.max)
+        e = mx_scale(amax)
+        # a lane's byte; four lanes' bytes -> a word
+        v = pk_fp4_bf16(fx.Int32(0), xw, pow2(e), 0) << (8 * (cp % 4))
+        for off in range_constexpr(2):
+            v = xred(v, 1 << off, lambda a, b: a | b)
+        at = t * HIDDEN + col
+        if cp % 4 == 0:
+            c["put_words"](c["xq"], at // 8, [v])
+        if cp % 16 == 0:
+            c["put_words"](c["xqs"], at // 32, [e])
 
 
 @flyc.jit
@@ -674,45 +704,32 @@ def xq_scales(s):
 
 
 @flyc.jit
-def quant_x_fp4(c):
-    """The x rows in LDS (bf16, K ``HIDDEN``) -> MXFP4 codes over them,
-    ``quant_x``'s arithmetic and lanes: token t's block b at byte t ``XQ_ROW`` +
-    16 b (element 2 j in byte j's low nibble; a lane's 8 elements one word), its
-    code at dword ``xq_scales`` + t (HIDDEN / 32) + b. Every thread reads
-    before any writes."""
+def load_xq(c):
+    """The MXFP4 x image (``stage_norm``) -> LDS ``xl``, the layout ``stage_ug``
+    reads: token t's block b at byte t ``XQ_ROW`` + 16 b (element 2 j in byte
+    j's low nibble; 8 elements a word), its code at dword ``xq_scales`` + t
+    (HIDDEN / 32) + b."""
     s, tid, xl = c["S"], c["tid"], c["xl"]
-    xrow = HIDDEN + gemv.LDS_PAD
     kq = HIDDEN // 8
-    nq = s * kq
-    rounds = (nq + THREADS - 1) // THREADS
-    # four rounds read, then their words written: a word lands below every
-    # later round's x, so only its own group's reads must precede it; the
-    # codes (four rounds' a register) after every read
-    codes = []
-    for g0 in range_constexpr(0, rounds, 4):
-        words = []
-        for i in range_constexpr(g0, min(g0 + 4, rounds)):
-            e = fx.min(tid + THREADS * i, nq - 1)
-            wv, code = _quad_scale(xl + ((e // kq) * xrow + 8 * (e % kq)) // 2)
-            w = fx.Int32(0)
-            for d in range_constexpr(4):
-                w = pk_fp4_bf16(w, wv[d], pow2(code), d)
-            words.append(w)
-            if const_expr(i % 4 == 0):
-                codes.append(code)
-            else:
-                codes[-1] = codes[-1] | (code << (8 * (i % 4)))
-        gpu.barrier()
-        for i in range_constexpr(g0, min(g0 + 4, rounds)):
-            e = fx.min(tid + THREADS * i, nq - 1)
-            if tid + THREADS * i < nq:
-                fx.ptr_store(words[i - g0], xl + ((e // kq) * XQ_ROW // 4 + e % kq))
-    gpu.barrier()
-    for i in range_constexpr(rounds):
-        e = fx.min(tid + THREADS * i, nq - 1)
-        if (tid + THREADS * i < nq) & (e % 4 == 0):
-            code = (codes[i // 4] >> (8 * (i % 4))) & 0xFF
-            fx.ptr_store(code, xl + (xq_scales(s) + e // 4))
+    nw = s * kq // 2
+    ns = s * (HIDDEN // 32) // 2
+    pw = (nw + THREADS - 1) // THREADS
+    ps = (ns + THREADS - 1) // THREADS
+    got = c["poll"](
+        [(c["xq"], 2 * fx.min(tid + THREADS * i, nw - 1), 2) for i in range(pw)]
+        + [(c["xqs"], 2 * fx.min(tid + THREADS * i, ns - 1), 2) for i in range(ps)]
+    )
+    for i in range_constexpr(pw):
+        w = 2 * (tid + THREADS * i)
+        at = (w // kq) * (XQ_ROW // 4) + w % kq
+        if tid + THREADS * i < nw:
+            for d in range_constexpr(2):
+                fx.ptr_store(got[i][d], xl + at + d)
+    for i in range_constexpr(ps):
+        at = xq_scales(s) + 2 * (tid + THREADS * i)
+        if tid + THREADS * i < ns:
+            for d in range_constexpr(2):
+                fx.ptr_store(got[pw + i][d], xl + at + d)
     gpu.barrier()
 
 
@@ -1481,6 +1498,8 @@ def build(key: K2Build):
             }
             for region in (
                 "msq",
+                "xq",
+                "xqs",
                 "rpart",
                 "sgu",
                 "sgate",
@@ -1520,16 +1539,15 @@ def build(key: K2Build):
             if (bid >= RT0) & (bid < RT0 + s):
                 stage_sgate(c, bid - RT0)
             stamp(c, 3)
-            # ---- the routed experts: x in and quantized while the route's logits
-            # come in; the fused shared expert's tasks need no route
+            # ---- the routed experts: the MXFP4 x image in while the route's
+            # logits come in; the fused shared expert's tasks need no route
             is_ps = (bid >= PS0) & (bid < PS0 + UG_GROUPS)
             if const_expr(key.ps):
                 sops = ug_loads(
                     c, fx.min(fx.max(bid - PS0, 0), UG_GROUPS - 1), is_ps, True
                 )
-            wait_x(c, HIDDEN, 0)
+            load_xq(c)
             stamp(c, 4)
-            quant_x_fp4(c)
             stamp(c, 5)
             if const_expr(key.ps):  # noqa: SIM102
                 if is_ps:
