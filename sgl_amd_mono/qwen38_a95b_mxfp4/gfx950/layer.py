@@ -117,6 +117,7 @@ OK = L.CORE  # o_proj K a rank: 2048
 OTASKS = HIDDEN // ROWS  # 512
 COLS = 128  # columns a norm / final task
 NRED = HIDDEN // COLS  # 64
+MSQ_LINE = 16  # pairs a norm task's MSQ: its own 128 B line
 R_GROUPS = EPR // ROWS  # 4
 R_PARTS = 4  # K quarters: the router is on the path to the route
 R_K = HIDDEN // R_PARTS
@@ -140,6 +141,7 @@ TAG_SLOTS = 256
 
 
 assert RT0 + L.MAX_TOKENS <= BLOCKS and OTASKS == 2 * BLOCKS and L.BLOCKS == BLOCKS
+assert L.MAX_TOKENS <= MSQ_LINE
 
 _STREAM = fx.Stream(None)
 
@@ -253,7 +255,7 @@ def peer_buffer_bytes() -> int:
 def scratch_layout(key: K2Build) -> dict:
     s = key.tokens
     pairs = {
-        "msq": NRED * s,
+        "msq": NRED * MSQ_LINE,
         "xq": s * HIDDEN // 8,  # the MXFP4 x image: 8 codes a word
         "xqs": s * HIDDEN // 32,  # its e8m0 codes, one a 1 x 32 block
         "rpart": R_TASKS * s * ROWS,
@@ -551,7 +553,7 @@ def stage_norm(c, j):
     sq = wave_sum(z0 * z0 + z1 * z1)
     rocdl.s_waitcnt(vmcnt=0)
     if mine & (lane == 0):
-        c["put"](c["msq"], j * s + t, sq)
+        c["put"](c["msq"], j * MSQ_LINE + t, sq)
     load_rstd(c)
     if mine:
         r = fx.ptr_load(c["rs"] + t)
@@ -585,11 +587,11 @@ def load_rstd(c):
     full poll then doesn't spin."""
     s, tid, lane, red = c["S"], c["tid"], c["lane"], c["red"]
     if tid < 64:
-        c["poll"]([(c["msq"], tid * s + s - 1, 1)])
+        c["poll"]([(c["msq"], tid * MSQ_LINE + s - 1, 1)])
     gpu.barrier()
     if tid < 64 * s:
         t = tid // 64
-        v = c["poll"]([(c["msq"], lane * s + t, 1)])[0][0]
+        v = c["poll"]([(c["msq"], lane * MSQ_LINE + t, 1)])[0][0]
         fx.ptr_store(f32_of(v), red + (t * 64 + lane))
     gpu.barrier()
     if tid < s:
