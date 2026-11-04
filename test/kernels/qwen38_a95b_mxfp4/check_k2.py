@@ -15,6 +15,7 @@ SGLang's layouts:
 
 import argparse
 import datetime
+import hashlib
 import os
 import sys
 import time
@@ -55,6 +56,17 @@ def same_on_every_rank(t: torch.Tensor) -> bool:
     ref = mine.clone()
     dist.broadcast(ref, 0)
     return all_ok(torch.equal(ref, mine))
+
+
+def digest(ts) -> str:
+    """The tensors' bytes on every rank, in rank order, as one short hash: two
+    commits with the same digests give the same outputs bit for bit."""
+    h = hashlib.sha256()
+    for t in ts:
+        h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+    every = [None] * L.TP
+    dist.all_gather_object(every, h.hexdigest())
+    return hashlib.sha256("".join(every).encode()).hexdigest()[:8]
 
 
 class Side:
@@ -231,7 +243,7 @@ def check_graph_replay(side, replays):
             bad += sum(not torch.equal(a, b) for a, b in zip(outputs(), eager))
     ok = all_ok(bad == 0 and not any(errors(side.epoch).values()))
     log(
-        f"graph replay: {replays} replays of widths {REPLAY_WIDTHS}: {'OK' if ok else 'FAIL'}, ranks agree {agree}"
+        f"graph replay: {replays} replays of widths {REPLAY_WIDTHS}: {'OK' if ok else 'FAIL'}, ranks agree {agree}, digest {digest(eager)}"
     )
     if bad:
         print(f"[rank {rank}] graph replay: {bad} mismatching checks", flush=True)
@@ -310,6 +322,7 @@ def check_timeline(side, replays=50, chain=4):
             torch.tensor(ends).median(0).values.tolist(),
             torch.tensor(us).median().item(),
             int(tl[0, k2.TL_U]),
+            digest((out, res_out)),
         )
     lines = [
         f"timeline: FSE, MXFP4 o_proj, rank 0, median of {replays} graph replays of"
@@ -321,6 +334,7 @@ def check_timeline(side, replays=50, chain=4):
         lines.append(f"{name:<12}" + "".join(f"{v[0][i]:9.2f}" for v in cols.values()))
     lines.append(f"{'graph':<12}" + "".join(f"{v[1]:9.2f}" for v in cols.values()))
     lines.append(f"{'|U|':<12}" + "".join(f"{v[2]:9d}" for v in cols.values()))
+    lines.append(f"{'digest':<12}" + "".join(f"{v[3]:>9}" for v in cols.values()))
     log("\n".join(lines))
     ok = all_ok(same)
     log(f"timeline: out and res_out equal the plain build's: {'OK' if ok else 'FAIL'}")
