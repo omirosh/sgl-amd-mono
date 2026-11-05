@@ -244,6 +244,7 @@ sgl-amd-mono/
 │   │   ├── a16w8.py     # the shared expert's MXFP8 GEMV steps
 │   │   └── runner.py    # launch runner
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4
+│   │   ├── README.md    # the K2 launch, the files and the tests
 │   │   ├── spec.py      # spec and forward
 │   │   ├── check.py     # SGLANG_AMD_MONO_CHECK: each layer against SGLang's own
 │   │   └── gfx950/      # kernels and launch runner
