@@ -36,7 +36,6 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS, _compile_only
 WIDE = blocks.MAXT  # layer_block's width in the spec
 REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
-CHAIN = 24  # layer_block launches in one epoch
 LATE = 20_000_000  # GPU cycles rank 3 sleeps before a launch, about 10 ms
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
 # arithmetic, the MoE output differs by about its rounding (the spec's bound)
@@ -339,38 +338,40 @@ def check_graph_replay(side, replays):
     )
 
 
-def _chain(n):
-    """n launches of a verify step: three MXFP4 o_proj (GDN) layers, then a bf16
-    (attention) one."""
-    return tuple((i % 4 != 3, i == 0, False, False) for i in range(n))
+def _case(kinds, epoch_each=False, sync=False, late=False):
+    """Launches of the o_proj kinds ``kinds`` ("1" MXFP4, "0" bf16) at slot 0, 1, ..:
+    a new epoch before the first (before each, ``epoch_each``); ``sync``: a host
+    sync and a barrier before each later launch; ``late``: rank 3 late before it."""
+    return tuple(
+        (k == "1", i == 0 or epoch_each, i > 0 and sync, i > 0 and late)
+        for i, k in enumerate(kinds)
+    )
 
 
-# a case: per launch (MXFP4 o_proj, a new epoch before it, a host sync and a
-# barrier before it, rank 3 late before it); a launch's layer slot is its index
-CHAIN_CASES = {
-    "o1 o1 in one epoch": ((True, True, False, False), (True, False, False, False)),
-    "o0 o0 in one epoch": ((False, True, False, False), (False, False, False, False)),
-    "o1 o0 in one epoch": ((True, True, False, False), (False, False, False, False)),
-    "o1 o1 in one epoch, a sync between": (
-        (True, True, False, False),
-        (True, False, True, False),
-    ),
-    "o1 o1 in one epoch, rank 3 late": (
-        (True, True, False, False),
-        (True, False, False, True),
-    ),
-    "o1 o1, an epoch each": ((True, True, False, False), (True, True, False, False)),
-    f"{CHAIN} launches in one epoch": _chain(CHAIN),
-}
+STEP = "1110" * 6  # a step's o_proj kinds: three GDN (MXFP4) layers, an attention one
+CHAIN_CASES = tuple(
+    {
+        "24 launches, an epoch each": _case(STEP, epoch_each=True),
+        "o1 o0, an epoch each": _case("10", epoch_each=True),
+        "o0 o1, an epoch each": _case("01", epoch_each=True),
+        "o1 o1 in one epoch": _case("11"),
+        "o0 o0 in one epoch": _case("00"),
+        "o1 o0 in one epoch": _case("10"),
+        "o0 o1 in one epoch": _case("01"),
+        "o1 o1 in one epoch, a sync between": _case("11", sync=True),
+        "o1 o1 in one epoch, rank 3 late": _case("11", late=True),
+        "24 launches in one epoch": _case(STEP),
+    }.items()
+)
 
 
-def check_chain():
-    """A verify step at WIDE rows runs layer_block for every layer in one epoch
-    (slot TAG_SLOTS // 2 + i), with no host sync between the launches. Each case
-    runs on a new peer buffer with stop=False keys and a 2 s deadline, so a wait
-    that times out sets its error words and the launch returns. Each launch's
+def check_chain(n):
+    """Chain case n: layer_block launches at WIDE rows on a new peer buffer with
+    a 10 s deadline. A verify step runs one for each layer in one epoch, with no
+    host sync between them. A launch that hangs stops this process. Each launch's
     rows must equal those of the same launch alone in its own epoch."""
-    keys = {q: blocks.LayerBuild(tokens=WIDE, oq=q, stop=False) for q in (False, True)}
+    name, case = CHAIN_CASES[n]
+    keys = {q: blocks.LayerBuild(tokens=WIDE, oq=q) for q in (False, True)}
     if not compile_keys(keys.values()):
         raise SystemExit("a rank failed to compile the chain keys")
     ws = {q: k2_weights(DEV, rank, 700, fse=True, oq=q) for q in (False, True)}
@@ -379,7 +380,7 @@ def check_chain():
             rnd(gen(DEV, 900 + 100 * rank + i), WIDE, CORE),
             rnd(gen(DEV, 800 + i), WIDE, HIDDEN),
         )
-        for i in range(CHAIN)
+        for i in range(len(case))
     ]
 
     def launch(side, i, q, bump):
@@ -388,42 +389,28 @@ def check_chain():
         side.run(keys[q], ws[q], *ins[i], out, res_out, layer=i, bump=bump)
         return out, res_out
 
-    side = Side()
-    alone = {}
-    for case in CHAIN_CASES.values():
-        for i, (q, *_) in enumerate(case):
-            if (i, q) not in alone:
-                alone[i, q] = launch(side, i, q, True)
+    side = Side(seconds=10.0)
+    outs = []
+    for i, (q, bump, sync, late) in enumerate(case):
+        if sync:
+            torch.cuda.synchronize()
+            dist.barrier()
+        if late and rank == 3:
+            torch.cuda._sleep(LATE)
+        outs.append(launch(side, i, q, bump))
     torch.cuda.synchronize()
     side.close()
-    fails = []
-    for name, case in CHAIN_CASES.items():
-        dist.barrier()
-        side = Side(seconds=2.0)
-        outs = []
-        for i, (q, bump, sync, late) in enumerate(case):
-            if sync:
-                torch.cuda.synchronize()
-                dist.barrier()
-            if late and rank == 3:
-                torch.cuda._sleep(LATE)
-            outs.append(launch(side, i, q, bump))
-        torch.cuda.synchronize()
-        words = errors(side.epoch)
-        side.close()
-        bad = [
-            i
-            for i, (got, (q, *_)) in enumerate(zip(outs, case))
-            if not all(map(torch.equal, got, alone[i, q]))
-        ]
-        every = [None] * L.TP
-        dist.all_gather_object(every, (words, bad))
-        ok = not any(any(w.values()) or b for w, b in every)
-        log(f"chain {name}: {'OK' if ok else 'FAIL'}")
-        if not ok:
-            log(f"  by rank (error words, mismatching launches): {every}")
-            fails.append(f"chain {name}")
-    return fails
+    dist.barrier()
+    side = Side()
+    bad = [
+        i
+        for i, (q, *_) in enumerate(case)
+        if not all(map(torch.equal, outs[i], launch(side, i, q, True)))
+    ]
+    side.close()
+    ok = all_ok(not bad)
+    log(f"chain {name}: {'OK' if ok else f'FAIL, launches {bad} differ from alone'}")
+    return [] if ok else [f"chain {name}"]
 
 
 def check_fault(build, s):
@@ -467,9 +454,13 @@ def check_fault(build, s):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
+    ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
     args = ap.parse_args()
+    if args.case is not None:
+        fails = check_chain(args.case)
+        dist.destroy_process_group()
+        sys.exit(1 if fails else 0)
     fails = check_compile()
-    fails += check_chain()
     side = Side()
     try:
         fails += check_batch_invariance(side)
