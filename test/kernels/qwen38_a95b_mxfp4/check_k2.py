@@ -340,7 +340,7 @@ def check_fault(build, s):
     key = build(tokens=s, stop=False, **fault)
     if not compile_keys([key]):
         raise SystemExit("a rank failed to compile the fault key")
-    w = k2_weights(DEV, rank, 77, fse=is_wide(key))
+    w = k2_weights(DEV, rank, 77, fse=is_wide(key), oq=key.oq)
     g = gen(DEV, 78)
     core, residual = rnd(g, s, CORE), rnd(g, s, HIDDEN)
     side = Side(seconds=0.5)
