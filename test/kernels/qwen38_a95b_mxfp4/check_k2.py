@@ -36,6 +36,8 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS, _compile_only
 WIDE = blocks.MAXT  # layer_block's width in the spec
 REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
+CHAIN = 24  # layer_block launches in one epoch
+LATE = 20_000_000  # GPU cycles a rank sleeps before a launch, about 10 ms
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
 # arithmetic, the MoE output differs by about its rounding (the spec's bound)
 AGREE = {"res_out": 0.9999, "out": NUMERICS.bound("k2.out.cosine")}
@@ -98,11 +100,13 @@ class Side:
         self.epoch = epoch(DEV, seconds)
         self.scratch = {}
 
-    def run(self, key, w, core, residual, out, res_out):
+    def run(self, key, w, core, residual, out, res_out, layer=0, bump=True):
+        """``bump=False``: the next layer of the epoch, as the spec's step."""
         if key.tokens not in self.scratch:
             n = scratch_bytes(key.tokens)
             self.scratch[key.tokens] = torch.zeros(n, dtype=torch.uint8, device=DEV)
-        self.epoch[:1].add_(1)
+        if bump:
+            self.epoch[:1].add_(1)
         (blocks.layer_block if is_wide(key) else k2.layer_post)(
             key,
             core=core,
@@ -114,7 +118,7 @@ class Side:
             peers=self.peer.addresses,
             rank=rank,
             epoch=self.epoch,
-            layer=k2.TAG_SLOTS // 2,
+            layer=k2.TAG_SLOTS // 2 + layer,
         )
 
     def close(self):
@@ -335,6 +339,64 @@ def check_graph_replay(side, replays):
     )
 
 
+def check_chain(side, replays):
+    """A verify step at WIDE rows, as the spec runs it: one epoch, layer_block
+    at slot TAG_SLOTS // 2 + i for every layer, no host sync between launches;
+    then a rank late before each launch, then in a graph. Each launch's rows
+    equal those of the launch alone in its own epoch."""
+    ws = {oq: k2_weights(DEV, rank, 700, fse=True, oq=oq) for oq in (False, True)}
+    steps = []
+    for i in range(CHAIN):
+        oq = i % 4 != 3  # three MXFP4 o_proj (GDN) layers, then a bf16 (attention) one
+        residual = rnd(gen(DEV, 800 + i), WIDE, HIDDEN)
+        core = rnd(gen(DEV, 900 + 100 * rank + i), WIDE, CORE)
+        out = torch.empty(WIDE, HIDDEN, dtype=BF, device=DEV)
+        key = blocks.LayerBuild(tokens=WIDE, oq=oq)
+        steps.append((key, ws[oq], core, residual, out, torch.empty_like(out)))
+
+    def outputs():
+        return [t for st in steps for t in st[4:]]
+
+    for st in steps:
+        side.run(*st)
+    torch.cuda.synchronize()
+    alone = [t.clone() for t in outputs()]
+
+    def step(late):
+        side.epoch[:1].add_(1)
+        for i, st in enumerate(steps):
+            if late and rank == i % L.TP:
+                torch.cuda._sleep(late)
+            side.run(*st, layer=i, bump=False)
+
+    bad = {}
+    for name, late in (("eager", 0), ("a rank late", LATE)):
+        for t in outputs():
+            t.zero_()
+        step(late)
+        torch.cuda.synchronize()
+        bad[name] = sum(not torch.equal(a, b) for a, b in zip(outputs(), alone))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step(LATE)
+    dist.barrier()
+    for t in outputs():
+        t.zero_()
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    bad["graph"] = sum(not torch.equal(a, b) for a, b in zip(outputs(), alone))
+    words = errors(side.epoch)
+    if any(bad.values()) or any(words.values()):
+        print(f"[rank {rank}] chain: mismatches {bad}, error words {words}", flush=True)
+    ok = all_ok(not any(bad.values()) and not any(words.values()))
+    log(
+        f"chain: {CHAIN} layer_block launches at {WIDE} rows in one epoch (eager, "
+        f"a rank late, {replays} graph replays): {'OK' if ok else 'FAIL'}"
+    )
+    return [] if ok else ["chain"]
+
+
 def check_fault(build, s):
     fault = dict(fault_site=1) if rank == 3 else {}
     key = build(tokens=s, stop=False, **fault)
@@ -383,6 +445,7 @@ def main():
         fails += check_batch_invariance(side)
         fails += check_layer_block(side)
         fails += check_graph_replay(side, args.replays)
+        fails += check_chain(side, 20)
     finally:
         side.close()
     dist.barrier()
