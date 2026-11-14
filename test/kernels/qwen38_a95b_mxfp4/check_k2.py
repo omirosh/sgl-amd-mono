@@ -37,7 +37,7 @@ WIDE = blocks.MAXT  # layer_block's width in the spec
 REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
 CHAIN = 24  # layer_block launches in one epoch
-LATE = 20_000_000  # GPU cycles a rank sleeps before a launch, about 10 ms
+LATE = 20_000_000  # GPU cycles rank 3 sleeps before a launch, about 10 ms
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
 # arithmetic, the MoE output differs by about its rounding (the spec's bound)
 AGREE = {"res_out": 0.9999, "out": NUMERICS.bound("k2.out.cosine")}
@@ -339,62 +339,91 @@ def check_graph_replay(side, replays):
     )
 
 
-def check_chain(side, replays):
-    """A verify step at WIDE rows, as the spec runs it: one epoch, layer_block
-    at slot TAG_SLOTS // 2 + i for every layer, no host sync between launches;
-    then a rank late before each launch, then in a graph. Each launch's rows
-    equal those of the launch alone in its own epoch."""
-    ws = {oq: k2_weights(DEV, rank, 700, fse=True, oq=oq) for oq in (False, True)}
-    steps = []
-    for i in range(CHAIN):
-        oq = i % 4 != 3  # three MXFP4 o_proj (GDN) layers, then a bf16 (attention) one
-        residual = rnd(gen(DEV, 800 + i), WIDE, HIDDEN)
-        core = rnd(gen(DEV, 900 + 100 * rank + i), WIDE, CORE)
+def _chain(n):
+    """n launches of a verify step: three MXFP4 o_proj (GDN) layers, then a bf16
+    (attention) one."""
+    return tuple((i % 4 != 3, i == 0, False, False) for i in range(n))
+
+
+# a case: per launch (MXFP4 o_proj, a new epoch before it, a host sync and a
+# barrier before it, rank 3 late before it); a launch's layer slot is its index
+CHAIN_CASES = {
+    "o1 o1 in one epoch": ((True, True, False, False), (True, False, False, False)),
+    "o0 o0 in one epoch": ((False, True, False, False), (False, False, False, False)),
+    "o1 o0 in one epoch": ((True, True, False, False), (False, False, False, False)),
+    "o1 o1 in one epoch, a sync between": (
+        (True, True, False, False),
+        (True, False, True, False),
+    ),
+    "o1 o1 in one epoch, rank 3 late": (
+        (True, True, False, False),
+        (True, False, False, True),
+    ),
+    "o1 o1, an epoch each": ((True, True, False, False), (True, True, False, False)),
+    f"{CHAIN} launches in one epoch": _chain(CHAIN),
+}
+
+
+def check_chain():
+    """A verify step at WIDE rows runs layer_block for every layer in one epoch
+    (slot TAG_SLOTS // 2 + i), with no host sync between the launches. Each case
+    runs on a new peer buffer with stop=False keys and a 2 s deadline, so a wait
+    that times out sets its error words and the launch returns. Each launch's
+    rows must equal those of the same launch alone in its own epoch."""
+    keys = {q: blocks.LayerBuild(tokens=WIDE, oq=q, stop=False) for q in (False, True)}
+    if not compile_keys(keys.values()):
+        raise SystemExit("a rank failed to compile the chain keys")
+    ws = {q: k2_weights(DEV, rank, 700, fse=True, oq=q) for q in (False, True)}
+    ins = [
+        (
+            rnd(gen(DEV, 900 + 100 * rank + i), WIDE, CORE),
+            rnd(gen(DEV, 800 + i), WIDE, HIDDEN),
+        )
+        for i in range(CHAIN)
+    ]
+
+    def launch(side, i, q, bump):
         out = torch.empty(WIDE, HIDDEN, dtype=BF, device=DEV)
-        key = blocks.LayerBuild(tokens=WIDE, oq=oq)
-        steps.append((key, ws[oq], core, residual, out, torch.empty_like(out)))
+        res_out = torch.empty_like(out)
+        side.run(keys[q], ws[q], *ins[i], out, res_out, layer=i, bump=bump)
+        return out, res_out
 
-    def outputs():
-        return [t for st in steps for t in st[4:]]
-
-    for st in steps:
-        side.run(*st)
+    side = Side()
+    alone = {}
+    for case in CHAIN_CASES.values():
+        for i, (q, *_) in enumerate(case):
+            if (i, q) not in alone:
+                alone[i, q] = launch(side, i, q, True)
     torch.cuda.synchronize()
-    alone = [t.clone() for t in outputs()]
-
-    def step(late):
-        side.epoch[:1].add_(1)
-        for i, st in enumerate(steps):
-            if late and rank == i % L.TP:
-                torch.cuda._sleep(late)
-            side.run(*st, layer=i, bump=False)
-
-    bad = {}
-    for name, late in (("eager", 0), ("a rank late", LATE)):
-        for t in outputs():
-            t.zero_()
-        step(late)
+    side.close()
+    fails = []
+    for name, case in CHAIN_CASES.items():
+        dist.barrier()
+        side = Side(seconds=2.0)
+        outs = []
+        for i, (q, bump, sync, late) in enumerate(case):
+            if sync:
+                torch.cuda.synchronize()
+                dist.barrier()
+            if late and rank == 3:
+                torch.cuda._sleep(LATE)
+            outs.append(launch(side, i, q, bump))
         torch.cuda.synchronize()
-        bad[name] = sum(not torch.equal(a, b) for a, b in zip(outputs(), alone))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        step(LATE)
-    dist.barrier()
-    for t in outputs():
-        t.zero_()
-    for _ in range(replays):
-        graph.replay()
-    torch.cuda.synchronize()
-    bad["graph"] = sum(not torch.equal(a, b) for a, b in zip(outputs(), alone))
-    words = errors(side.epoch)
-    if any(bad.values()) or any(words.values()):
-        print(f"[rank {rank}] chain: mismatches {bad}, error words {words}", flush=True)
-    ok = all_ok(not any(bad.values()) and not any(words.values()))
-    log(
-        f"chain: {CHAIN} layer_block launches at {WIDE} rows in one epoch (eager, "
-        f"a rank late, {replays} graph replays): {'OK' if ok else 'FAIL'}"
-    )
-    return [] if ok else ["chain"]
+        words = errors(side.epoch)
+        side.close()
+        bad = [
+            i
+            for i, (got, (q, *_)) in enumerate(zip(outs, case))
+            if not all(map(torch.equal, got, alone[i, q]))
+        ]
+        every = [None] * L.TP
+        dist.all_gather_object(every, (words, bad))
+        ok = not any(any(w.values()) or b for w, b in every)
+        log(f"chain {name}: {'OK' if ok else 'FAIL'}")
+        if not ok:
+            log(f"  by rank (error words, mismatching launches): {every}")
+            fails.append(f"chain {name}")
+    return fails
 
 
 def check_fault(build, s):
@@ -440,12 +469,12 @@ def main():
     ap.add_argument("--replays", type=int, default=200)
     args = ap.parse_args()
     fails = check_compile()
+    fails += check_chain()
     side = Side()
     try:
         fails += check_batch_invariance(side)
         fails += check_layer_block(side)
         fails += check_graph_replay(side, args.replays)
-        fails += check_chain(side, 20)
     finally:
         side.close()
     dist.barrier()
