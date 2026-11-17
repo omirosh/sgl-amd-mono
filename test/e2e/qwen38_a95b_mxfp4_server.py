@@ -13,6 +13,9 @@ ENV = {
     "AITER_USE_FLYDSL_MOE_SORTING": "1",
     "ROCM_QUICK_REDUCE_QUANTIZATION": "INT4",
     "SAFETENSORS_FAST_GPU": "1",
+    # sgl-project/sglang#46059 rotates the MXFP4 GDN projections by default; the
+    # spec refuses that
+    "SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD": "0",
 }
 # The benchmark server of the PR, with up to 16 running requests and graphs to 16.
 # Without --monokernel-backend, so a test can launch the normal path too.

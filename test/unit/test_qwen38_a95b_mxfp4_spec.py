@@ -130,10 +130,12 @@ def _layer(i, gdn=True, fse=False, mxfp4=False, eps=1e-6):
         out = SimpleNamespace(
             weight=_meta(8192, 1024, dtype=torch.uint8),
             weight_scale=_meta(8192, 64, dtype=torch.uint8),
+            quant_method=SimpleNamespace(),
         )
         qkvz = SimpleNamespace(
             weight=_meta(4608, 4096, dtype=torch.uint8),
             weight_scale=_meta(4608, 256, dtype=torch.uint8),
+            quant_method=SimpleNamespace(),
         )
     layer.linear_attn = SimpleNamespace(
         layer_id=i,
@@ -170,6 +172,28 @@ def test_model_reasons(kw):
     layers = [_layer(i, gdn=i % 4 != 3, **kw) for i in range(8)]
     reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
     assert reasons == [], reasons
+
+
+@pytest.mark.parametrize("proj", ["in_proj_qkvz", "out_proj"])
+@pytest.mark.parametrize(
+    "state, refused",
+    [
+        ({}, False),
+        ({"hadamard": False, "quant_kwargs": {}}, False),
+        ({"hadamard": True, "quant_kwargs": {"hadamard_rotate": True}}, True),
+        ({"quant_kwargs": {"hadamard_rotate": True}}, True),
+    ],
+)
+def test_mxfp4_gdn_projections_have_no_rotation(proj, state, refused):
+    # sgl-project/sglang#46059 rotates the weight and the activation; K1 and K2 do not
+    layers = [_layer(i, gdn=i % 4 != 3, mxfp4=True) for i in range(8)]
+    getattr(layers[1].linear_attn, proj).quant_method = SimpleNamespace(**state)
+    reasons = qwen.SPEC.model_disable_reasons(_model(layers), QWEN, {})
+    if refused:
+        assert len(reasons) == 1 and reasons[0].startswith("layer 1:"), reasons
+        assert "SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0" in reasons[0], reasons
+    else:
+        assert reasons == [], reasons
 
 
 def test_the_shared_expert_is_unfused_or_expert_512():
