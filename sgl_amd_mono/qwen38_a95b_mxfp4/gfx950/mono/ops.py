@@ -257,6 +257,27 @@ def wave_max(v):
     return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
 
 
+def hadamard32_quad(vs, tid):
+    """The 8 f32 `vs` of lane `tid` in its 1 x 32 block (elements 8 (tid % 4)
+    .. 8 (tid % 4) + 7, the block on 4 adjacent lanes) -> the same elements of
+    the block times the 32-point Hadamard matrix / sqrt(32), f32, not rounded.
+    The add order is the numerical contract: ROCm/aiter#6734's
+    `hadamard32_rotate` runs stages 1 .. 16 with v[j], v[j + h] = a + b, a - b;
+    stages 1, 2 and 4 are in the lane, 8 and 16 with lane ^ 1 and ^ 2, where the
+    lane of v[j] keeps a + b and the lane of v[j + h] keeps a - b."""
+    v = list(vs)
+    for h in (1, 2, 4):
+        for j in range(8):
+            if not j & h:
+                v[j], v[j + h] = v[j] + v[j + h], v[j] - v[j + h]
+    for off in (1, 2):
+        upper = (tid & off) != 0
+        p = [xshfl(x, off) for x in v]
+        v = [upper.select(p[j] - v[j], v[j] + p[j]) for j in range(8)]
+    scale = fx.Float32(0.17677669529663687)  # 1 / sqrt(32) in f32, as aiter
+    return [x * scale for x in v]
+
+
 def _xpartner(v, off, lane):
     """Lane `lane ^ off`'s v: DPP within a row, v_permlane*_swap across rows
     (`xshfl` takes `shuffle_xor` there)."""

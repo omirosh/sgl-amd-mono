@@ -106,6 +106,7 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950._k3 import (
     wave_sum,
 )
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.layout import need
+from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono.ops import hadamard32_quad, pack_bf16x8
 
 SOURCES = kernel_sources(__name__)
 
@@ -592,19 +593,21 @@ def wait_x(c, klen, k0):
 
 
 @flyc.jit
-def quant_x(c, k=HIDDEN):
+def quant_x(c, k=HIDDEN, h32=False):
     """The rows of K ``k`` in LDS through MXFP4 in place, 1 x 32 blocks (RCEIL
     scale), 8 elements a lane (a block on 4 adjacent lanes: one 16 B LDS access
     a lane, conflict-free): the routed experts' activations, as the stock
     decode kernel takes them (the router and the shared expert read x
-    unquantized, before this), or an fp4 o_proj's core rows."""
+    unquantized, before this), or an fp4 o_proj's core rows. With ``h32`` each
+    block is rotated by Hadamard-32 first, for a projection whose weight
+    sgl-project/sglang#46059 rotated."""
     s, tid, xl = c["S"], c["tid"], c["xl"]
     xrow = k + gemv.LDS_PAD
     nq = s * k // 8
     for i in range_constexpr((nq + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, nq - 1)
         at = ((e // (k // 8)) * xrow + 8 * (e % (k // 8))) // 2
-        wv, code = _quad_scale(xl + at)
+        wv, code = _quad_scale(xl + at, h32, tid)
         sc = pow2(code)
         q = fx.Int32(0)
         for d in range_constexpr(4):
@@ -615,13 +618,17 @@ def quant_x(c, k=HIDDEN):
     gpu.barrier()
 
 
-def _quad_scale(ptr):
+def _quad_scale(ptr, h32=False, tid=None):
     """A lane's 8 bf16 at LDS ``ptr`` (4 words) and their 1 x 32 block's e8m0
-    code (the amax over the block's 4 lanes)."""
+    code (the amax over the block's 4 lanes); with ``h32`` the 8 of the rotated
+    block, rounded to bf16 as aiter rounds them before its amax."""
     wv = fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
     vs = []
     for d in range_constexpr(4):
         vs += [bf_lo(wv[d]), bf_hi(wv[d])]
+    if h32:
+        vs = [bf16_round(v) for v in hadamard32_quad(vs, tid)]
+        wv = pack_bf16x8(vs)
     amax = fx.Float32(0.0)
     for j in range_constexpr(8):
         amax = fx.max(amax, fx.Float32(fmath.absf(vs[j])))
