@@ -2,9 +2,11 @@
 layouts: the routed experts' fp4 tiles and e8m0 scales where K2 reads them (on
 the host); K1 on one GPU and K2 on 8 (``qwen38_a95b_mxfp4/check_k1.py``,
 ``check_k2.py``): every build key compiles, pad rows, the bf16 state, batch
-invariance, graph replay across widths and an injected wait fault; and the
-refactor proof against the sgl-project/sglang#43516 kernels, bit for bit
-(``check_port.py``, where that SGLang is installed)."""
+invariance, graph replay across widths and an injected wait fault; the MXFP4
+activation quant, plain and with the sgl-project/sglang#46059 rotation, against
+AITER bit for bit (``check_quant.py``); and the refactor proof against the
+sgl-project/sglang#43516 kernels, bit for bit (``check_port.py``, where that
+SGLang is installed)."""
 
 import importlib.util
 import subprocess
@@ -114,6 +116,12 @@ def _run(script: str, *args: str, ranks: int = 0) -> int:
     return subprocess.run(
         [*launcher, str(CHECKS / script), *args], timeout=3600
     ).returncode
+
+
+@unittest.skipIf(_gfx950_gpus() < 1, "needs a gfx950 GPU")
+class TestQwen38MoeQuant(CustomTestCase):
+    def test_quant_x_against_aiter(self):
+        self.assertEqual(_run("check_quant.py"), 0)
 
 
 @unittest.skipIf(_gfx950_gpus() < 1, "needs a gfx950 GPU")
