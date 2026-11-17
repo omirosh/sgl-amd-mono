@@ -202,6 +202,17 @@ def _mxfp4(linear) -> bool:
     )
 
 
+# The quant method states of an MXFP4 projection whose weight is not rotated: SGLang
+# before sgl-project/sglang#46059, and with SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0.
+# Its default rotates the weight and the activation by Hadamard-32, and the kernels
+# rotate neither. An exact match, so that a renamed flag gives a refusal.
+_UNROTATED = ({}, {"hadamard": False, "quant_kwargs": {}})
+
+
+def _unrotated(linear) -> bool:
+    return vars(linear.quant_method) in _UNROTATED
+
+
 def _fse(mlp) -> bool:
     return bool(getattr(mlp, "num_fused_shared_experts", 0))
 
@@ -286,6 +297,11 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
         o = a.out_proj
         if not all(_mxfp4(p) or _bf16(p.weight) for p in (a.in_proj_qkvz, o)):
             reasons.append("needs in_proj_qkvz and out_proj in bf16 or MXFP4")
+        elif not all(_unrotated(p) for p in (a.in_proj_qkvz, o) if _mxfp4(p)):
+            reasons.append(
+                "needs the MXFP4 in_proj_qkvz and out_proj without the Hadamard "
+                "rotation: set SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0"
+            )
         if not _bf16(a.in_proj_ba.weight, a.conv1d.weight, a.dt_bias, a.norm.weight):
             reasons.append("needs the GDN in_proj_ba, conv, dt_bias and norm in bf16")
         if a.A_log.dtype != torch.float32:
