@@ -513,7 +513,7 @@ def run_oproj(c, oops, k):
     else:
         gemv.rows_to_lds(c["tid"], core, k, c["S"], c["xl"], k + gemv.LDS_PAD)
     if const_expr(c["oq"]):
-        quant_x(c, k)
+        quant_x(c, k, h32=c["oh"])
     for j in range_constexpr(len(oops)):
         stage_o(c, c["bid"] + BLOCKS * j, oops[j], k)
 
