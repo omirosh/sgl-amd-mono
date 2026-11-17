@@ -85,6 +85,7 @@ SGLANG_READS = {
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "linear_attn_backend",
         "forward_metadata",
+        "state_layer_cache",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
     "kernels/ops/attention/fla/layernorm_gated.py": (
@@ -95,7 +96,6 @@ SGLANG_READS = {
     ),
     "srt/layers/layernorm.py": ("variance_epsilon",),
     "srt/mem_cache/memory_pool.py": (
-        "mamba2_layer_cache",
         "conv",
         "temporal",
         "replayssm_d",
@@ -108,10 +108,7 @@ SGLANG_READS = {
         '"w2_weight_scale"',
     ),
     "srt/model_executor/forward_batch_info.py": ("mrope_positions",),
-    "srt/model_executor/forward_context.py": (
-        "get_attn_backend",
-        "get_req_to_token_pool",
-    ),
+    "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/models/qwen2_moe.py": (
         "Qwen2MoeSparseMoeBlock",
         "gate",
@@ -465,9 +462,9 @@ class _Built:
         return idx
 
     def _state(self, a):
-        from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
 
-        st = get_req_to_token_pool().mamba2_layer_cache(a.layer_id)
+        st = get_attn_backend().linear_attn_backend.state_layer_cache(a.layer_id)
         conv, temporal = st.conv[0], st.temporal
         want = self.state_dtype
         if (
