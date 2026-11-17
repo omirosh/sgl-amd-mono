@@ -101,6 +101,9 @@ SGLANG_READS = {
         "temporal",
         "replayssm_d",
     ),
+    "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py": (
+        "AiterMxfp4OnlineLinearMethod",
+    ),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
         "is_shuffled",
         '"w13_weight"',
@@ -199,15 +202,31 @@ def _mxfp4(linear) -> bool:
     )
 
 
-# The quant method states of an MXFP4 projection whose weight is not rotated: SGLang
-# before sgl-project/sglang#46059, and with SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0.
-# Its default rotates the weight and the activation by Hadamard-32, and the kernels
-# rotate neither. An exact match, so that a renamed flag gives a refusal.
-_UNROTATED = ({}, {"hadamard": False, "quant_kwargs": {}})
+# The states of the quant method of an MXFP4 GDN projection and whether its weight
+# is rotated: SGLang before sgl-project/sglang#46059, with
+# SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0, and with its default, which rotates the
+# weight and the activation by Hadamard-32 (the kernels rotate the activation as
+# AITER does). An exact match, so that a renamed or a new flag gives a refusal.
+_ONLINE = "AiterMxfp4OnlineLinearMethod"
+_STATES = (
+    ({}, False),
+    ({"hadamard": False, "quant_kwargs": {}}, False),
+    ({"hadamard": True, "quant_kwargs": {"hadamard_rotate": True}}, True),
+)
 
 
-def _unrotated(linear) -> bool:
-    return vars(linear.quant_method) in _UNROTATED
+def _rotated(linear) -> bool | None:
+    """An MXFP4 projection's rotation; None for a quant method or a state the
+    kernels do not know."""
+    method = linear.quant_method
+    if type(method).__name__ != _ONLINE:
+        return None
+    return next((rot for state, rot in _STATES if vars(method) == state), None)
+
+
+def _format(linear) -> tuple[bool, bool]:
+    """(MXFP4, rotated) of a projection that the spec accepts."""
+    return (True, _rotated(linear)) if _mxfp4(linear) else (False, False)
 
 
 def _fse(mlp) -> bool:
@@ -294,10 +313,10 @@ def _layer_reasons(layer, eps: tuple) -> list[str]:
         o = a.out_proj
         if not all(_mxfp4(p) or _bf16(p.weight) for p in (a.in_proj_qkvz, o)):
             reasons.append("needs in_proj_qkvz and out_proj in bf16 or MXFP4")
-        elif not all(_unrotated(p) for p in (a.in_proj_qkvz, o) if _mxfp4(p)):
+        elif any(_rotated(p) is None for p in (a.in_proj_qkvz, o) if _mxfp4(p)):
             reasons.append(
-                "needs the MXFP4 in_proj_qkvz and out_proj without the Hadamard "
-                "rotation: set SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0"
+                f"needs the MXFP4 in_proj_qkvz and out_proj of {_ONLINE} in a known "
+                "state (sgl-project/sglang#46059 at 7397386194)"
             )
         if not _bf16(a.in_proj_ba.weight, a.conv1d.weight, a.dt_bias, a.norm.weight):
             reasons.append("needs the GDN in_proj_ba, conv, dt_bias and norm in bf16")
@@ -391,7 +410,7 @@ class _Built:
         self.lm, self.rank = lm, rank
         self.state_dtype = torch.bfloat16 if state_bf16 else torch.float32
         self.k1_keys, self.k2_keys = k1_keys, k2_keys
-        self.widths = {w for w, _, _ in k2_keys}
+        self.widths = {w for w, *_ in k2_keys}
         self.k1_scratch, self.k2_scratch = k1_scratch, k2_scratch
         self.epoch, self.peer = epoch, peer
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -507,11 +526,11 @@ class _Built:
             ref = check.k1_reference(
                 layer, h, residual, conv, temporal, idx[:s], check_batch
             )
-        qq = _mxfp4(a.in_proj_qkvz)
+        qq, qh = _format(a.in_proj_qkvz)
         core = torch.empty(s, L.CORE, dtype=h.dtype, device=h.device)
         res_out = torch.empty_like(h)
         gdn.gdn_pre(
-            self.k1_keys[s, residual is None, qq],
+            self.k1_keys[s, residual is None, qq, qh],
             hidden=h,
             residual=residual,
             res_out=res_out,
@@ -545,11 +564,11 @@ class _Built:
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
         if check_batch is not None:
             ref, ids, logits = check.k2_reference(layer, o, core, residual, check_batch)
-        oq, fse = _mxfp4(o), _fse(mlp)
+        (oq, oh), fse = _format(o), _fse(mlp)
         se, ex = mlp.shared_expert, mlp.experts
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
-        key = self.k2_keys[s, fse, oq]
+        key = self.k2_keys[s, fse, oq, oh]
         wide = s > L.MAX_TOKENS
         shared = (
             {}
@@ -650,50 +669,55 @@ def _build(model, hf_config, ctx) -> _Built:
     # the target model runs no plain decode step under speculative decoding
     verify = get_spec().speculative_algorithm is not None
     gdns = [x for x in layers if _is_gdn(x)]
+    qkvz = sorted({_format(x.linear_attn.in_proj_qkvz) for x in gdns})
     bf16 = mamba2_state_dtype(hf_config).temporal == torch.bfloat16
     narrow = [w for w in ctx.widths if w <= L.MAX_TOKENS]
     k1_keys = {}
     if not verify:
         for w in narrow:
             for first in sorted({x is layers[0] for x in gdns}):
-                for qq in sorted({_mxfp4(x.linear_attn.in_proj_qkvz) for x in gdns}):
-                    k1_keys[w, first, qq] = gdn.K1Build(
+                for qq, qh in qkvz:
+                    k1_keys[w, first, qq, qh] = gdn.K1Build(
                         tokens=w,
                         first=first,
                         eps=e1,
                         norm_eps=e_norm,
                         state_bf16=bf16,
                         qq=qq,
+                        qh=qh,
                         fault_site=fault_site,
                         fault_after=fault_after,
                     )
     outs = {x.linear_attn.out_proj if _is_gdn(x) else x.o_proj for x in layers}
+    out_formats = sorted({_format(o) for o in outs})
     k2_keys = {
-        (w, fse, oq): k2.K2Build(
+        (w, fse, oq, oh): k2.K2Build(
             tokens=w,
             eps=e2,
             fse=fse,
             oq=oq,
+            oh=oh,
             fault_site=fault_site,
             fault_after=fault_after,
         )
         for w in narrow
         for fse in sorted({_fse(x.mlp) for x in layers})
-        for oq in sorted({_mxfp4(o) for o in outs})
+        for oq, oh in out_formats
     }
     wide_keys = {}
     if all(_fse(x.mlp) for x in layers):
         wide_keys = {
-            (w, True, oq): blocks.LayerBuild(
+            (w, True, oq, oh): blocks.LayerBuild(
                 tokens=w,
                 eps=e2,
                 oq=oq,
+                oh=oh,
                 fault_site=fault_site,
                 fault_after=fault_after,
             )
             for w in ctx.widths
             if w > L.MAX_TOKENS
-            for oq in sorted({_mxfp4(o) for o in outs})
+            for oq, oh in out_formats
         }
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
     ticks = guard.deadline_ticks(ctx.deadline_s)
