@@ -148,6 +148,7 @@ class K2Build(msgspec.Struct, frozen=True):
     eps: float = 1e-6  # post_attention_layernorm
     fse: bool = False  # the shared expert fused as expert 512
     oq: bool = False  # o_proj MXFP4 (ASM FP4 GEMM layout)
+    oh: bool = False  # o_proj rotated by Hadamard-32 (sgl-project/sglang#46059)
     # o_proj's input is core x sigmoid(gate) (bf16; the attention output gate
     # as Qwen3NextAttention applies it)
     og: bool = False
@@ -477,7 +478,7 @@ def run_oproj(c, oops):
     else:
         gemv.rows_to_lds(c["tid"], core, OK, c["S"], c["xl"], OK + gemv.LDS_PAD)
     if const_expr(c["oq"]):
-        quant_x(c, OK)
+        quant_x(c, OK, h32=c["oh"])
     for j in range_constexpr(OTASKS // BLOCKS):
         stage_o(c, c["bid"] + BLOCKS * j, oops[j])
 
@@ -1283,6 +1284,7 @@ def build(key: K2Build):
         return _BUILDS[key]
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
+    need(key.oq or not key.oh, "oh rotates the MXFP4 o_proj: it needs oq")
     lay = scratch_layout(key)
     # every width at the widest's offsets: a step's parity half never overlaps
     # the other half of a step of another width
@@ -1320,7 +1322,10 @@ def build(key: K2Build):
         rs: fx.Array[fx.Float32, 16, 16]
 
     keyed = key_tuple(key, SOURCES)
-    name = f"qwen38_mono_k2_s{s}_f{int(key.fse)}_o{int(key.oq)}_a{int(key.og)}"
+    name = (
+        f"qwen38_mono_k2_s{s}_f{int(key.fse)}_o{int(key.oq)}_a{int(key.og)}"
+        f"{'_h1' if key.oh else ''}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -1392,6 +1397,7 @@ def build(key: K2Build):
                 "eps": key.eps,
                 "fse": key.fse,
                 "oq": key.oq,
+                "oh": key.oh,
                 "KT": kt,
                 "put": mb.put,
                 "put_bf": mb.put_bf,
