@@ -24,7 +24,18 @@ import time
 
 import torch
 import torch.distributed as dist
-from inputs import BF, CORE, HIDDEN, MAXT, epoch, errors, gen, k2_weights, rnd
+from inputs import (
+    BF,
+    CORE,
+    FP4_FORMATS,
+    HIDDEN,
+    MAXT,
+    epoch,
+    errors,
+    gen,
+    k2_weights,
+    rnd,
+)
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
@@ -142,12 +153,12 @@ def compile_keys(keys):
 
 def check_compile():
     keys = [
-        k2.K2Build(tokens=s, fse=f, oq=q)
+        k2.K2Build(tokens=s, fse=f, oq=q, oh=h)
         for s in range(1, MAXT + 1)
         for f in (False, True)
-        for q in (False, True)
+        for q, h in FP4_FORMATS
     ]
-    keys += [blocks.LayerBuild(tokens=WIDE, oq=q) for q in (False, True)]
+    keys += [blocks.LayerBuild(tokens=WIDE, oq=q, oh=h) for q, h in FP4_FORMATS]
     t0 = time.time()
     ok = compile_keys(keys)
     log(
@@ -232,16 +243,16 @@ def cosine(a, b) -> float:
 
 
 def check_layer_block(side):
-    """layer_block at WIDE rows, bf16 and MXFP4 o_proj: the probe row does not
-    change with the other rows or its row, and the rows agree with K2 at 8 rows
-    (fused shared expert) on the same inputs."""
+    """layer_block at WIDE rows, bf16, MXFP4 and rotated MXFP4 o_proj: the probe
+    row does not change with the other rows or its row, and the rows agree with
+    K2 at 8 rows (fused shared expert) on the same inputs."""
     g = gen(DEV, 0)
     probe_r = rnd(g, 1, HIDDEN)
     probe_c = rnd(gen(DEV, 200 + rank), 1, CORE)
     bad, probes, agree = [], [], {}
-    for oq in (False, True):
+    for oq, oh in FP4_FORMATS:
         w = k2_weights(DEV, rank, 600, fse=True, oq=oq)
-        key = blocks.LayerBuild(tokens=WIDE, oq=oq)
+        key = blocks.LayerBuild(tokens=WIDE, oq=oq, oh=oh)
         outs = {}
         for pos in (0, WIDE - 1):
             for kind in KINDS:
@@ -254,14 +265,14 @@ def check_layer_block(side):
                 side.run(key, w, core, residual, out, res_out)
                 if pos == 0 and kind == "rand0":
                     ref = torch.empty_like(out), torch.empty_like(out)
-                    half = k2.K2Build(tokens=MAXT, fse=True, oq=oq)
+                    half = k2.K2Build(tokens=MAXT, fse=True, oq=oq, oh=oh)
                     for r in range(0, WIDE, MAXT):
                         rs = slice(r, r + MAXT)
                         side.run(
                             half, w, core[rs], residual[rs], ref[0][rs], ref[1][rs]
                         )
                     for name, a, b in zip(("out", "res_out"), (out, res_out), ref):
-                        agree[oq, name] = cosine(a, b)
+                        agree[oq, oh, name] = cosine(a, b)
                 torch.cuda.synchronize()
                 outs[pos, kind] = (out[pos].clone(), res_out[pos].clone())
         moved = [
@@ -270,11 +281,11 @@ def check_layer_block(side):
             if not all(map(torch.equal, got, outs[0, "rand0"]))
         ]
         if moved:
-            bad.append(f"oq {oq}: the probe changes in {moved}")
+            bad.append(f"oq {oq} oh {oh}: the probe changes in {moved}")
         probes.append(outs[0, "rand0"][0])
     bad += [
-        f"oq {oq}: {name} cosine against K2 {v:.6f} < {AGREE[name]}"
-        for (oq, name), v in agree.items()
+        f"oq {oq} oh {oh}: {name} cosine against K2 {v:.6f} < {AGREE[name]}"
+        for (oq, oh, name), v in agree.items()
         if not v >= AGREE[name]
     ]
     if any(errors(side.epoch).values()):
@@ -283,7 +294,9 @@ def check_layer_block(side):
         print(f"[rank {rank}] layer_block: {bad}", flush=True)
     same = same_on_every_rank(torch.stack(probes))
     ok = all_ok(not bad)
-    worst = {name: min(v for (_, n), v in agree.items() if n == name) for name in AGREE}
+    worst = {
+        name: min(v for (*_, n), v in agree.items() if n == name) for name in AGREE
+    }
     log(
         f"layer_block at {WIDE} rows: probe invariance and K2 agreement (worst cosine "
         f"{worst}): {'OK' if ok else 'FAIL'}, ranks agree {same}"

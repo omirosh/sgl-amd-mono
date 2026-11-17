@@ -96,6 +96,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     tokens: int
     eps: float = 1e-6  # post_attention_layernorm
     oq: bool = True  # out_proj / o_proj MXFP4 (ASM FP4 GEMM layout)
+    oh: bool = False  # out_proj rotated by Hadamard-32 (sgl-project/sglang#46059)
     og: bool = False  # o_proj's input is core x sigmoid(gate) (full attention)
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
@@ -298,6 +299,7 @@ def build_layer(key: LayerBuild):
         return _LAYER[key]
     s = key.tokens
     need(1 <= s <= MAXT, f"{s} rows, layer_block takes 1..{MAXT}")
+    need(key.oq or not key.oh, "oh rotates the MXFP4 out_proj: it needs oq")
     scr = layer_scratch_layout(key)
     max_u = s * TOPK + 1  # distinct experts the step can touch + the fused shared
     d = MOE
@@ -332,7 +334,9 @@ def build_layer(key: LayerBuild):
         rs: fx.Array[fx.Float32, 16, 16]
 
     keyed = key_tuple(key, SOURCES)
-    name = f"qwen38_mono_layer_s{s}_o{int(key.oq)}_a{int(key.og)}"
+    name = (
+        f"qwen38_mono_layer_s{s}_o{int(key.oq)}_a{int(key.og)}{'_h1' if key.oh else ''}"
+    )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def klayer(
@@ -400,6 +404,7 @@ def build_layer(key: LayerBuild):
                 "rank": rank,
                 "eps": key.eps,
                 "oq": key.oq,
+                "oh": key.oh,
                 "og": key.og,
                 "shuffled": True,
                 "u1": key.u1,
