@@ -264,7 +264,9 @@ def hadamard32_quad(vs, tid):
     The add order is the numerical contract: ROCm/aiter#6734's
     `hadamard32_rotate` runs stages 1 .. 16 with v[j], v[j + h] = a + b, a - b;
     stages 1, 2 and 4 are in the lane, 8 and 16 with lane ^ 1 and ^ 2, where the
-    lane of v[j] keeps a + b and the lane of v[j + h] keeps a - b."""
+    lane of v[j] keeps a + b and the lane of v[j + h] keeps -b + a, the same
+    bits as a - b. The partner's value has one use, so its DPP move can fold
+    into the add."""
     v = list(vs)
     for h in (1, 2, 4):
         for j in range(8):
@@ -273,7 +275,7 @@ def hadamard32_quad(vs, tid):
     for off in (1, 2):
         upper = (tid & off) != 0
         p = [xshfl(x, off) for x in v]
-        v = [upper.select(p[j] - v[j], v[j] + p[j]) for j in range(8)]
+        v = [upper.select(-v[j], v[j]) + p[j] for j in range(8)]
     scale = fx.Float32(0.17677669529663687)  # 1 / sqrt(32) in f32, as aiter
     return [x * scale for x in v]
 

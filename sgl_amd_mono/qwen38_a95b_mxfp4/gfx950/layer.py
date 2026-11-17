@@ -628,8 +628,8 @@ def _quad_scale(ptr, h32=False, tid=None):
     for d in range_constexpr(4):
         vs += [bf_lo(wv[d]), bf_hi(wv[d])]
     if h32:
-        vs = [bf16_round(v) for v in hadamard32_quad(vs, tid)]
-        wv = pack_bf16x8(vs)
+        wv = pack_bf16x8(hadamard32_quad(vs, tid))
+        vs = [half(wv[d]) for d in range(4) for half in (bf_lo, bf_hi)]
     amax = fx.Float32(0.0)
     for j in range_constexpr(8):
         amax = fx.max(amax, fx.Float32(fmath.absf(vs[j])))
