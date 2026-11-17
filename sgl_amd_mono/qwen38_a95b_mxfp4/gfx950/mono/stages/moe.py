@@ -42,9 +42,11 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono.ops import (
     bf_hi,
     bf_lo,
     div_rn,
+    hadamard32_quad,
     hw_exp2,
     ld_i32,
     mfma_bf16,
+    pack_bf16x8,
     rsrc,
     traced,
     uniform,
@@ -374,14 +376,18 @@ def ksplit_rows(c, region, at, q, parts, out, t0=0, n=None):
 
 
 # ---------------------------------------------------------------- x through MXFP4
-def _quad_scale(ptr, rceil=True):
+def _quad_scale(ptr, rceil=True, h32=False, tid=None):
     """A lane's 8 bf16 at LDS `ptr` (4 words) and their 1 x 32 block's e8m0
     code (the amax over the block's 4 lanes; `mx_scale`, else
-    `mx_scale_round`)."""
+    `mx_scale_round`); with `h32` the 8 of the rotated block, rounded to bf16
+    as aiter rounds them before its amax."""
     wv = fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
     vs = []
     for d in range_constexpr(4):
         vs += [bf_lo(wv[d]), bf_hi(wv[d])]
+    if h32:
+        wv = pack_bf16x8(hadamard32_quad(vs, tid))
+        vs = [half(wv[d]) for d in range(4) for half in (bf_lo, bf_hi)]
     amax = fx.Float32(0.0)
     for j in range_constexpr(8):
         amax = fx.max(amax, fx.Float32(fmath.absf(vs[j])))
@@ -391,19 +397,21 @@ def _quad_scale(ptr, rceil=True):
 
 
 @traced
-def quant_x(c, k):
+def quant_x(c, k, h32=False):
     """The rows of K `k` in LDS through MXFP4 in place, 1 x 32 blocks, 8
     elements a lane (a block on 4 adjacent lanes: one 16 B LDS access a lane,
     conflict-free): an fp4 linear's input rows, as its GEMM quantizes them
     (`c["shuffled"]`: the ASM FP4 GEMM's `per_1x32_f4_quant_hip`, RCEIL;
-    else the Triton FP4 GEMM's `dynamic_mxfp4_quant`)."""
+    else the Triton FP4 GEMM's `dynamic_mxfp4_quant`). With `h32` each block
+    is rotated by Hadamard-32 first, as `per_1x32_f4_quant_hip` rotates it for
+    a projection whose weight sgl-project/sglang#46059 rotated."""
     s, tid, xl = c["S"], c["tid"], c["xl"]
     xrow = k + gemv.LDS_PAD
     nq = s * k // 8
     for i in range_constexpr((nq + THREADS - 1) // THREADS):
         e = fx.min(tid + THREADS * i, nq - 1)
         at = ((e // (k // 8)) * xrow + 8 * (e % (k // 8))) // 2
-        wv, code = _quad_scale(xl + at, c["shuffled"])
+        wv, code = _quad_scale(xl + at, c["shuffled"], h32, tid)
         sc = pow2(code)
         q = fx.Int32(0)
         for d in range_constexpr(4):
