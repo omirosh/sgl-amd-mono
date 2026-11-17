@@ -150,6 +150,9 @@ The spec also refuses these GDN settings, because K1 cannot run them:
   in place
 - an SSM state that is not f32 or bf16, or a conv state that is not bf16
 - an `in_proj_qkvz` or `out_proj` that is neither bf16 nor MXFP4
+- an MXFP4 `in_proj_qkvz` or `out_proj` with the Hadamard-32 rotation of
+  [sglang#46059](https://github.com/sgl-project/sglang/pull/46059), or with another state of its quant method. K1 and
+  K2 do not rotate the activation. Set `SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0`.
 - other GDN weights that are not bf16, or an `A_log` that is not f32
 - a conv with a bias or without SiLU
 - a gated norm over less than a full head, without SiLU, or after the gate
