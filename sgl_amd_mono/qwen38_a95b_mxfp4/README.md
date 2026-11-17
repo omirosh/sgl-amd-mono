@@ -34,7 +34,7 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | test file | contents |
 | --- | --- |
 | `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, and the rows that check mode compares |
-| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
+| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, the activation quant on 1 GPU with `qwen38_a95b_mxfp4/check_quant.py`, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
 | `test/kernels/qwen38_a95b_mxfp4/inputs.py` | random TP8 shards in SGLang's layouts, the inputs of the kernel checks |
 | `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags, the NEXTN flags in `NEXTN`, and the environment of the serving tests |
 | `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving tests at TP8, with `TestMonokernelVerify` for NEXTN |
@@ -112,6 +112,18 @@ time. It does this by default, and `SGLANG_ROCM_GDN_ONLINE_MXFP4=0` turns it off
   on CTAs 0 to 15.
 - The `oq` build of K2 reads the MXFP4 `out_proj`. Its `o_proj` stage quantizes the core rows to MXFP4 in the same way.
 
+Since [sglang#46059](https://github.com/sgl-project/sglang/pull/46059), SGLang also rotates the weights of these
+projections by Hadamard-32 at load time, by default. `SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0` turns the rotation off.
+A rotated weight needs the same rotation of each 1 x 32 block of the activation before its MXFP4 quant. Two more
+builds do this:
+
+- The `qh` build of K1 rotates the normed rows, then quantizes them. `in_proj_ba` reads the rows before the rotation.
+- The `oh` build of K2 and of `layer_block` rotates the core rows in the same way.
+
+The rotation adds in the order of `hadamard32_rotate` of [aiter#6734](https://github.com/ROCm/aiter/pull/6734), so the
+rotated bf16 values are the same as AITER's, bit for bit. A block lies on 4 adjacent lanes. Stages 1, 2 and 4 run in
+the lane, and stages 8 and 16 exchange values with the lanes `lane ^ 1` and `lane ^ 2`.
+
 ## 3. Hand-offs and guarded waits
 
 - Stages and ranks pass values through the tagged mailboxes of `common/sync.py`. Each value has a tag from the step
@@ -166,9 +178,10 @@ The spec also refuses these GDN settings, because K1 cannot run them:
   in place
 - an SSM state that is not f32 or bf16, or a conv state that is not bf16
 - an `in_proj_qkvz` or `out_proj` that is neither bf16 nor MXFP4
-- an MXFP4 `in_proj_qkvz` or `out_proj` with the Hadamard-32 rotation of
-  [sglang#46059](https://github.com/sgl-project/sglang/pull/46059), or with another state of its quant method. K1 and
-  K2 do not rotate the activation. Set `SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0`.
+- an MXFP4 `in_proj_qkvz` or `out_proj` whose quant method is not `AiterMxfp4OnlineLinearMethod` in a known state.
+  The known states are those of SGLang before [sglang#46059](https://github.com/sgl-project/sglang/pull/46059), and
+  those of [sglang#46059](https://github.com/sgl-project/sglang/pull/46059) at `7397386194` with and without the
+  rotation. A new flag of the quant method gives a refusal, because the kernels do not know its numbers.
 - other GDN weights that are not bf16, or an `A_log` that is not f32
 - a conv with a bias or without SiLU
 - a gated norm over less than a full head, without SiLU, or after the gate
@@ -176,13 +189,14 @@ The spec also refuses these GDN settings, because K1 cannot run them:
 The spec accepts a layer with a bf16 shared expert, or with a fused shared expert and 513 routed experts. It refuses a
 layer with neither.
 
-On each rank, `_build` makes two K1 launches for each CUDA graph width of 1 to 8 and each `in_proj_qkvz` dtype of the
-model. One K1 launch is for layer 0, which has no residual input. The other K1 launch is for the other GDN layers.
-`_build` also makes one K2 launch for each width of 1 to 8, each shared-expert layout and each `o_proj` or `out_proj`
-dtype of the model. When each layer has the fused shared expert, it makes one `layer_block` launch for the width 16
-and each `o_proj` or `out_proj` dtype. Without the fused shared expert, a step of 16 rows runs SGLang's forward. It
-compiles them before the first step. With the MXFP4 projections, K2 and `layer_block` run `oq` on the GDN layers and
-the bf16 build on the full-attention layers.
+On each rank, `_build` makes two K1 launches for each CUDA graph width of 1 to 8 and each `in_proj_qkvz` format of
+the model: bf16, MXFP4 or rotated MXFP4. One K1 launch is for layer 0, which has no residual input. The other K1
+launch is for the other GDN layers. `_build` also makes one K2 launch for each width of 1 to 8, each shared-expert
+layout and each `o_proj` or `out_proj` format of the model. When each layer has the fused shared expert, it makes one
+`layer_block` launch for the width 16 and each `o_proj` or `out_proj` format. Without the fused shared expert, a step
+of 16 rows runs SGLang's forward. It compiles them before the first step. With the MXFP4 projections, K2 and
+`layer_block` run `oq` on the GDN layers, with `oh` when SGLang rotates them, and the bf16 build on the
+full-attention layers. Each layer runs the launch of its own format.
 The log shows "Qwen3.8 monokernel: N K1, M K2 and L layer_block launches (widths [...], decode) in T s". With
 speculative decoding, `_build` makes no K1 launch, and the log shows "verify" instead of "decode". In the NEXTN test,
 each request has 4 rows, so the widths are 4, 8 and 16.
@@ -200,7 +214,10 @@ The unit tests run on CPU. Section 1 gives what they check.
 
 The kernel tests run K1 on 1 GPU, and K2 and `layer_block` on 8 GPUs, with random weights:
 
-- Each build key compiles.
+- The MXFP4 quant of the activation in K1, K2 and `layer_block` gives the dequantized values of AITER's
+  `per_1x32_f4_quant_hip`, bit for bit, with and without `hadamard_rotate`. The rotation alone gives the bf16 values of
+  AITER's order, bit for bit. Each input has an outlier in every third block and a block of zeros.
+- Each build key compiles, with the plain and the rotated MXFP4 projections.
 - The outputs of a row do not change with the other rows or with the width. At 16 rows, the outputs of a row do not
   change with the other rows or with the row of the probe.
 - At 16 rows, the outputs of `layer_block` agree with those of two 8-row `fse` K2 launches on the same rows: a cosine
@@ -225,7 +242,9 @@ conv and SSM state rows. `k1.core.cosine`, `k1.conv.cosine` and `k1.state.cosine
 The e2e test runs K1 and K2 on decode steps of width 1 to 8, and SGLang's forward on wider steps. The decode server
 has no fused shared expert, so its steps of 16 rows also run SGLang's forward. It also runs GSM8K, measures the KL
 divergence of decode against prefill, runs check mode, and injects a fault on one rank. Check mode must log K1 and K2
-checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 runs `qq` and K2 runs `oq`. The first
+checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections and SGLang's default rotation, so K1 runs `qq`
+and K2 runs `oq`, with `qh` and `oh` on an SGLang with
+[sglang#46059](https://github.com/sgl-project/sglang/pull/46059). The first
 check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at least 1. A second
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. This test
