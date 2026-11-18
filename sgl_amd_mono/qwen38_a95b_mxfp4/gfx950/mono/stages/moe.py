@@ -5,13 +5,15 @@
 """The MoE and o_proj stages: the MXFP4 arithmetic, the online-MXFP4 GEMV and
 o_proj, the route (the top-10 of 512 logits, the union U of the step's picks)
 and the routed experts (ug, INTER through MXFP4, down) with the shared expert
-fused as expert 512, at the rank's shapes `c["moe"]` (`mx_layout.MoeDims`).
+fused as expert 512 (`fse`) or in bf16 (its down rows added in down), at the
+rank's shapes `c["moe"]` (`mx_layout.MoeDims`).
 
 A stage reads the kernel context `c`: `S`, `TP`, `KT` (picks a token),
 the thread ids, `rank`, the mailbox (`put`, `put_bf`, `put_words`,
-`poll`), LDS (`red`, `xl`, `il`, `contrib`, `rt`), the scratch
-regions `sgate` / `route` / `inter`, the peer regions `ar` / `final`,
-`args` and the variant flags `oq` / `og` / `u1`. Where the
+`poll`), LDS (`red`, `xl`, `il`, `contrib`, `rt`, and `hl` without `fse`),
+the scratch regions `sgate` / `route` / `inter` (and `sgu` without `fse`),
+the peer regions `ar` / `final`, `args` and the variant flags `oq` / `og` /
+`u1` / `fse`. Where the
 router logits are is the model's: `rlog_at(t, lane, i)` is token t's logit
 of expert lane + 64 i as a poll spec, `rlog_last` (n, spec of i) the n
 logits that land last, and CTA `route_cta` also puts ROUTE (for the tests).
@@ -626,24 +628,27 @@ def local_route(c):
 def load_route(c):
     """The LDS route (ids, weights; a token's `KT` picks) -> the union U in
     expert order: `flag[e]` -> slot, `expert[slot]`, `kof[slot][t]` (the
-    token's pick index, -1 if not picked); the fused shared expert is U's last
-    slot, every token's pick `TOPK` with its SGATE weight. Returns |U|."""
+    token's pick index, -1 if not picked); fused (`c["fse"]`), the shared
+    expert is U's last slot, every token's pick `TOPK` with its SGATE weight.
+    Returns |U|."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt, kt = c["rt"], c["KT"]
     kf, max_u = kof_t(c), c["max_u"]
-    if tid < s:
-        g = c["poll"]([(c["sgate"], tid, 1)])[0][0]
-        fx.ptr_store(fx.Int32(E), rt["route"] + (tid * 2 * kt + TOPK))
-        fx.ptr_store(g, rt["route"] + (tid * 2 * kt + kt + TOPK))
+    if const_expr(c["fse"]):  # noqa: SIM102 (traced: `and` does not combine traced values)
+        if tid < s:
+            g = c["poll"]([(c["sgate"], tid, 1)])[0][0]
+            fx.ptr_store(fx.Int32(E), rt["route"] + (tid * 2 * kt + TOPK))
+            fx.ptr_store(g, rt["route"] + (tid * 2 * kt + kt + TOPK))
     if const_expr(c["u1"]):
         # local_route's stores are this wave's (wave 0): no barrier first
         if tid < TOPK:
             e = fx.max(fx.min(fx.ptr_load(rt["route"] + tid), E - 1), 0)
             fx.ptr_store(e, rt["expert"] + tid)
             fx.ptr_store(fx.Int32(tid), rt["kof"] + tid * kf)
-        if tid == 0:
-            fx.ptr_store(fx.Int32(E), rt["expert"] + TOPK)
-            fx.ptr_store(fx.Int32(TOPK), rt["kof"] + TOPK * kf)
+        if const_expr(c["fse"]):  # noqa: SIM102
+            if tid == 0:
+                fx.ptr_store(fx.Int32(E), rt["expert"] + TOPK)
+                fx.ptr_store(fx.Int32(TOPK), rt["kof"] + TOPK * kf)
         gpu.barrier()
         return fx.Int32(kt)
     for i in range_constexpr((E + THREADS - 1) // THREADS):
@@ -675,11 +680,12 @@ def load_route(c):
         e = fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * kt + k)), E - 1), 0)
         slot = fx.ptr_load(rt["flag"] + e)
         fx.ptr_store(fx.Int32(k), rt["kof"] + (slot * kf + t))
-    if tid < s:
-        fx.ptr_store(fx.Int32(TOPK), rt["kof"] + (tot * kf + tid))
-    if tid == 0:
-        fx.ptr_store(fx.Int32(E), rt["expert"] + tot)
-    tot = tot + 1
+    if const_expr(c["fse"]):
+        if tid < s:
+            fx.ptr_store(fx.Int32(TOPK), rt["kof"] + (tot * kf + tid))
+        if tid == 0:
+            fx.ptr_store(fx.Int32(E), rt["expert"] + tot)
+        tot = tot + 1
     gpu.barrier()
     return uniform(tot)
 
@@ -723,7 +729,8 @@ def ug_loads(c, task, h, live, shared=False):
     else:
         e = uniform(fx.ptr_load(rt["expert"] + slot))
         # + the fused shared expert, expert E
-        n_w, n_s = (E + 1) * wb, (E + 1) * sb
+        ne = E + int(c["fse"])
+        n_w, n_s = ne * wb, ne * sb
         r_w = rsrc(a["w13"], live.select(fx.Int32(n_w), fx.Int32(0)))
         r_s = rsrc(a["w13s"], live.select(fx.Int32(n_s), fx.Int32(0)))
     base = L.w13_base(d, e)
@@ -1076,22 +1083,64 @@ def down_slots(c, rgd, nu, ops0, lo, hi, nxt=None, part=0):
 
 
 @traced
+def load_h(c):
+    """The bf16 shared expert's SGU -> h = bf16(silu(g) u) (SiluAndMul on
+    bf16) -> LDS `hl` rows of RI + pad (its intermediate is the experts')."""
+    s, tid, ri = c["S"], c["tid"], c["moe"].ri
+    n = s * ri // 2
+    per = (n + THREADS - 1) // THREADS
+    hrow = ri + gemv.LDS_PAD
+    specs = []
+    for i in range_constexpr(per):
+        p = fx.min(tid + THREADS * i, n - 1)
+        t = p // (ri // 2)
+        cp = p % (ri // 2)
+        specs += [
+            (c["sgu"], (t * 2 * ri) // 2 + cp, 1),
+            (c["sgu"], (t * 2 * ri + ri) // 2 + cp, 1),
+        ]
+    got = c["poll"](specs)
+    for i in range_constexpr(per):
+        p = fx.min(tid + THREADS * i, n - 1)
+        t = p // (ri // 2)
+        cp = p % (ri // 2)
+        g, u = got[2 * i][0], got[2 * i + 1][0]
+        h0 = silu_mul(bf_lo(g), bf_lo(u))
+        h1 = silu_mul(bf_hi(g), bf_hi(u))
+        hw = (
+            fx.Vector.from_elements([h0, h1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)[0]
+        )
+        if tid + THREADS * i < n:
+            fx.ptr_store(hw, c["hl"] + (t * hrow + 2 * cp) // 2)
+    gpu.barrier()
+
+
+@traced
 def down_put(c, rgd, part=0):
     """Hidden rows 16 rgd ..: the contributions (`part`) summed in top-k
-    order -> bf16 partial -> every rank's FINAL."""
+    order -> bf16 partial -> every rank's FINAL; with the bf16 shared expert
+    (not `c["fse"]`), + bf16(bf16(its down rows in `red`) x SGATE)."""
     s, tid, kt, d = c["S"], c["tid"], c["KT"], c["moe"]
     cb = c["contrib"] + part * contrib_floats(s, kt)
     gpu.barrier()
     if tid < (ROWS // 2) * s:
         rp = tid % (ROWS // 2)
         tt = tid // (ROWS // 2)
+        if const_expr(not c["fse"]):
+            sg = f32_of(c["poll"]([(c["sgate"], tt, 1)])[0][0])
         ys = []
         for q in range_constexpr(2):
             r = 2 * rp + q
             y = fx.Float32(0.0)
             for k in range_constexpr(kt):
                 y = y + fx.ptr_load(cb + ((tt * kt + k) * ROWS + r))
-            ys.append(bf16_round(y))
+            if const_expr(c["fse"]):
+                ys.append(bf16_round(y))
+            else:
+                sd = bf16_round(bf16_round(row_sum(c["red"], r, tt)) * sg)
+                ys.append(bf16_round(bf16_round(y) + sd))
         for p in range_constexpr(c["TP"]):
             c["put_bf"](
                 c["peer"]["final"][p],
@@ -1102,11 +1151,19 @@ def down_put(c, rgd, part=0):
 
 
 def stage_down(c, rgd, nu, ops0, rgd_next=None):
-    """Hidden rows 16 rgd .. over every slot (`down_slots`) -> every rank's
-    FINAL (`down_put`); the last batch's prefetch is row group `rgd_next`'s
-    first batch, returned (the loop runs: |U| >= TOPK > WAVES)."""
+    """Hidden rows 16 rgd .. over every slot (`down_slots`), with the bf16
+    shared expert (not `c["fse"]`) its down rows against h (`load_h`) ->
+    every rank's FINAL (`down_put`); the last batch's prefetch is row group
+    `rgd_next`'s first batch, returned (the loop runs: |U| >= TOPK > WAVES)."""
+    lane, wave, ri = c["lane"], c["wave"], c["moe"].ri
+    if not c["fse"]:
+        # the shared down's operands first: K 256 is two chunks (waves 0, 1)
+        sops = gemv.loads(lane, wave, c["args"]["w_sd"], rgd * ROWS, ri)
     down_zero(c)
     nxt = None if rgd_next is None else (rgd_next, 0, nu)
     ops = down_slots(c, rgd, nu, ops0, 0, nu, nxt)
+    if not c["fse"]:
+        hrow = ri + gemv.LDS_PAD
+        put_acc(c, gemv.mfmas(lane, wave, c["hl"], hrow, ri, c["S"], sops))
     down_put(c, rgd)
     return ops

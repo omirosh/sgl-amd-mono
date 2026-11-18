@@ -346,7 +346,8 @@ def xq_to_lds(c):
 def stage_sgate(c, t, src):
     """Token t's shared-expert weight: sigmoid(bf16(x . w_sg)) in fp32 (the
     top-k kernel's fused sigmoid on the combined gate's bf16 logit) -> SGATE,
-    x built from `src` (`rs` loaded)."""
+    x built from `src` (`rs` loaded); with the bf16 shared expert (not
+    `c["fse"]`) the sigmoid is bf16 (ReplicatedLinear then torch.sigmoid)."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     per = H // THREADS  # 16: two 8-column words a thread
     acc = fx.Float32(0.0)
@@ -366,7 +367,8 @@ def stage_sgate(c, t, src):
         tot = fx.ptr_load(red + 0)
         for w in range_constexpr(1, WAVES):
             tot = tot + fx.ptr_load(red + w)
-        c["put"](c["sgate"], t, sigmoid(bf16_round(tot)))
+        g = sigmoid(bf16_round(tot))
+        c["put"](c["sgate"], t, g if c["fse"] else bf16_round(g))
     gpu.barrier()
 
 
