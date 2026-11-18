@@ -14,8 +14,9 @@ GPUs (torchrun), on random TP8 shards in SGLang's layouts:
   shared expert, without it, then with it) in one graph on one peer buffer,
   replayed, bit for bit against eager on every rank;
 - fault: rank 3 stalls at its first wait (``stop=False``), in K2 at 1 row and in
-  layer_block at 16 with and without the fused shared expert: rank 3 sets its
-  deadline word and its flag reaches every rank.
+  layer_block at 16 with and without the fused shared expert, and without it also
+  at the shared gate | up's ``spart`` wait: rank 3 sets its deadline word and its
+  flag reaches every rank.
 """
 
 import argparse
@@ -449,8 +450,42 @@ def check_chain(n):
     return [] if ok else [f"chain {name}"]
 
 
-def check_fault(build, s, fse):
-    fault = dict(fault_site=1) if rank == 3 else {}
+def sgu_site():
+    """The guard site of part 0's `spart` wait in the 16-row build without the fused
+    shared expert: the last wait `blocks.stage_sgu` traces (sites go in trace order).
+    The disk cache can hand a rank another's build untraced, so every rank takes
+    the largest site any rank saw."""
+    seen, inside = [], [False]
+    next_site, stage_sgu = guard.Guard.next_site, blocks.stage_sgu
+
+    def count(g):
+        n = next_site(g)
+        if inside[0]:
+            seen.append(n)
+        return n
+
+    def probe(*args, **kwargs):
+        inside[0] = True
+        try:
+            return stage_sgu(*args, **kwargs)
+        finally:
+            inside[0] = False
+
+    guard.Guard.next_site, blocks.stage_sgu = count, probe
+    try:
+        # fault_site -1 stalls no wait: a key no other check compiled, so it traces
+        ok = compile_keys([blocks.LayerBuild(tokens=WIDE, fse=False, fault_site=-1)])
+    finally:
+        guard.Guard.next_site, blocks.stage_sgu = next_site, stage_sgu
+    t = torch.tensor([max(seen, default=0)])
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    if not ok or int(t) == 0:
+        raise SystemExit("no rank traced a stage_sgu wait")
+    return int(t)
+
+
+def check_fault(build, s, fse, site=1):
+    fault = dict(fault_site=site) if rank == 3 else {}
     key = build(tokens=s, fse=fse, stop=False, **fault)
     if not compile_keys([key]):
         raise SystemExit("a rank failed to compile the fault key")
@@ -471,8 +506,8 @@ def check_fault(build, s, fse):
     finally:
         side.close()
     bad = []
-    if rank == 3 and words[guard.ERR_DEADLINE] != 2:
-        bad.append(f"rank 3 error words {words}, want deadline word 2")
+    if rank == 3 and words[guard.ERR_DEADLINE] != site + 1:
+        bad.append(f"rank 3 error words {words}, want deadline word {site + 1}")
     # with stop=False rank 3 sends its data after the deadline, so a peer may
     # finish its waits before it sees the flag; the e2e test stops on it
     if flags[3] != 1:
@@ -480,7 +515,7 @@ def check_fault(build, s, fse):
     if bad:
         print(f"[rank {rank}] fault: {bad} in {dt:.2f} s", flush=True)
     ok = all_ok(not bad)
-    name = f"{build.__name__} at {s} rows, fse {fse}"
+    name = f"{build.__name__} at {s} rows, fse {fse}, site {site}"
     log(
         f"fault ({name}): rank 3 stalled, returned in {dt:.2f} s: {'OK' if ok else 'FAIL'}"
     )
@@ -510,6 +545,8 @@ def main():
     fails += check_fault(blocks.LayerBuild, WIDE, True)
     dist.barrier()
     fails += check_fault(blocks.LayerBuild, WIDE, False)
+    dist.barrier()
+    fails += check_fault(blocks.LayerBuild, WIDE, False, sgu_site())
     for f in fails:
         log(f"FAIL {f}")
     log("PASS" if not fails else f"FAIL ({len(fails)})")
