@@ -1,23 +1,26 @@
 """Check K2 (``layer_post``: o_proj, its TP reduce, the norm, the router and the
-experts, the MoE TP reduce) and ``layer_block`` (the same at 16 rows, with the
-fused shared expert) on 8 gfx950 GPUs (torchrun), on random TP8 shards in
-SGLang's layouts:
+experts, the MoE TP reduce) and ``layer_block`` (the same at 16 rows) on 8 gfx950
+GPUs (torchrun), on random TP8 shards in SGLang's layouts:
 
-- compile: every build key the spec can make (K2 at widths 1 .. 8, fused shared
-  expert, MXFP4 o_proj; layer_block at 16, MXFP4 o_proj) compiles on every rank;
+- compile: every build key the spec can make (K2 at widths 1 .. 8, layer_block at
+  16, each with and without the fused shared expert and each o_proj format)
+  compiles on every rank;
 - batch invariance: a probe row's out and res_out do not change with the step's
   other rows (other requests, zero rows, copies of the probe) or the width, on
-  every rank, and every rank has the same out; at 16 rows (layer_block) the same
-  over the probe's row, and the rows agree with K2 at 8 rows (cosine);
-- graph replay: widths 8, 16, 16, 1, 3, 8, 16, 2, 5 in one graph on one peer
-  buffer, replayed, bit for bit against eager on every rank;
+  every rank, and every rank has the same out; at 16 rows (layer_block), with and
+  without the fused shared expert, the same over the probe's row, and the rows
+  agree with K2 at 8 rows in the same state (cosine);
+- graph replay: widths 8, 16, 16, 1, 3, 8, 16, 2, 5 (layer_block with the fused
+  shared expert, without it, then with it) in one graph on one peer buffer,
+  replayed, bit for bit against eager on every rank;
 - fault: rank 3 stalls at its first wait (``stop=False``), in K2 at 1 row and in
-  layer_block at 16: rank 3 sets its deadline word and its flag reaches every
-  rank.
+  layer_block at 16 with and without the fused shared expert: rank 3 sets its
+  deadline word and its flag reaches every rank.
 """
 
 import argparse
 import datetime
+import itertools
 import os
 import sys
 import time
@@ -45,7 +48,18 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import blocks
 from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS, _compile_only
 
 WIDE = blocks.MAXT  # layer_block's width in the spec
-REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
+# (width, fused shared expert) of each launch of the graph replay
+REPLAY = (
+    (8, False),
+    (WIDE, True),
+    (WIDE, False),
+    (1, False),
+    (3, False),
+    (8, False),
+    (WIDE, True),
+    (2, False),
+    (5, False),
+)
 KINDS = ("rand0", "rand1", "zero", "copy")
 LATE = 20_000_000  # GPU cycles rank 3 sleeps before a launch, about 10 ms
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
@@ -86,8 +100,9 @@ def scratch_bytes(s):
     if s > MAXT:
         return max(
             blocks.scratch_bytes(
-                blocks.layer_scratch_layout(blocks.LayerBuild(tokens=s, oq=q))
+                blocks.layer_scratch_layout(blocks.LayerBuild(tokens=s, fse=f, oq=q))
             )
+            for f in (False, True)
             for q in (False, True)
         )
     return max(
@@ -158,7 +173,11 @@ def check_compile():
         for f in (False, True)
         for q, h in FP4_FORMATS
     ]
-    keys += [blocks.LayerBuild(tokens=WIDE, oq=q, oh=h) for q, h in FP4_FORMATS]
+    keys += [
+        blocks.LayerBuild(tokens=WIDE, fse=f, oq=q, oh=h)
+        for f in (False, True)
+        for q, h in FP4_FORMATS
+    ]
     t0 = time.time()
     ok = compile_keys(keys)
     log(
@@ -243,16 +262,17 @@ def cosine(a, b) -> float:
 
 
 def check_layer_block(side):
-    """layer_block at WIDE rows, bf16, MXFP4 and rotated MXFP4 o_proj: the probe
-    row does not change with the other rows or its row, and the rows agree with
-    K2 at 8 rows (fused shared expert) on the same inputs."""
+    """layer_block at WIDE rows, with and without the fused shared expert, bf16,
+    MXFP4 and rotated MXFP4 o_proj: the probe row does not change with the other
+    rows or its row, and the rows agree with K2 at 8 rows in the same shared
+    expert state on the same inputs."""
     g = gen(DEV, 0)
     probe_r = rnd(g, 1, HIDDEN)
     probe_c = rnd(gen(DEV, 200 + rank), 1, CORE)
     bad, probes, agree = [], [], {}
-    for oq, oh in FP4_FORMATS:
-        w = k2_weights(DEV, rank, 600, fse=True, oq=oq)
-        key = blocks.LayerBuild(tokens=WIDE, oq=oq, oh=oh)
+    for fse, (oq, oh) in itertools.product((True, False), FP4_FORMATS):
+        w = k2_weights(DEV, rank, 600, fse=fse, oq=oq)
+        key = blocks.LayerBuild(tokens=WIDE, fse=fse, oq=oq, oh=oh)
         outs = {}
         for pos in (0, WIDE - 1):
             for kind in KINDS:
@@ -265,14 +285,14 @@ def check_layer_block(side):
                 side.run(key, w, core, residual, out, res_out)
                 if pos == 0 and kind == "rand0":
                     ref = torch.empty_like(out), torch.empty_like(out)
-                    half = k2.K2Build(tokens=MAXT, fse=True, oq=oq, oh=oh)
+                    half = k2.K2Build(tokens=MAXT, fse=fse, oq=oq, oh=oh)
                     for r in range(0, WIDE, MAXT):
                         rs = slice(r, r + MAXT)
                         side.run(
                             half, w, core[rs], residual[rs], ref[0][rs], ref[1][rs]
                         )
                     for name, a, b in zip(("out", "res_out"), (out, res_out), ref):
-                        agree[oq, oh, name] = cosine(a, b)
+                        agree[fse, oq, oh, name] = cosine(a, b)
                 torch.cuda.synchronize()
                 outs[pos, kind] = (out[pos].clone(), res_out[pos].clone())
         moved = [
@@ -281,11 +301,11 @@ def check_layer_block(side):
             if not all(map(torch.equal, got, outs[0, "rand0"]))
         ]
         if moved:
-            bad.append(f"oq {oq} oh {oh}: the probe changes in {moved}")
+            bad.append(f"fse {fse} oq {oq} oh {oh}: the probe changes in {moved}")
         probes.append(outs[0, "rand0"][0])
     bad += [
-        f"oq {oq} oh {oh}: {name} cosine against K2 {v:.6f} < {AGREE[name]}"
-        for (oq, oh, name), v in agree.items()
+        f"fse {fse} oq {oq} oh {oh}: {name} cosine against K2 {v:.6f} < {AGREE[name]}"
+        for (fse, oq, oh, name), v in agree.items()
         if not v >= AGREE[name]
     ]
     if any(errors(side.epoch).values()):
@@ -295,11 +315,13 @@ def check_layer_block(side):
     same = same_on_every_rank(torch.stack(probes))
     ok = all_ok(not bad)
     worst = {
-        name: min(v for (*_, n), v in agree.items() if n == name) for name in AGREE
+        (f, name): min(v for (ff, *_, n), v in agree.items() if (ff, n) == (f, name))
+        for f in (True, False)
+        for name in AGREE
     }
     log(
-        f"layer_block at {WIDE} rows: probe invariance and K2 agreement (worst cosine "
-        f"{worst}): {'OK' if ok else 'FAIL'}, ranks agree {same}"
+        f"layer_block at {WIDE} rows, fse on and off: probe invariance and K2 "
+        f"agreement (worst cosine {worst}): {'OK' if ok else 'FAIL'}, ranks agree {same}"
     )
     return ([] if ok else ["layer_block"]) + (
         [] if same else ["layer_block: ranks differ"]
@@ -307,24 +329,25 @@ def check_layer_block(side):
 
 
 def check_graph_replay(side, replays):
-    w = k2_weights(DEV, rank, 300)
-    w_fse = k2_weights(DEV, rank, 300, fse=True)
+    ws = {f: k2_weights(DEV, rank, 300, fse=f) for f in (False, True)}
     steps = []
-    for j, s in enumerate(REPLAY_WIDTHS):
+    for j, (s, fse) in enumerate(REPLAY):
         residual = rnd(gen(DEV, 400 + j), s, HIDDEN)
         core = rnd(gen(DEV, 500 + 100 * rank + j), s, CORE)
         out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
         key = (
-            blocks.LayerBuild(tokens=s, oq=False) if s > MAXT else k2.K2Build(tokens=s)
+            blocks.LayerBuild(tokens=s, fse=fse, oq=False)
+            if s > MAXT
+            else k2.K2Build(tokens=s, fse=fse)
         )
-        steps.append((key, core, residual, out, torch.empty_like(out)))
+        steps.append((key, ws[fse], core, residual, out, torch.empty_like(out)))
 
     def run_all():
-        for key, core, residual, out, res_out in steps:
-            side.run(key, w_fse if is_wide(key) else w, core, residual, out, res_out)
+        for key, w, core, residual, out, res_out in steps:
+            side.run(key, w, core, residual, out, res_out)
 
     def outputs():
-        return [t for st in steps for t in st[3:]]
+        return [t for st in steps for t in st[4:]]
 
     run_all()
     torch.cuda.synchronize()
@@ -342,7 +365,7 @@ def check_graph_replay(side, replays):
             bad += sum(not torch.equal(a, b) for a, b in zip(outputs(), eager))
     ok = all_ok(bad == 0 and not any(errors(side.epoch).values()))
     log(
-        f"graph replay: {replays} replays of widths {REPLAY_WIDTHS}: {'OK' if ok else 'FAIL'}, ranks agree {agree}"
+        f"graph replay: {replays} replays of (width, fse) {REPLAY}: {'OK' if ok else 'FAIL'}, ranks agree {agree}"
     )
     if bad:
         print(f"[rank {rank}] graph replay: {bad} mismatching checks", flush=True)
@@ -426,12 +449,12 @@ def check_chain(n):
     return [] if ok else [f"chain {name}"]
 
 
-def check_fault(build, s):
+def check_fault(build, s, fse):
     fault = dict(fault_site=1) if rank == 3 else {}
-    key = build(tokens=s, stop=False, **fault)
+    key = build(tokens=s, fse=fse, stop=False, **fault)
     if not compile_keys([key]):
         raise SystemExit("a rank failed to compile the fault key")
-    w = k2_weights(DEV, rank, 77, fse=is_wide(key), oq=key.oq)
+    w = k2_weights(DEV, rank, 77, fse=fse, oq=key.oq)
     g = gen(DEV, 78)
     core, residual = rnd(g, s, CORE), rnd(g, s, HIDDEN)
     side = Side(seconds=0.5)
@@ -457,7 +480,7 @@ def check_fault(build, s):
     if bad:
         print(f"[rank {rank}] fault: {bad} in {dt:.2f} s", flush=True)
     ok = all_ok(not bad)
-    name = f"{build.__name__} at {s} rows"
+    name = f"{build.__name__} at {s} rows, fse {fse}"
     log(
         f"fault ({name}): rank 3 stalled, returned in {dt:.2f} s: {'OK' if ok else 'FAIL'}"
     )
@@ -482,9 +505,11 @@ def main():
     finally:
         side.close()
     dist.barrier()
-    fails += check_fault(k2.K2Build, 1)
+    fails += check_fault(k2.K2Build, 1, False)
     dist.barrier()
-    fails += check_fault(blocks.LayerBuild, WIDE)
+    fails += check_fault(blocks.LayerBuild, WIDE, True)
+    dist.barrier()
+    fails += check_fault(blocks.LayerBuild, WIDE, False)
     for f in fails:
         log(f"FAIL {f}")
     log("PASS" if not fails else f"FAIL ({len(fails)})")
