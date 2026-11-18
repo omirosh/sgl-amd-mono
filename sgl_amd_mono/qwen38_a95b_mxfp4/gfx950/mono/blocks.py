@@ -69,7 +69,6 @@ E, TOPK = L.EXPERTS, L.TOPK
 EPR = E // TP  # router logits a rank computes: 64
 RIP = L.RI  # the experts' intermediate rows as the weights hold them
 MOE = QL.MoeDims(H, L.RI, RIP)
-KT = TOPK + 1  # picks a token: the top-10 and the fused shared expert
 MAXT = L.SPLIT_MAX
 NRED = N.NRED  # 64: the norm / final tasks, CTAs 0 ..
 OTASKS = H // ROWS  # 512: o_proj / down row groups, bid and bid + 256
@@ -87,6 +86,13 @@ SPLIT_MIN = 8
 
 assert SPLIT_MIN >= PS_MIN
 assert OTASKS == 2 * BLOCKS and PS0 + L.RI // moe.UG_COLS <= BLOCKS
+# the bf16 shared expert's gate | up (not `fse`): 2 RI rows in row groups of
+# 16, each over x's K quarters as the router, on the CTAs the fused one's
+# early ug tasks take
+SG0 = PS0  # 96
+SG_PARTS = R_PARTS
+SG_TASKS = 2 * L.RI // ROWS * SG_PARTS  # 128
+assert SG0 + SG_TASKS <= BLOCKS
 assert RIP % 128 == 0 and k2.TAG_SLOTS == moe.TAG_SLOTS
 
 _STREAM = fx.Stream(None)
@@ -98,6 +104,9 @@ class LayerBuild(msgspec.Struct, frozen=True):
     oq: bool = True  # out_proj / o_proj MXFP4 (ASM FP4 GEMM layout)
     oh: bool = False  # out_proj rotated by Hadamard-32 (sgl-project/sglang#46059)
     og: bool = False  # o_proj's input is core x sigmoid(gate) (full attention)
+    # the shared expert fused as expert 512 (sgl-project/sglang#41899); False:
+    # the bf16 shared expert (w_sgu, w_sd)
+    fse: bool = True
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
@@ -110,8 +119,13 @@ class LayerBuild(msgspec.Struct, frozen=True):
         return self.tokens == 1
 
     @property
+    def kt(self) -> int:
+        """Picks a token: the top-10, then the fused shared expert."""
+        return TOPK + int(self.fse)
+
+    @property
     def ps(self) -> bool:
-        return self.tokens >= PS_MIN
+        return self.fse and self.tokens >= PS_MIN
 
     @property
     def xq(self) -> bool:
@@ -119,7 +133,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
 
     @property
     def split(self) -> bool:
-        return self.tokens >= SPLIT_MIN
+        return self.fse and self.tokens >= SPLIT_MIN
 
 
 LAYER_ABI = KernelAbi(
@@ -132,6 +146,8 @@ LAYER_ABI = KernelAbi(
         "ln_w",
         "w_gate",
         "w_sg",
+        "w_sgu",
+        "w_sd",
         "w13",
         "w13s",
         "w2",
@@ -148,23 +164,26 @@ LAYER_ABI = KernelAbi(
 
 
 LAYER_REGIONS = ("msq", "xqf", "rpart", "sgate", "route", "inter")
+SGU_REGIONS = ("spart", "sgu")  # the bf16 shared expert's (not `fse`)
 
 
 def layer_scratch_layout(key: LayerBuild) -> dict:
-    """The mailbox regions, then `xbuf`: the AR sums [S, H] bf16 the norm
-    tasks write for the consumers' x (16 B aligned), then with `key.xq` the x
-    rows' shared MXFP4 image (16 B aligned)."""
+    """The mailbox regions (without `key.fse`, then the shared gate | up's
+    partials and its bf16 SGU [S, 2 RI]), then `xbuf`: the AR sums [S, H]
+    bf16 the norm tasks write for the consumers' x (16 B aligned), then with
+    `key.xq` the x rows' shared MXFP4 image (16 B aligned)."""
     s = key.tokens
-    lay = pair_layout(
-        {
-            "msq": NRED * s,
-            "xqf": NRED,
-            "rpart": R_TASKS * s * ROWS,
-            "sgate": s,
-            "route": s * 2 * TOPK,
-            "inter": s * KT * moe.inter_pairs(MOE),
-        }.items()
-    )
+    regions = {
+        "msq": NRED * s,
+        "xqf": NRED,
+        "rpart": R_TASKS * s * ROWS,
+        "sgate": s,
+        "route": s * 2 * TOPK,
+        "inter": s * key.kt * moe.inter_pairs(MOE),
+    }
+    if not key.fse:
+        regions |= {"spart": SG_TASKS * s * ROWS, "sgu": s * L.RI}
+    lay = pair_layout(regions.items())
     lay |= pair_layout([("xbuf", s * H * 2 // 8)], 16, scratch_bytes(lay))
     if key.xq:
         lay |= pair_layout([("xq", N.xq_dwords(s) // 2)], 16, scratch_bytes(lay))
@@ -270,6 +289,35 @@ def stage_router(c, i, q, ops, src):
     )
 
 
+def sgu_loads(c, j, q):
+    """Shared gate | up task (j, q): rows 16 j .. of w_sgu, K quarter q."""
+    return gemv.loads(
+        c["lane"], c["wave"], c["args"]["w_sgu"], j * ROWS, R_K, ldk=H, k0=q * R_K
+    )
+
+
+@traced
+def stage_sgu(c, j, q, ops, src):
+    """Shared gate | up task (j, q) on x's K quarter q (`rs` loaded), as the
+    router's: part 0 rounds the rows to bf16 (the bf16 GEMM's output) and puts
+    them to SGU, token t's at t 2 RI + 16 j (gate 0 .. RI, up RI .. 2 RI)."""
+    s, lane, wave = c["S"], c["lane"], c["wave"]
+    N.x_rows_to_lds(c, src, R_K, q * R_K)
+    moe.put_acc(c, gemv.mfmas(lane, wave, c["xl"], R_K + gemv.LDS_PAD, R_K, s, ops))
+
+    def out(t, r, vs):
+        c["put_bf"](c["sgu"], t * 2 * L.RI + j * ROWS + r, vs)
+
+    moe.ksplit_rows(
+        c,
+        c["spart"],
+        lambda qq, t, r: ((j * SG_PARTS + qq) * s + t) * ROWS + r,
+        q,
+        SG_PARTS,
+        out,
+    )
+
+
 def _rlog_at(rlog, s, t, e):
     """Token t's logit of expert e: rank e / EPR's slot of every rank's RLOG."""
     return (rlog, ((e // EPR * s + t) * EPR + e % EPR) // 2, 1)
@@ -300,13 +348,19 @@ def build_layer(key: LayerBuild):
     s = key.tokens
     need(1 <= s <= MAXT, f"{s} rows, layer_block takes 1..{MAXT}")
     need(key.oq or not key.oh, "oh rotates the MXFP4 out_proj: it needs oq")
+    need(
+        key.fse or s == MAXT,
+        f"layer_block with the bf16 shared expert: {MAXT} rows only (the spec's)",
+    )
     scr = layer_scratch_layout(key)
-    max_u = s * TOPK + 1  # distinct experts the step can touch + the fused shared
+    kt = key.kt
+    # distinct experts the step can touch + the fused shared
+    max_u = s * TOPK + int(key.fse)
     d = MOE
 
     @fx.struct
     class RouteLds:
-        route: fx.Array[fx.Int32, s * 2 * KT, 16]
+        route: fx.Array[fx.Int32, s * 2 * kt, 16]
         flag: fx.Array[fx.Int32, E, 16]
         expert: fx.Array[fx.Int32, max_u, 16]
         kof: fx.Array[fx.Int32, max_u * s, 16]
@@ -320,8 +374,10 @@ def build_layer(key: LayerBuild):
 
     @fx.struct
     class DownLds:
-        il: fx.Array[fx.Int32, s * KT * (moe.irow(d) // 4 + d.rip // 32), 16]
-        contrib: fx.Array[fx.Float32, (1 + int(key.split)) * s * KT * ROWS, 16]
+        il: fx.Array[fx.Int32, s * kt * (moe.irow(d) // 4 + d.rip // 32), 16]
+        contrib: fx.Array[fx.Float32, (1 + int(key.split)) * s * kt * ROWS, 16]
+        # h of the bf16 shared expert (not `fse`)
+        hl: fx.Array[fx.Int32, 16 if key.fse else s * (L.RI + gemv.LDS_PAD) // 2, 16]
 
     @fx.union
     class StageLds:
@@ -336,6 +392,7 @@ def build_layer(key: LayerBuild):
     keyed = key_tuple(key, SOURCES)
     name = (
         f"qwen38_mono_layer_s{s}_o{int(key.oq)}_a{int(key.og)}{'_h1' if key.oh else ''}"
+        f"{'' if key.fse else '_f0'}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -348,6 +405,8 @@ def build_layer(key: LayerBuild):
         ln_w: Int64,
         w_gate: Int64,
         w_sg: Int64,
+        w_sgu: Int64,
+        w_sd: Int64,
         w13: Int64,
         w13s: Int64,
         w2: Int64,
@@ -408,7 +467,8 @@ def build_layer(key: LayerBuild):
                 "og": key.og,
                 "shuffled": True,
                 "u1": key.u1,
-                "KT": KT,
+                "fse": key.fse,
+                "KT": kt,
                 "kof_t": s,
                 "max_u": max_u,
                 "put": mb.put,
@@ -421,6 +481,7 @@ def build_layer(key: LayerBuild):
                 "xl": xl.xl.ptr,
                 "il": dl.il.ptr,
                 "contrib": dl.contrib.ptr,
+                "hl": dl.hl.ptr,
                 "rt": {
                     "route": rl.route.ptr,
                     "flag": rl.flag.ptr,
@@ -439,6 +500,8 @@ def build_layer(key: LayerBuild):
                     "ln_w": ln_w,
                     "w_gate": w_gate,
                     "w_sg": w_sg,
+                    "w_sgu": w_sgu,
+                    "w_sd": w_sd,
                     "w13": w13,
                     "w13s": w13s,
                     "w2": w2,
@@ -447,15 +510,21 @@ def build_layer(key: LayerBuild):
                     "res_out": res_out,
                 },
             }
-            for region in LAYER_REGIONS:
+            for region in LAYER_REGIONS + (() if key.fse else SGU_REGIONS):
                 c[region] = sreg(scratch, scr[region][0], region)
             src = (c["xbuf"], CM_DEV, residual)
             is_r = (bid >= R0) & (bid < RT0)
             is_g = (bid >= RT0) & (bid < RT0 + s)
+            if const_expr(key.fse):
+                is_rs = is_r
+            else:
+                is_s = (bid >= SG0) & (bid < SG0 + SG_TASKS)
+                is_rs = is_r | is_s
             ck = L.VALUE_DIM
-            # ---- o_proj (both tasks' weights in flight first; a router CTA's
-            # router weights behind them), then the AR + residual add + norm
-            # sums, the router and the shared gate
+            # ---- o_proj (both tasks' weights in flight first; a router or
+            # shared gate | up CTA's weights behind them), then the AR +
+            # residual add + norm sums, the router, the shared gate | up and
+            # the shared gate
             if is_r:
                 oops = [moe.o_loads(c, bid + BLOCKS * j, ck) for j in range(2)]
                 ri = bid - R0
@@ -463,7 +532,15 @@ def build_layer(key: LayerBuild):
                 moe.run_oproj(c, oops, ck)
                 N.load_rstd(c)
                 stage_router(c, ri // R_PARTS, ri % R_PARTS, rops, src)
-            if ~is_r:
+            if const_expr(not key.fse):  # noqa: SIM102 (traced: `and` does not combine traced values)
+                if is_s:
+                    soops = [moe.o_loads(c, bid + BLOCKS * j, ck) for j in range(2)]
+                    si = bid - SG0
+                    sops = sgu_loads(c, si // SG_PARTS, si % SG_PARTS)
+                    moe.run_oproj(c, soops, ck)
+                    N.load_rstd(c)
+                    stage_sgu(c, si // SG_PARTS, si % SG_PARTS, sops, src)
+            if ~is_rs:
                 moe.run_oproj(
                     c, [moe.o_loads(c, bid + BLOCKS * j, ck) for j in range(2)], ck
                 )
@@ -476,7 +553,7 @@ def build_layer(key: LayerBuild):
                 N.load_rstd(c)
                 N.stage_sgate(c, bid - RT0, src)
             # ---- the routed experts, then down: two row groups a CTA
-            missing = ~(is_r | is_g)
+            missing = ~(is_rs | is_g)
             nu = moe.run_ug(c, key.ps, PS0, lambda: _x_ug(c, src, key.xq, missing))
             dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
             if const_expr(key.split):
@@ -493,6 +570,8 @@ def build_layer(key: LayerBuild):
                 moe.down_put(c, b2, 1)
             else:
                 moe.load_inter(c)
+                if const_expr(not key.fse):
+                    moe.load_h(c)
                 dops2 = moe.stage_down(c, bid, nu, dops, bid + BLOCKS)
                 moe.stage_down(c, bid + BLOCKS, nu, dops2)
             if bid < NRED:
@@ -508,6 +587,8 @@ def build_layer(key: LayerBuild):
         ln_w: Int64,
         w_gate: Int64,
         w_sg: Int64,
+        w_sgu: Int64,
+        w_sd: Int64,
         w13: Int64,
         w13s: Int64,
         w2: Int64,
@@ -531,6 +612,8 @@ def build_layer(key: LayerBuild):
             ln_w,
             w_gate,
             w_sg,
+            w_sgu,
+            w_sd,
             w13,
             w13s,
             w2,
@@ -571,6 +654,8 @@ def layer_block(
     layer,
     w_os=None,
     gate=None,
+    w_sgu=None,
+    w_sd=None,
 ):
     """out_proj / o_proj and its TP all-reduce, the residual add +
     post_attention_layernorm, the sparse MoE and its TP all-reduce: `core`
@@ -579,13 +664,14 @@ def layer_block(
     MoE's output) [S, H] bf16. Every weight as SGLang holds it after loading:
     `w_o` with `key.oq` fp4x2 with e8m0 `w_os` in the ASM FP4 GEMM layout,
     the routed experts as the AITER_MXFP4_MXFP4 backend holds them (shuffled,
-    e8m0 scales), the shared expert fused as expert 512. `peers`: the int64
+    e8m0 scales), the shared expert fused as expert 512 with `key.fse`, else
+    bf16 `w_sgu` [2 RI, H] (gate | up) and `w_sd` [H, RI]. `peers`: the int64
     table of every rank's peer buffer (`peer_buffer_bytes()` each)."""
     s = key.tokens
     k = L.VALUE_DIM
     bf = torch.bfloat16
     fp4s = (torch.uint8, torch.float4_e2m1fn_x2)
-    ne = E + 1
+    ne = E + int(key.fse)
     rows = (s, H)
     need(core.shape == (s, k) and core.dtype == bf, f"core: bf16 [{s}, {k}]")
     need(
@@ -608,6 +694,17 @@ def layer_block(
         need(w_o.shape == (H, k) and w_o.dtype == bf, f"o_proj: bf16 [{H}, {k}]")
     need(w_gate.shape == (E, H) and w_sg.numel() == H, "router shape")
     need(all(t.dtype == bf for t in (w_gate, w_sg)), "router weights: bf16")
+    shared = [] if key.fse else [w_sgu, w_sd]
+    if not key.fse:
+        need(
+            w_sgu is not None
+            and w_sd is not None
+            and w_sgu.shape == (2 * L.RI, H)
+            and w_sd.shape == (H, L.RI)
+            and w_sgu.dtype == bf
+            and w_sd.dtype == bf,
+            f"shared expert: bf16 gate | up [{2 * L.RI}, {H}] and down [{H}, {L.RI}]",
+        )
     need(
         w13.shape == (ne, 2 * RIP, H // 2) and w13.dtype in fp4s,
         f"w13: fp4x2 [{ne}, {2 * RIP}, {H // 2}]",
@@ -625,7 +722,7 @@ def layer_block(
         "w2 scales: e8m0, one a 32-block, shuffled (K blocks padded to 8)",
     )
     used = [core, gate, residual, w_o, w_os, ln_w, w_gate, w_sg, w13, w13s, w2, w2s]
-    used += [out, res_out]
+    used += [out, res_out] + shared
     need(
         all(t.is_contiguous() for t in used if t is not None), "a non-contiguous input"
     )
@@ -638,6 +735,8 @@ def layer_block(
         "ln_w": ln_w.data_ptr(),
         "w_gate": w_gate.data_ptr(),
         "w_sg": w_sg.data_ptr(),
+        "w_sgu": 0 if key.fse else w_sgu.data_ptr(),
+        "w_sd": 0 if key.fse else w_sd.data_ptr(),
         "w13": w13.data_ptr(),
         "w13s": w13s.data_ptr(),
         "w2": w2.data_ptr(),
