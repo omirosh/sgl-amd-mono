@@ -20,7 +20,7 @@ layers.
 A step of 16 rows (decode or verify) runs SGLang's GDN or attention up to
 out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
 from vllm-project/vllm#67421) in place of K2. It keeps no x tile in LDS, so it
-takes the rows K2 cannot; it needs the fused shared expert.
+takes the rows K2 cannot, with or without the fused shared expert.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sgl-project/sglang#43839)
@@ -427,8 +427,7 @@ class _Built:
     ):
         lm = self.lm
         # SGLang sets layers_to_capture (EAGLE3 / DFlash targets) after the build,
-        # and the launches keep no auxiliary hidden states. 16 rows without the
-        # fused shared expert have no build.
+        # and the launches keep no auxiliary hidden states.
         if (
             input_embeds is not None
             or pp_proxy_tensors is not None
@@ -570,14 +569,6 @@ class _Built:
         res_out = torch.empty_like(residual)
         key = self.k2_keys[s, fse, oq, oh]
         wide = s > L.MAX_TOKENS
-        shared = (
-            {}
-            if wide
-            else {
-                "w_sgu": None if se is None else se.gate_up_proj.weight,
-                "w_sd": None if se is None else se.down_proj.weight,
-            }
-        )
         (blocks.layer_block if wide else k2.layer_post)(
             key,
             core=core,
@@ -598,7 +589,8 @@ class _Built:
             epoch=self.epoch,
             layer=TAG_SLOTS // 2 + i,
             w_os=o.weight_scale if oq else None,
-            **shared,
+            w_sgu=None if se is None else se.gate_up_proj.weight,
+            w_sd=None if se is None else se.down_proj.weight,
         )
         if check_batch is not None:
             # ROUTE: (value, tag) pairs; token t's experts at 2 k t, then its weights
@@ -704,21 +696,21 @@ def _build(model, hf_config, ctx) -> _Built:
         for fse in sorted({_fse(x.mlp) for x in layers})
         for oq, oh in out_formats
     }
-    wide_keys = {}
-    if all(_fse(x.mlp) for x in layers):
-        wide_keys = {
-            (w, True, oq, oh): blocks.LayerBuild(
-                tokens=w,
-                eps=e2,
-                oq=oq,
-                oh=oh,
-                fault_site=fault_site,
-                fault_after=fault_after,
-            )
-            for w in ctx.widths
-            if w > L.MAX_TOKENS
-            for oq, oh in out_formats
-        }
+    wide_keys = {
+        (w, fse, oq, oh): blocks.LayerBuild(
+            tokens=w,
+            eps=e2,
+            fse=fse,
+            oq=oq,
+            oh=oh,
+            fault_site=fault_site,
+            fault_after=fault_after,
+        )
+        for w in ctx.widths
+        if w > L.MAX_TOKENS
+        for fse in sorted({_fse(x.mlp) for x in layers})
+        for oq, oh in out_formats
+    }
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
     ticks = guard.deadline_ticks(ctx.deadline_s)
     lo = ticks & 0xFFFFFFFF
