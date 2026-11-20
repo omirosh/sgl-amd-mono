@@ -14,7 +14,8 @@ stock rounding points (``wide_reference``):
   routes, route weights, residual and normed rows against the reference fed the
   previous launch's outputs (relative Frobenius errors);
 - fault: rank 3 stalls at its first wait (``stop=False``) in ``gdn_back`` at 32
-  rows: rank 3 sets its deadline word and its flag reaches every rank.
+  rows, with a deadline of 0.5 s and 5 s on the peers: rank 3 sets its deadline
+  word and its flag reaches every rank.
 
 The MoE is checked on the kernel's own MXFP4 input rows (``x4``): the
 reference's input differs from the kernel's in a few bf16 ulps, which flip MXFP4
@@ -304,7 +305,9 @@ def check_fault(rows=32, fmt="mxfp4"):
     w = weights(shared, mine, "gdn_back", fmt)
     core = (torch.randn(rows, L.VALUE_DIM, generator=mine, device=DEV)).to(BF)
     norm = torch.zeros(L.HIDDEN, dtype=BF, device=DEV)
-    side = Side(rows, 2, seconds=0.5)
+    # the first wait reads the peers, so a peer that launched first can time out
+    # on rank 3 before rank 3's stall does: the peers wait longer
+    side = Side(rows, 2, seconds=0.5 if rank == 3 else 5.0)
     try:
         t0 = time.time()
         side.run(0, k, 0, core, w, norm, norm)
