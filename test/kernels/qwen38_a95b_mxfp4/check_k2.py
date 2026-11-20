@@ -15,8 +15,9 @@ GPUs (torchrun), on random TP8 shards in SGLang's layouts:
   replayed, bit for bit against eager on every rank;
 - fault: rank 3 stalls at its first wait (``stop=False``), in K2 at 1 row and in
   layer_block at 16 with and without the fused shared expert, and without it also
-  at the shared gate | up's ``spart`` wait: rank 3 sets its deadline word and its
-  flag reaches every rank.
+  at the shared gate | up's ``spart`` wait: rank 3 sets its deadline word (that
+  wait's, or another wait's that needs the stalled CTA) and its flag reaches every
+  rank.
 """
 
 import argparse
@@ -506,8 +507,15 @@ def check_fault(build, s, fse, site=1):
     finally:
         side.close()
     bad = []
-    if rank == 3 and words[guard.ERR_DEADLINE] != site + 1:
-        bad.append(f"rank 3 error words {words}, want deadline word {site + 1}")
+    # the stall also holds the CTA's later work: a wait on this GPU that needs it can
+    # start its deadline first and time out first, and the stalled wait then sees that
+    # failure (the peer word)
+    dl, peer = words[guard.ERR_DEADLINE], words[guard.ERR_PEER]
+    if rank == 3 and not (dl == site + 1 or (dl and peer)):
+        bad.append(
+            f"rank 3 error words {words}, want deadline word {site + 1}, "
+            "or another wait's and the peer word"
+        )
     # with stop=False rank 3 sends its data after the deadline, so a peer may
     # finish its waits before it sees the flag; the e2e test stops on it
     if flags[3] != 1:
