@@ -132,7 +132,7 @@ class TestMonokernelDecodeFse(CustomTestCase):
     def test_split_steps_match_prefill(self):
         # the server shares its log files' offsets: read them through new handles
         log = Path(self.err.name).read_text() + Path(self.out.name).read_text()
-        self.assertIn("layer_block and 2 split launches", log)
+        self.assertIn("layer_block, 2 split and", log)
         # graph 16 runs the split GDN launch and layer_block, pad rows at 12
         _match_prefill((12, 16))
 
@@ -176,7 +176,7 @@ class TestMonokernelCheck(CustomTestCase):
         log = self._check(["--enforce-shared-experts-fusion"], wide=True)
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
         # one in_proj_qkvz format: a split launch for layer 0 and one for the others
-        self.assertIn("layer_block and 2 split launches", log)
+        self.assertIn("layer_block, 2 split and", log)
 
     def _check(self, extra_args=(), wide=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;

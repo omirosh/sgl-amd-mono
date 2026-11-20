@@ -26,6 +26,14 @@ the ``gdn`` kind at 16 rows, from vllm-project/vllm#67421 at 28f094565b and
 vllm-project/vllm#67678 at ce476ce305) in place of SGLang's GDN: input norm, in_proj_qkvz and in_proj_ba, the conv and the gated delta rule
 with their state updates, and the gated norm, as K1 does.
 
+A step of 32 rows (decode or verify) runs SGLang's GDN or attention up to
+out_proj's / o_proj's input, then one wide launch a layer (``gfx950/wide``, from
+vllm-project/vllm#67421 and #67678): out_proj / o_proj and its TP reduce, the
+post-attention norm, the MoE and its TP reduce, and the next layer's input norm
+(the last layer's: the final norm). The launches hand the residual and the normed
+rows on in their scratch, so SGLang runs no input norm between them. It needs
+the fused shared expert.
+
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sgl-project/sglang#43839)
 run K1 ``qq`` and K2 ``oq``. The fused shared expert
@@ -71,8 +79,9 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import layout as ML
 logger = logging.getLogger(__name__)
 
 # the rows a launch takes (decode requests, or verify tokens): 1 to MAX_TOKENS
-# (K1, K2), or SPLIT_MAX (layer_block)
-WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX)
+# (K1, K2), SPLIT_MAX (layer_block) or WIDE (the wide launches)
+WIDE = 32
+WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX, WIDE)
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
@@ -186,6 +195,7 @@ NUMERICS = Numerics(
         "k1.conv.cosine": 0.9999,
         "k1.state.cosine": 0.9999,
         "k2.out.cosine": 0.99,
+        "wide.out.cosine": 0.99,
     },
 )
 
@@ -499,10 +509,137 @@ class _Split:
         return self.core, self.res
 
 
+def _builds_wide(model, layers, widths) -> bool:
+    """Whether a WIDE-row step runs the wide launches: every shared expert fused,
+    and one eps for the input, post-attention and final norms (a launch's closing
+    combine is the next layer's input norm, with the post-attention eps)."""
+    e1, _, e2 = _eps(layers)
+    return (
+        WIDE in widths
+        and all(_fse(x.mlp) for x in layers)
+        and e1 == e2 == model.model.norm.variance_epsilon
+    )
+
+
+def _wide_keys(layers, eps, tp, fault_site, fault_after) -> list:
+    """Each layer's wide launch at WIDE rows: ``attn`` from SGLang's gated core,
+    ``gdn_back`` from its GDN core (decode and verify alike)."""
+    from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
+
+    keys = []
+    for x in layers:
+        common = dict(
+            tokens=WIDE,
+            tp=tp,
+            rip=L.RI,
+            eps=eps,
+            fault_site=fault_site,
+            fault_after=fault_after,
+        )
+        if _is_gdn(x):
+            q = _mxfp4(x.linear_attn.out_proj)
+            keys.append(
+                W.LayerBuild(
+                    kind="gdn_back",
+                    out="mxfp4" if q else "bf16",
+                    out_shuffled=q,
+                    **common,
+                )
+            )
+        else:
+            keys.append(W.LayerBuild(kind="attn", og=False, **common))
+    return keys
+
+
+def _router_gates(layers) -> list:
+    """Each layer's router gate with the shared expert's gate as its last row,
+    [E + 1, H]: the wide router reads one matrix. ponytail: SGLang's two weights
+    become views of it, so the build keeps no copy; the upgrade is a second
+    weight pointer in the wide router."""
+    out = []
+    for x in layers:
+        g, sg = x.mlp.gate.weight, x.mlp.shared_expert_gate.weight
+        both = torch.cat([g.data, sg.data], 0)
+        g.data, sg.data = both[: g.shape[0]], both[g.shape[0] :]
+        out.append(both)
+    return out
+
+
+class _Wide:
+    """The launches of a WIDE-row step: one wide launch a layer (``keys[n]``,
+    layer ``n`` of the step), their scratch, barrier slots and router gates.
+    ``peers``: the peer buffers' address table; ``epoch``: the guard block."""
+
+    def __init__(self, keys, gates, peers, rank, epoch, device):
+        from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import grid
+        from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
+
+        self.keys, self.gates = keys, gates
+        self.peers, self.rank, self.epoch = peers, rank, epoch
+        self.layout = W.scratch_layout(WIDE, L.RI)
+        self.scratch = torch.zeros(
+            W.scratch_bytes(WIDE, L.RI), dtype=torch.uint8, device=device
+        )
+        # zeroed: each launch's barriers count up from its slot's zeros
+        self.sync = torch.zeros(grid.sync_words(), dtype=torch.int32, device=device)
+        base = self.sync.data_ptr()
+        slot = [base + 4 * grid.SLOT_WORDS * k for k in range(grid.SLOTS)]
+        self.slots = [(slot[a], slot[b]) for a, b in grid.launch_slots(len(keys))]
+        self.folds = base + 4 * grid.FOLD_BASE
+
+    def view(self, name: str, cols: int) -> torch.Tensor:
+        """Scratch region ``name`` as bf16 [WIDE, cols]."""
+        off, n = self.layout[name]
+        assert n >= WIDE * cols * 2, (name, n, cols)
+        return (
+            self.scratch[off : off + WIDE * cols * 2]
+            .view(torch.bfloat16)
+            .view(WIDE, cols)
+        )
+
+    def route_ids(self) -> torch.Tensor:
+        """The routed experts of the last launch's rows, [WIDE, TOPK] (its route:
+        [WIDE, TOPK + 1] ids, the shared expert last, then their weights)."""
+        off, _ = self.layout["route"]
+        ids = self.scratch[off : off + 4 * WIDE * (L.TOPK + 1)].view(torch.int32)
+        return ids.view(WIDE, L.TOPK + 1)[:, : L.TOPK]
+
+    def launch(self, n, i, layer, core, n_next):
+        """Layer ``n`` of the step (model layer ``i``) from its out_proj / o_proj
+        input ``core``: the residual and the rows ``n_next`` norms stay in the
+        scratch."""
+        from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
+
+        o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
+        ex = layer.mlp.experts
+        args = dict.fromkeys(W.ABI.names, 0) | {
+            "scratch": self.scratch,
+            "core_out" if _is_gdn(layer) else "attn": core,
+            "n_post": layer.post_attention_layernorm.weight,
+            "n_next": n_next,
+            "w_out": o.weight,
+            "w_out_s": o.weight_scale if _mxfp4(o) else 0,
+            "w_gate": self.gates[n],
+            "w13": ex.w13_weight,
+            "w13s": ex.w13_weight_scale,
+            "w2": ex.w2_weight,
+            "w2s": ex.w2_weight_scale,
+            "peers": self.peers,
+            "rank": self.rank,
+            "epoch": self.epoch,
+            "layer": i,
+            "sync": self.slots[n][0],
+            "sync_next": self.slots[n][1],
+            "folds": self.folds,
+        }
+        W.run(self.keys[n], args)
+
+
 class _Built:
     """One rank's launches: the build keys per (width, variant), the scratch per
-    width, the guard block (word 0 the step epoch), the peer buffer and the split
-    launches of the 16-row decode steps (``_Split``, else None)."""
+    width, the guard block (word 0 the step epoch), the peer buffer, the split
+    launches of the 16-row decode steps (``_Split``, else None) and the wide
+    launches of the 32-row steps (``_Wide``, else None)."""
 
     def __init__(
         self,
@@ -516,11 +653,13 @@ class _Built:
         epoch,
         peer,
         split=None,
+        wide=None,
     ):
         self.lm, self.rank = lm, rank
         self.state_dtype = torch.bfloat16 if state_bf16 else torch.float32
         self.k1_keys, self.k2_keys = k1_keys, k2_keys
-        self.widths = {w for w, *_ in k2_keys}
+        self.wide = wide
+        self.widths = {w for w, *_ in k2_keys} | ({WIDE} if wide else set())
         self.k1_scratch, self.k2_scratch = k1_scratch, k2_scratch
         self.epoch, self.peer, self.split = epoch, peer, split
         self.check_layers = os.environ.get("SGLANG_AMD_MONO_CHECK") == "1"
@@ -558,6 +697,8 @@ class _Built:
             positions = forward_batch.mrope_positions
         m = lm.model
         s = plan.key.rows
+        if s == WIDE:
+            return self._wide_forward(input_ids, positions, forward_batch)
         decode = plan.key.forward_mode != "target_verify"
         k1 = decode and s <= L.MAX_TOKENS
         split = decode and s == ML.SPLIT_MAX and self.split is not None
@@ -585,6 +726,43 @@ class _Built:
             h, residual = self._k2(i, layer, core, res_attn, s, fb)
         h, _ = m.norm(h, residual)
         return lm.logits_processor(input_ids, h, lm.lm_head, forward_batch, None)
+
+    def _wide_forward(self, input_ids, positions, forward_batch):
+        from sgl_amd_mono.qwen38_a95b_mxfp4 import check
+
+        lm, m, w = self.lm, self.lm.model, self.wide
+        fb = (
+            forward_batch
+            if self.check_layers and not torch.cuda.is_current_stream_capturing()
+            else None
+        )
+        self.epoch[:1].add_(1)
+        h = m.embed_tokens(input_ids)
+        x, res = w.view("x", L.HIDDEN), w.view("res", L.HIDDEN)
+        for n, i in enumerate(range(m.start_layer, m.end_layer)):
+            layer = m.layers[i]
+            if n == 0:
+                res.copy_(h)
+                core = self._core(
+                    layer, positions, layer.input_layernorm(h), forward_batch
+                )
+            else:
+                core = self._core(layer, positions, x, forward_batch)
+            nxt = m.layers[i + 1].input_layernorm if i + 1 < m.end_layer else m.norm
+            if fb is not None:
+                # SGLang's tail on the launch's input, then its next norm
+                o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
+                ref, ids, logits = check.k2_reference(layer, o, core, res.clone(), fb)
+                ref["out"], ref["res_out"] = nxt(ref["out"], ref["res_out"])
+            w.launch(n, i, layer, core, nxt.weight)
+            if fb is not None:
+                alike = check.k2_alike(layer.layer_id, ids, logits, w.route_ids())
+                got = {"out": x, "res_out": res}
+                check.compare("wide", layer.layer_id, WIDE, ref, got, alike)
+        # the final norm's rows: the next step's launches rewrite the scratch
+        return lm.logits_processor(
+            input_ids, x.clone(), lm.lm_head, forward_batch, None
+        )
 
     @staticmethod
     def _core(layer, positions, x, forward_batch):
@@ -844,10 +1022,11 @@ def _build(model, hf_config, ctx) -> _Built:
             fault_after=fault_after,
         )
         for w in ctx.widths
-        if w > L.MAX_TOKENS
+        if L.MAX_TOKENS < w <= ML.SPLIT_MAX
         for fse in sorted({_fse(x.mlp) for x in layers})
         for oq, oh in out_formats
     }
+    builds_wide = _builds_wide(model, layers, ctx.widths)
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
     ticks = guard.deadline_ticks(ctx.deadline_s)
     lo = ticks & 0xFFFFFFFF
@@ -855,7 +1034,12 @@ def _build(model, hf_config, ctx) -> _Built:
     epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
     # collective: every rank builds it at the same point
     group = p.tp_group.cpu_group
-    nbytes = blocks.peer_buffer_bytes() if wide_keys else k2.peer_buffer_bytes()
+    if builds_wide:
+        nbytes = W.peer_buffer_bytes(tp)
+    elif wide_keys:
+        nbytes = blocks.peer_buffer_bytes()
+    else:
+        nbytes = k2.peer_buffer_bytes()
     peer = PeerBuffer(nbytes, group, rank, tp, device)
     peer.bytes.zero_()
     torch.cuda.synchronize()
@@ -871,6 +1055,10 @@ def _build(model, hf_config, ctx) -> _Built:
         keys = _split_keys(layers, e1, e_norm, bf16, tp, fault_site, fault_after)
         split = _Split(keys, peer.addresses, rank, epoch, device)
         split_keys = list(dict.fromkeys(k for k in keys if k is not None))
+    wide = None
+    if builds_wide:
+        keys = _wide_keys(layers, e2, tp, fault_site, fault_after)
+        wide = _Wide(keys, _router_gates(layers), peer.addresses, rank, epoch, device)
     built = _Built(
         model,
         rank,
@@ -882,6 +1070,7 @@ def _build(model, hf_config, ctx) -> _Built:
         epoch,
         peer,
         split,
+        wide,
     )
     # Every rank builds every key. FlyDSL's disk cache hands a rank the kernels
     # another rank built (a lock per kernel), so each rank starts at its own share.
@@ -889,18 +1078,21 @@ def _build(model, hf_config, ctx) -> _Built:
     launches += [k2.build(k) for k in k2_keys.values()]
     launches += [blocks.build_layer(k) for k in wide_keys.values()]
     launches += [W.build(k) for k in split_keys]
+    wide_builds = sorted(set(wide.keys), key=repr) if wide else []
+    launches += [W.build(k) for k in wide_builds]
     start = len(launches) * rank // tp
     t0 = time.monotonic()
     for launch in launches[start:] + launches[:start]:
         _compile_only(launch)
     torch.cuda.synchronize()
     logger.info(
-        "Qwen3.8 monokernel: %d K1, %d K2, %d layer_block and %d split launches "
-        "(widths %s, %s) in %.0f s",
+        "Qwen3.8 monokernel: %d K1, %d K2, %d layer_block, %d split and %d wide "
+        "launches (widths %s, %s) in %.0f s",
         len(k1_keys),
         len(k2_keys),
         len(wide_keys),
         len(split_keys),
+        len(wide_builds),
         sorted(built.widths),
         "verify" if verify else "decode",
         time.monotonic() - t0,
