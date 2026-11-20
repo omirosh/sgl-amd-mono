@@ -13,6 +13,8 @@ sgl-project/sglang#41899 (and at 16 rows the split GDN launch and layer_block, a
 32 the wide launches); and a fault on one rank that stops the server before any
 token of the failed step is sent."""
 
+import json
+import math
 import os
 import re
 import resource
@@ -236,11 +238,24 @@ class TestMonokernelCheck(CustomTestCase):
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
-        # a bf16 tie at the 10th logit routes a row elsewhere; a router bug, many
-        rows = sum(int(n) for kind, n, _ in checks if kind != "k1")
-        routes = re.findall(r"monokernel check route .*", log)
-        print(f"rows routed elsewhere: {len(routes)} of {rows}")
-        self.assertLessEqual(len(routes), rows // 100, "\n".join(routes[:20]))
+        # a bf16 tie at the 10th logit routes a row elsewhere: SGLang's logits of the
+        # two picks are a few bf16 steps apart (2 at most in 529 rows), and a router
+        # bug is further. K2 reads SGLang's residual, so few rows; the wide launches
+        # make their own (within one step), so more (6% of 8832 rows)
+        routes = re.findall(
+            r"monokernel check route (k2|wide) (.*: k2 only \[.*\] (\[.*\]), "
+            r"sglang only \[.*\] (\[.*\]))",
+            log,
+        )
+        for kind, per in (("k2", 100), ("wide", 10)):
+            rows = sum(int(n) for k, n, _ in checks if k == kind)
+            lines = [line for k, line, _, _ in routes if k == kind]
+            print(f"{kind} rows routed elsewhere: {len(lines)} of {rows}")
+            self.assertLessEqual(len(lines), rows // per, "\n".join(lines[:20]))
+        for _, line, got, ref in routes:
+            a, b = max(json.loads(got)), min(json.loads(ref))
+            step = 2.0 ** (math.frexp(max(abs(a), abs(b)))[1] - 8)
+            self.assertLessEqual(abs(a - b), 4 * step, line)
         return log
 
 
