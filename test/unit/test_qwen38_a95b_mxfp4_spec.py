@@ -35,8 +35,8 @@ def test_the_plugin_registers_the_spec():
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx950"
     )
     assert found is qwen.SPEC, why
-    # K1 and K2 at 1 to 8 rows, layer_block at 16
-    assert found.devices["gfx950"].widths == (*range(1, 9), 16)
+    # K1 and K2 at 1 to 8 rows, layer_block at 16, the wide launches at 32
+    assert found.devices["gfx950"].widths == (*range(1, 9), 16, 32)
     found, why = registry.find_spec(
         backend=sgl_amd_mono.BACKEND, architectures=arch, isa="gfx942"
     )
@@ -233,6 +233,73 @@ def test_model_reasons_name_the_layer():
     ]
     assert "eps" in reasons[0] and "A_log" in reasons[1] and "shuffled" in reasons[2]
     assert "o_proj in bf16" in reasons[3]
+
+
+def _wide_model(fse=True, mxfp4=True, final_eps=1e-6):
+    layers = [_layer(i, gdn=i % 4 != 3, fse=fse, mxfp4=mxfp4) for i in range(8)]
+    m = _model(layers)
+    m.model.norm = _norm(final_eps)
+    return m, layers
+
+
+def test_the_wide_launches_need_the_fused_shared_expert_and_one_eps():
+    widths = (*range(1, 9), 16, 32)
+    m, layers = _wide_model()
+    assert qwen._builds_wide(m, layers, widths)
+    assert not qwen._builds_wide(m, layers, widths[:-1])
+    assert not qwen._builds_wide(*_wide_model(fse=False), widths)
+    assert not qwen._builds_wide(*_wide_model(final_eps=1e-5), widths)
+
+
+@pytest.mark.parametrize("mxfp4", [False, True])
+def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4):
+    _, layers = _wide_model(mxfp4=mxfp4)
+    keys = qwen._wide_keys(layers, 1e-6, 8, 0, 0)
+    assert [k.kind for k in keys] == ["gdn_back"] * 3 + ["attn"] + ["gdn_back"] * 3 + [
+        "attn"
+    ]
+    assert all(k.tokens == qwen.WIDE and not k.qkv_tail for k in keys)
+    assert all(k.next_q4 == "none" and not k.first for k in keys)
+    # SGLang applies the attention output gate before o_proj
+    assert not keys[3].og
+    assert keys[0].out == ("mxfp4" if mxfp4 else "bf16")
+    assert keys[0].out_shuffled == mxfp4
+
+
+def test_the_router_gates_are_views_of_one_matrix():
+    layers = [_layer(i, fse=True) for i in range(2)]
+    for x in layers:
+        x.mlp.gate = SimpleNamespace(weight=torch.nn.Parameter(torch.randn(4, 8)))
+        x.mlp.shared_expert_gate = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.randn(1, 8))
+        )
+    want = [
+        (x.mlp.gate.weight.clone(), x.mlp.shared_expert_gate.weight.clone())
+        for x in layers
+    ]
+    gates = qwen._router_gates(layers)
+    for x, both, (g, sg) in zip(layers, gates, want):
+        assert torch.equal(both, torch.cat([g, sg]))
+        assert x.mlp.gate.weight.data_ptr() == both.data_ptr()
+        assert x.mlp.shared_expert_gate.weight.data_ptr() == both[4:].data_ptr()
+        assert torch.equal(x.mlp.gate.weight, g)
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_a_32_row_step_runs_the_wide_launches_when_built(wide):
+    class LM:
+        is_mrope_enabled = False
+
+        def forward(self, *args):
+            return "sglang"
+
+    built = qwen._Built.__new__(qwen._Built)
+    built.lm = LM()
+    built.lm.model = SimpleNamespace(layers_to_capture=[])
+    built.widths = {16, qwen.WIDE} if wide else {16}
+    built._wide_forward = lambda *args: "wide"
+    plan = SimpleNamespace(key=SimpleNamespace(rows=qwen.WIDE))
+    assert built.forward(plan, None, None, None) == ("wide" if wide else "sglang")
 
 
 def test_aux_hidden_states_run_sglangs_forward():

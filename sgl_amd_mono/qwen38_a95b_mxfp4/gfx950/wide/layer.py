@@ -107,6 +107,7 @@ class LayerBuild:
     first_q4: str = "none"  # the first combine's MXFP4 rows ("none", ``norm.Q4_MODES``)
     next_q4: str = "none"  # the closing combine's, for the next layer's qkvz
     qkv_tail: bool = False  # the next layer is full attention: run its qkv_proj
+    og: bool = True  # attn: o_proj's input is attn x sigmoid(gate), else `attn` as is
     rip: int = 256  # the experts' padded intermediate rows a rank
     eps: float = 1e-6
     gdn_eps: float = 1e-6
@@ -592,7 +593,9 @@ def build(key: LayerBuild):
             if const_expr(key.kind == "attn" and not key.split):
                 back(
                     tiled.Bf16Weights(w_out, HIDDEN, ATTN_CORE),
-                    gdn.GatedCore(attn, gate, ATTN_CORE),
+                    gdn.GatedCore(attn, gate, ATTN_CORE)
+                    if key.og
+                    else tiled.Source(attn, ATTN_CORE),
                     ATTN_CORE,
                     name="o_proj+allreduce+combine",
                 )
