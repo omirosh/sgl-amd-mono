@@ -2,7 +2,8 @@
 layouts: the routed experts' fp4 tiles and e8m0 scales where K2 reads them (on
 the host); K1 on one GPU and K2 on 8 (``qwen38_a95b_mxfp4/check_k1.py``,
 ``check_k2.py``): every build key compiles, pad rows, the bf16 state, batch
-invariance, graph replay across widths and an injected wait fault; and the
+invariance, graph replay across widths and an injected wait fault; the wide
+launches of 17 and 32 rows on 8 against float64 references (``check_wide.py``); and the
 refactor proof against the sgl-project/sglang#43516 kernels, bit for bit
 (``check_port.py``, where that SGLang is installed)."""
 
@@ -135,6 +136,9 @@ class TestQwen38MoeK2(CustomTestCase):
             if rcs[-1]:
                 time.sleep(30)  # the GPUs of the stopped launch come free
         self.assertEqual(rcs, [0] * CHAIN_CASES)
+
+    def test_wide(self):
+        self.assertEqual(_run("check_wide.py", ranks=8), 0)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")

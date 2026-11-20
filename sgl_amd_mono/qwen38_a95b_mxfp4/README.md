@@ -36,7 +36,7 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | test file | contents |
 | --- | --- |
 | `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, the rows that check mode compares, and the wide build: its condition, its keys, the router gates and the route of a step of 32 rows |
-| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
+| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, the wide launches on 8 GPUs with `check_wide.py`, and the port test `check_port.py` |
 | `test/kernels/qwen38_a95b_mxfp4/inputs.py` | random TP8 shards in SGLang's layouts, the inputs of the kernel checks |
 | `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags, the NEXTN flags in `NEXTN`, and the environment of the serving tests |
 | `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving tests at TP8, with `TestMonokernelVerify` for NEXTN |
@@ -227,7 +227,7 @@ the flag is `--enable-amd-monokernel`.
 
 The unit tests run on CPU. Section 1 gives what they check.
 
-The kernel tests run K1 on 1 GPU, and K2 and `layer_block` on 8 GPUs, with random weights:
+The kernel tests run K1 on 1 GPU, and K2, `layer_block` and the wide launches on 8 GPUs, with random weights:
 
 - Each build key compiles.
 - The outputs of a row do not change with the other rows or with the width. At 16 rows, the outputs of a row do not
@@ -243,6 +243,11 @@ The kernel tests run K1 on 1 GPU, and K2 and `layer_block` on 8 GPUs, with rando
 - The port test compares K1 and K2 with the kernels of sgl-project/sglang#43516, bit for bit. It runs only where those
   kernels are installed. It compares the `fse` build of K2 at 1, 4 and 8 rows. It also compares the `qq` and `oq`
   builds.
+- `check_wide.py` runs one step of three wide launches (`gdn_back`, `attn`, `gdn_back`) at 17 and 32 rows, with a
+  bf16 and an MXFP4 `out_proj`. It compares each launch with float64 references that round as SGLang does
+  (`wide_reference.py`): the MoE input rows, the routes, the route weights, the residual and the normed rows. The
+  relative error must be at most 0.01 (0.02 for the MXFP4 MoE input rows). A stalled wait on rank 3 in `gdn_back` at
+  32 rows sets its deadline error word, and its flag reaches each rank.
 
 Check mode needs `SGLANG_AMD_MONO_CHECK=1` and runs only in eager mode. It runs SGLang's own layer code next to each
 K2 launch, on the same input. On the rows that K2 and SGLang route to the same experts, `k2.out.cosine` must be at
@@ -262,9 +267,10 @@ check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_pro
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. This test
 also sends 16 requests, and check mode must log a `layer_block` check at 16 rows. Check mode compares `layer_block`
-as it compares K2, and the log names it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
-server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serves the steps of up to 8 rows, and
-`layer_block` the steps of 16 rows.
+as it compares K2, and the log names it `k2`. The test also sends 32 requests with `--max-running-requests 32`, and
+check mode must log a `wide` check at 32 rows. The build log must give 2 wide launches. `TestMonokernelVerify` runs
+GSM8K at 8 concurrent requests on a NEXTN server with the fused shared expert. Its verify steps have 4 to 32 rows. K2
+serves the steps of up to 8 rows, `layer_block` the steps of 16 rows, and the wide launches the steps of 32 rows.
 
 ## 7. Limitations
 
