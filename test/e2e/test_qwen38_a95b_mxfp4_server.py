@@ -1,4 +1,4 @@
-"""Qwen3.8 MoE with --monokernel-backend amd on MI355X, TP8, across the switch
+"""Qwen3.8 MoE with --enable-amd-monokernel on MI355X, TP8, across the switch
 points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path (16
 rows too, without the fused shared expert), and requests join and leave a running
 batch that steps past 8 rows and back (a short GSM8K run, for gross failures);
@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import requests
 from qwen38_a95b_mxfp4_server import ARGS, ENV, MODEL, NEXTN
+from sglang.srt import server_args
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_helper as assert_logprobs_match,
 )
@@ -34,6 +35,12 @@ from sglang.test.test_utils import (
 
 from sgl_amd_mono import BACKEND
 
+# sgl-project/sglang#45389 replaced --monokernel-backend amd with --enable-amd-monokernel
+MONO_ARGS = (
+    ["--enable-amd-monokernel"]
+    if "--monokernel-backend" in getattr(server_args, "REMOVED_FLAGS", {})
+    else ["--monokernel-backend", BACKEND]
+)
 LAUNCH_TIMEOUT = 3600
 # For gross failures: the normal path scores about 0.95 or more (thinking on)
 GSM8K_BOUND = 0.90
@@ -47,7 +54,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + [*MONO_ARGS, *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
