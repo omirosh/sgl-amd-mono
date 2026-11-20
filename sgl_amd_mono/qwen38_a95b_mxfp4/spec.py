@@ -738,7 +738,9 @@ class _Built:
                 ref["out"], ref["res_out"] = nxt(ref["out"], ref["res_out"])
             w.launch(n, i, layer, core, nxt.weight)
             if fb is not None:
-                alike = check.k2_alike(layer.layer_id, ids, logits, w.route_ids())
+                alike = check.k2_alike(
+                    layer.layer_id, ids, logits, w.route_ids(), "wide"
+                )
                 got = {"out": x, "res_out": res}
                 check.compare("wide", layer.layer_id, WIDE, ref, got, alike)
         # the final norm's rows: the next step's launches rewrite the scratch
