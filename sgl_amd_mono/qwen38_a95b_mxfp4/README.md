@@ -284,7 +284,8 @@ and K2 runs `oq`, with `qh` and `oh` on an SGLang with
 check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at least 1. A second
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. Both tests
-also send 16 requests, and check mode must log a `layer_block` check at 16 rows. Check mode compares `layer_block`
+also send 16 requests, and check mode must log a `layer_block` check at 16 rows. The test with the fused shared expert
+must also log a split launch check, and its build log must show 2 split launches. Check mode compares `layer_block`
 as it compares K2, and the log names it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
 server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serves the steps of up to 8 rows, and
 `layer_block` the steps of 16 rows.
