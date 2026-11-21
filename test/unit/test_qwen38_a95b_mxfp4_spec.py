@@ -290,6 +290,22 @@ def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4):
     assert keys[0].out_shuffled == mxfp4
 
 
+@pytest.mark.parametrize("mxfp4", [False, True])
+def test_the_decode_wide_keys_run_the_gdn_front(mxfp4):
+    _, layers = _wide_model(mxfp4=mxfp4)
+    keys = qwen._wide_keys(layers, 1e-6, 8, 0, 0, front=(1e-5, True))
+    assert [k.kind for k in keys] == (["gdn"] * 3 + ["attn"]) * 2
+    assert keys[0].first and not any(k.first for k in keys[1:])
+    # the launch before a GDN layer quantizes its rows for that in_proj_qkvz
+    q4 = "plain" if mxfp4 else "none"
+    assert keys[0].first_q4 == q4
+    assert [k.next_q4 for k in keys] == [q4, q4, "none", q4] + [q4, q4, "none", "none"]
+    gdn = [k for k in keys if k.kind == "gdn"]
+    assert all(k.qkvz == ("mxfp4" if mxfp4 else "bf16") for k in gdn)
+    assert all(k.qkvz_shuffled == mxfp4 == k.out_shuffled for k in gdn)
+    assert all(k.gdn_eps == 1e-5 and k.state_bf16 for k in gdn)
+
+
 def test_the_router_gates_are_views_of_one_matrix():
     layers = [_layer(i, fse=True) for i in range(2)]
     for x in layers:
