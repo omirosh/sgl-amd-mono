@@ -4,7 +4,8 @@ the host); K1 on one GPU and K2 on 8 (``qwen38_a95b_mxfp4/check_k1.py``,
 ``check_k2.py``): every build key compiles, pad rows, the bf16 state, batch
 invariance, graph replay across widths and an injected wait fault; the MXFP4
 activation quant, plain and with the sgl-project/sglang#46059 rotation, against
-AITER bit for bit (``check_quant.py``); and the refactor proof against the
+AITER bit for bit (``check_quant.py``); the split GDN launch of 16 rows on 8
+against K1 (``check_wide.py``); and the refactor proof against the
 sgl-project/sglang#43516 kernels, bit for bit (``check_port.py``, where that
 SGLang is installed)."""
 
@@ -143,6 +144,9 @@ class TestQwen38MoeK2(CustomTestCase):
             if rcs[-1]:
                 time.sleep(30)  # the GPUs of the stopped launch come free
         self.assertEqual(rcs, [0] * CHAIN_CASES)
+
+    def test_wide(self):
+        self.assertEqual(_run("check_wide.py", ranks=8), 0)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")

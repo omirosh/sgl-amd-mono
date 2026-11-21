@@ -36,7 +36,7 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | test file | contents |
 | --- | --- |
 | `test/unit/test_qwen38_a95b_mxfp4_spec.py` | CPU tests of the registry entry, the widths, the config and model refusals, the rows that check mode compares, and the split build: its condition and its keys |
-| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, the activation quant on 1 GPU with `qwen38_a95b_mxfp4/check_quant.py`, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, and the port test `check_port.py` |
+| `test/kernels/test_qwen38_a95b_mxfp4_kernels.py` | the MXFP4 layout on the host, the activation quant on 1 GPU with `qwen38_a95b_mxfp4/check_quant.py`, K1 on 1 GPU with `qwen38_a95b_mxfp4/check_k1.py`, K2 on 8 GPUs with `qwen38_a95b_mxfp4/check_k2.py`, the split launch on 8 GPUs with `check_wide.py`, and the port test `check_port.py` |
 | `test/kernels/qwen38_a95b_mxfp4/inputs.py` | random TP8 shards in SGLang's layouts, the inputs of the kernel checks |
 | `test/e2e/qwen38_a95b_mxfp4_server.py` | the server flags, the NEXTN flags in `NEXTN`, and the environment of the serving tests |
 | `test/e2e/test_qwen38_a95b_mxfp4_server.py` | the serving tests at TP8, with `TestMonokernelVerify` for NEXTN |
@@ -242,7 +242,7 @@ the flag is `--enable-amd-monokernel`.
 
 The unit tests run on CPU. Section 1 gives what they check.
 
-The kernel tests run K1 on 1 GPU, and K2 and `layer_block` on 8 GPUs, with random weights:
+The kernel tests run K1 on 1 GPU, and K2, `layer_block` and the split launch on 8 GPUs, with random weights:
 
 - The MXFP4 quant of the activation in K1, K2 and `layer_block` gives the dequantized values of AITER's
   `per_1x32_f4_quant_hip`, bit for bit, with and without `hadamard_rotate`. The rotation alone gives the bf16 values of
@@ -259,6 +259,10 @@ The kernel tests run K1 on 1 GPU, and K2 and `layer_block` on 8 GPUs, with rando
 - K1 writes a zero core row and no state for a pad row.
 - With a bf16 SSM state, K1 computes in f32 on the widened state. Its core and conv state are the same as those of the
   f32 build, bit for bit.
+- `check_wide.py` runs two decode steps of two split launches at 16 rows, with pad rows. The core, the residual, and
+  the conv and SSM state rows agree with those of K1 on two 8-row chunks of the same input: a relative error of at
+  most 1e-2. The pad rows get a zero core, and the other state slots do not change. Each step has new input rows. A
+  stalled split launch on rank 3 sets its deadline error word, and its flag reaches each rank.
 - The port test compares K1 and K2 with the kernels of sgl-project/sglang#43516, bit for bit. It runs only where those
   kernels are installed. It compares the `fse` build of K2 at 1, 4 and 8 rows. It also compares the `qq` and `oq`
   builds.
