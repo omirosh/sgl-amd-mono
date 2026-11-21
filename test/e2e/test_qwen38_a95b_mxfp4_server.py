@@ -1,6 +1,8 @@
 """Qwen3.8 MoE with --enable-amd-monokernel on MI355X, TP8, across the switch
 points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path (16
-rows too, without the fused shared expert), and requests join and leave a running
+rows too, without the fused shared expert; with it, decode steps of 12 and 16 rows
+run the split GDN launch and layer_block in graph 16, scored again by the normal
+prefill path), and requests join and leave a running
 batch that steps past 8 rows and back (a short GSM8K run, for gross failures);
 NEXTN verify steps of up to 8 rows run K2, of 16 rows layer_block (with the fused
 shared expert); the tokens of covered steps scored again by the normal prefill
@@ -17,6 +19,7 @@ import resource
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -68,6 +71,20 @@ def _gsm8k(num_threads):
     )
 
 
+def _match_prefill(batches):
+    # one graph per batch (ignore_eos keeps its rows)
+    for rows in batches:
+        requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
+        assert_logprobs_match(
+            DEFAULT_URL_FOR_TEST,
+            {MODEL: {"kl_div": KL_BOUND}},
+            MODEL,
+            max_samples=rows,
+            max_new_tokens=512,
+            trust_remote_code=True,
+        )
+
+
 class TestMonokernelDecode(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -86,18 +103,39 @@ class TestMonokernelDecode(CustomTestCase):
         self.assertGreater(metrics["score"], GSM8K_BOUND)
 
     def test_covered_steps_match_prefill(self):
-        # one graph per batch (ignore_eos keeps its rows): 2, 3, 7 and 8 rows
-        # (graphs 2, 4 and 8, pad rows at 3 and 7)
-        for rows in (2, 3, 7, 8):
-            requests.post(DEFAULT_URL_FOR_TEST + "/flush_cache").raise_for_status()
-            assert_logprobs_match(
-                DEFAULT_URL_FOR_TEST,
-                {MODEL: {"kl_div": KL_BOUND}},
-                MODEL,
-                max_samples=rows,
-                max_new_tokens=512,
-                trust_remote_code=True,
-            )
+        # graphs 2, 4 and 8, pad rows at 3 and 7
+        _match_prefill((2, 3, 7, 8))
+
+
+class TestMonokernelDecodeFse(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.err = cls.enterClassContext(
+            tempfile.NamedTemporaryFile("w+", suffix=".err")
+        )
+        cls.out = cls.enterClassContext(
+            tempfile.NamedTemporaryFile("w+", suffix=".out")
+        )
+        cls.process = _launch(
+            extra_args=[
+                "--enforce-shared-experts-fusion",
+                "--watchdog-timeout",
+                "600",
+            ],
+            log=(cls.out, cls.err),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_split_steps_match_prefill(self):
+        # the server shares its log files' offsets: read them through new handles
+        log = Path(self.err.name).read_text() + Path(self.out.name).read_text()
+        self.assertIn("layer_block and 2 split launches", log)
+        # graph 16 runs the split GDN launch and layer_block, pad rows at 12
+        _match_prefill((12, 16))
 
 
 class TestMonokernelVerify(CustomTestCase):
