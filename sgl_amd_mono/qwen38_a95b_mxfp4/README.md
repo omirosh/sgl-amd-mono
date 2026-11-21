@@ -286,7 +286,10 @@ check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the S
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. Both tests
 also send 16 requests, and check mode must log a `layer_block` check at 16 rows. The test with the fused shared expert
 must also log a split launch check, and its build log must show 2 split launches. Check mode compares `layer_block`
-as it compares K2, and the log names it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
+as it compares K2, and the log names it `k2`. `TestMonokernelDecodeFse` starts the decode server with
+`--enforce-shared-experts-fusion` and its CUDA graphs. Its build log must show 2 split launches. It measures the KL
+divergence of decode against prefill at 12 rows (graph 16 with 4 pad rows) and at 16 rows. `TestMonokernelVerify`
+runs GSM8K at 4 concurrent requests on a NEXTN
 server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serves the steps of up to 8 rows, and
 `layer_block` the steps of 16 rows.
 
