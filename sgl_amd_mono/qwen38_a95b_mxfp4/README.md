@@ -256,8 +256,9 @@ checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 run
 check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at least 1. A second
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. This test
-also sends 16 requests, and check mode must log a `layer_block` check at 16 rows. Check mode compares `layer_block`
-as it compares K2, and the log names it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
+also sends 16 requests, and check mode must log a split launch check and a `layer_block` check at 16 rows. Check mode
+compares `layer_block` as it compares K2, and the log names it `k2`. The build log of this server must show 2 split
+launches. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
 server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serves the steps of up to 8 rows, and
 `layer_block` the steps of 16 rows.
 
