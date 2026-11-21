@@ -9,7 +9,9 @@ every row of the step.
 - `proj`: `[q | k | v | z] = x @ W_qkvz.T` in three K slices a 64-row
   group (72 groups, 216 units), folded by the group's last arriving unit,
   whose epilogue runs the causal conv on `q | k | v` with its state update:
-  `silu(w0 s0 + w1 s1 + w2 s2 + w3 x)`, new state `[s1, s2, x]`, `x` the
+  `silu(w0 s0 + w1 s1 + w2 s2 + w3 x)`, each product rounded to bf16 (SGLang's
+  Triton conv update), new state `[s1, s2, x]` in SGLang's `[CONV_DIM, 3]`
+  slot layout, `x` the
   projection rounded to bf16 (the stock GEMM's output); `z` is stored as
   is. `W_qkvz` is bf16, or MXFP4 against the MXFP4 rows of `x` (W4A4, the
   online-quantized projection; with a Hadamard rotation those rows are of
@@ -17,7 +19,8 @@ every row of the step.
   as split-K units on the CTAs past the projection's; the recurrence sums
   their partials.
 - `recur`: a unit is (row, value head), a CTA: the gated delta rule on the
-  head's 128 x 128 fp32 state in place, then the gated RMSNorm of the output
+  head's 128 x 128 state in place (fp32 math; a bf16 state, SGLang's
+  `--mamba-ssm-dtype bfloat16`, is stored rounded), then the gated RMSNorm of the output
   (`RMSNormGated`, `norm_before_gate`, SiLU gate: `norm(o) w silu(z)`),
   rounded to bf16 (the stock norm's output); for an MXFP4 `out_proj`
   quantized (after the Hadamard rotation, when it has one). A row whose state
@@ -174,7 +177,7 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
     """The input projection and its conv. `w`: `qkvz` (and `qkvz_s`),
     `ba` (bf16), `conv` ([CONV_DIM, 4] bf16); `b`: `x` (and the MXFP4
     rows `x4` / `x4s`), `qkv`, `z`, `ba` (partials), `part`,
-    `st_idx`, `conv_state` (a slot [3, CONV_DIM] bf16, slots
+    `st_idx`, `conv_state` (a slot SGLang's [CONV_DIM, 3] bf16, slots
     `conv_stride` elements apart). Fold counters `fold0 ..`.
     `pending`: the first unit's weights (`proj_issue`'s), or None.
     With `tag` (resident widths) the outputs are tagged
@@ -320,18 +323,30 @@ def conv_loads(w, b, row, tokens, slots=None):
     if slots is None:
         slots = [ld(b.st_idx, tk, fx.Int32, cm=CM_DEV) for tk in tokens]
     live = [sl > 0 for sl in slots]
-    # a slot's [3, CONV_DIM] state, slots ``conv_stride`` elements apart
+    # SGLang's [CONV_DIM, 3] state a slot, slots ``conv_stride`` elements apart:
+    # the 4 rows' 12 values are contiguous (`_conv_state`)
     sbs = [
         b.conv_state
-        + (fx.Int64(live[t].select(slots[t], i32(0))) * b.conv_stride + fx.Int64(row))
+        + (
+            fx.Int64(live[t].select(slots[t], i32(0))) * b.conv_stride
+            + fx.Int64(row * 3)
+        )
         * fx.Int64(2)
         for t in range(len(tokens))
     ]
-    states = [
-        [gld(sbs[t] + fx.Int64(jj * CONV_DIM * 2), fx.Int32, 2) for jj in range(3)]
-        for t in range(len(tokens))
-    ]
+    states = []
+    for t in range(len(tokens)):
+        s = []
+        for q in range(3):
+            v = gld(sbs[t] + fx.Int64(8 * q), fx.Int32, 2)
+            s += [v[0], v[1]]
+        states.append(s)
     return words, live, sbs, states
+
+
+def _conv_state(s, e, j):
+    """Row `e`'s state value `j` (0 the oldest) of a token's 6 state words."""
+    return _halves(s[(3 * e + j) // 2])[(3 * e + j) % 2]
 
 
 @traced
@@ -361,15 +376,16 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
             out = []
             for e in range_constexpr(4):
                 sv = [
-                    live[t].select(_halves(s[jj][e // 2])[e % 2], fx.Float32(0.0))
+                    live[t].select(_conv_state(s, e, jj), fx.Float32(0.0))
                     for jj in range(3)
                 ]
+                # each product rounded to bf16, as SGLang's Triton conv update
                 out.append(
                     silu(
-                        tap[e][0] * sv[0]
-                        + tap[e][1] * sv[1]
-                        + tap[e][2] * sv[2]
-                        + tap[e][3] * xs[e]
+                        bf16_round(tap[e][0] * sv[0])
+                        + bf16_round(tap[e][1] * sv[1])
+                        + bf16_round(tap[e][2] * sv[2])
+                        + bf16_round(tap[e][3] * xs[e])
                     )
                 )
             if valid[t]:
@@ -384,14 +400,22 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
                     at = (tokens[t] * QKVZ + row) // 2
                     tagged.put(b.qkv, at, [packed[0], packed[1]], tag)
                 if live[t]:
-                    gst(sbs[t], s[1])
-                    gst(sbs[t] + fx.Int64(CONV_DIM * 2), s[2])
-                    gst(
-                        sbs[t] + fx.Int64(2 * CONV_DIM * 2),
-                        fx.Vector.from_elements(xs, fx.Float32)
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int32),
-                    )
+                    new = []
+                    for e in range_constexpr(4):
+                        new += [_conv_state(s, e, 1), _conv_state(s, e, 2), xs[e]]
+                    for q in range_constexpr(3):
+                        gst(
+                            sbs[t] + fx.Int64(8 * q),
+                            fx.Vector.from_elements(
+                                [
+                                    pack_bf16(
+                                        new[4 * q + 2 * i], new[4 * q + 2 * i + 1]
+                                    )
+                                    for i in range(2)
+                                ],
+                                fx.Int32,
+                            ),
+                        )
     else:
         for t in range_constexpr(tiles):
             if valid[t]:
@@ -415,7 +439,7 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
 # instruction covers two whole rows (1 KiB). Dots over the key dimension
 # reduce over the 32 lanes of a row.
 ROWS_PER_THREAD = GDN_DV // 8
-HEAD_BYTES = GDN_DV * GDN_DK * 4
+HEAD_ELEMS = GDN_DV * GDN_DK
 # LDS f32 offsets of a unit's staged values
 Q_AT, K_AT, V_AT, Z_AT = 0, GDN_DK, 2 * GDN_DK, 2 * GDN_DK + GDN_DV
 G_AT = 2 * GDN_DK + 2 * GDN_DV  # [beta, decay]
@@ -440,20 +464,24 @@ def _state_offsets(g):
     ]
 
 
-def state_base(b, slot):
-    """Byte address of slot `slot`'s state (clamped to the null block 0 for
-    a padding row, whose state is never written); slots are `ssm_stride`
-    f32 apart, a slot's [NV, DV, DK] heads dense."""
+def head_base(b, slot, vh):
+    """Byte address of value head `vh` of slot `slot`'s state (clamped to the
+    null block 0 for a padding row, whose state is never written); slots are
+    `ssm_stride` elements apart, a slot's [NV, DV, DK] heads dense, f32 or
+    (`b.state_bf16`) bf16."""
     s = (slot > 0).select(slot, i32(0))
-    return b.ssm + fx.Int64(s) * b.ssm_stride * fx.Int64(4)
+    es = 2 if b.state_bf16 else 4
+    return b.ssm + (fx.Int64(s) * b.ssm_stride + fx.Int64(vh) * HEAD_ELEMS) * es
 
 
 def load_head(b, unit, at):
-    """This thread's 16 state quads of value head `unit % NV` of row `unit //
-    NV`."""
+    """This thread's 16 state quads (f32) of value head `unit % NV` of row
+    `unit // NV`."""
     row, vh = unit // NV, unit % NV
     slot = uniform(ld(b.st_idx, row, fx.Int32, cm=CM_DEV))
-    hb = state_base(b, slot) + fx.Int64(vh) * fx.Int64(HEAD_BYTES)
+    hb = head_base(b, slot, vh)
+    if b.state_bf16:
+        return [ld(hb, a, fx.BFloat16, 4, cm=CM_NT).to(fx.Float32) for a in at]
     return [ld(hb, a, fx.Float32, 4, cm=CM_NT) for a in at]
 
 
@@ -470,7 +498,8 @@ def recur_first(g, b, rows: int):
 def recur(g, w, b, lds, rows: int, eps: float, core: str, h=None, tag=None):
     """`w`: `a_log` (f32), `dt_bias` (bf16), `norm` ([GDN_DV] bf16);
     `b`: `qkv`, `z`, `ba` (partials), `st_idx`, `ssm` (a slot [NV,
-    DV, DK] f32, slots `ssm_stride` apart), `core` ([rows, VALUE_DIM]
+    DV, DK] f32 or with `state_bf16` bf16, slots `ssm_stride` elements
+    apart), `core` ([rows, VALUE_DIM]
     bf16, or for `core` "mxfp4*" the codes with `core_s` the scale
     words); `lds`: `recur_lds_words()` f32 words. CTA `bid` takes
     units (row, value head) `bid, bid + BLOCKS, ..`, the next unit's state
@@ -498,8 +527,8 @@ def recur(g, w, b, lds, rows: int, eps: float, core: str, h=None, tag=None):
         k = lds_ld(lds + K_AT + k0, 4, fx.Float32)
         nxt = load_head(b, (i32(unit) + BLOCKS < units).select(unit + BLOCKS, unit), at)
         if slot > 0:
-            hb = state_base(b, slot) + fx.Int64(vh) * fx.Int64(HEAD_BYTES)
-            head(g, nw, h, hb, at, q, k, lds, rp, kq, eps)
+            hb = head_base(b, slot, vh)
+            head(g, nw, h, hb, at, q, k, lds, rp, kq, eps, b.state_bf16)
         else:
             if g.tid < GDN_DV:
                 lds_st(lds + Y_AT + g.tid, fx.Float32(0.0))
@@ -607,9 +636,10 @@ def _permlane16(x, y):
 
 
 @traced
-def head(g, nw, h, hb, at, q, k, lds, rp, kq, eps):
+def head(g, nw, h, hb, at, q, k, lds, rp, kq, eps, bf16=False):
     """One value head of one row: the delta rule on the state (`h`, this
-    thread's 16 rows of 4 keys, loaded), stored back in place; then the gated
+    thread's 16 rows of 4 keys, loaded), stored back in place (`bf16`:
+    rounded to a bf16 state); then the gated
     RMSNorm of the head's output into LDS (`Y_AT`). `k . h` of each row is
     reduced by halving (`_halve`) and broadcast to the row's lanes through
     the wave's LDS words (`B_AT`); `q . h` stays in the lanes that hold it."""
@@ -634,7 +664,10 @@ def head(g, nw, h, hb, at, q, k, lds, rp, kq, eps):
         v = 8 * i + g.wave * 2 + rp
         dv = (lds_ld(vl + v) - rows_kv[i // 4][i % 4]) * beta
         x[i] = [x[i][e] + dv * k[e] for e in range(4)]
-        st(hb, at[i], fx.Vector.from_elements(x[i], fx.Float32), cm=CM_NT)
+        new = fx.Vector.from_elements(x[i], fx.Float32)
+        if const_expr(bf16):
+            new = new.to(fx.BFloat16)
+        st(hb, at[i], new, cm=CM_NT)
         outs.append(x[i][0] * q[0] + x[i][1] * q[1] + x[i][2] * q[2] + x[i][3] * q[3])
     o = bf16_round(
         _halve(outs, g.lane)

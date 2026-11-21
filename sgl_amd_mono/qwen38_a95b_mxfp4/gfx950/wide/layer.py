@@ -107,6 +107,7 @@ class LayerBuild:
     first_q4: str = "none"  # the first combine's MXFP4 rows ("none", ``norm.Q4_MODES``)
     next_q4: str = "none"  # the closing combine's, for the next layer's qkvz
     qkv_tail: bool = False  # the next layer is full attention: run its qkv_proj
+    state_bf16: bool = False  # gdn: SGLang's bf16 SSM state (else f32)
     og: bool = True  # attn: o_proj's input is attn x sigmoid(gate), else `attn` as is
     rip: int = 256  # the experts' padded intermediate rows a rank
     eps: float = 1e-6
@@ -343,6 +344,7 @@ def build(key: LayerBuild):
     name += "" if key.qkvz == "bf16" else f"_qkvz_{key.qkvz}"
     name += "" if key.out == "bf16" else f"_out_{key.out}"
     name += "_qkv" if key.qkv_tail else ""
+    name += "_sb16" if key.state_bf16 else ""
     name += "_split" if key.split else ""
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -533,6 +535,7 @@ def build(key: LayerBuild):
                     conv_stride=conv_stride,
                     ssm=ssm,
                     ssm_stride=ssm_stride,
+                    state_bf16=key.state_bf16,
                 )
                 out_w = gdn.out_weights(w_out, w_out_s, key.out, key.out_shuffled)
                 if const_expr(key.split):
