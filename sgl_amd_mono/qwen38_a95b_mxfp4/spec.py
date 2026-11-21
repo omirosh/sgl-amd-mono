@@ -31,8 +31,10 @@ out_proj's / o_proj's input, then one wide launch a layer (``gfx950/wide``, from
 vllm-project/vllm#67421 and #67678): out_proj / o_proj and its TP reduce, the
 post-attention norm, the MoE and its TP reduce, and the next layer's input norm
 (the last layer's: the final norm). The launches hand the residual and the normed
-rows on in their scratch, so SGLang runs no input norm between them. It needs
-the fused shared expert.
+rows on in their scratch, so SGLang runs no input norm between them. In a decode
+step, a GDN layer's launch also runs its front from the normed rows, as K1 does:
+in_proj_qkvz and in_proj_ba, the conv and the gated delta rule with their state
+updates, and the gated norm. It needs the fused shared expert.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sgl-project/sglang#43839)
@@ -193,6 +195,8 @@ NUMERICS = Numerics(
         "k1.state.cosine": 0.9999,
         "k2.out.cosine": 0.99,
         "wide.out.cosine": 0.99,
+        "wide.conv.cosine": 0.9999,
+        "wide.state.cosine": 0.9999,
     },
 )
 
@@ -459,25 +463,11 @@ class _Split:
         returns its core and residual (buffers the next launch rewrites)."""
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
-        a, qkvz = layer.linear_attn, layer.linear_attn.in_proj_qkvz
-        args = dict.fromkeys(W.ABI.names, 0) | {
+        args = dict.fromkeys(W.ABI.names, 0) | _gdn_front(layer, h, conv, temporal, idx)
+        args |= {
             "scratch": self.scratch,
-            "emb": h,
             "res_in": 0 if residual is None else residual,
             "core_out": self.core,
-            "n_in": layer.input_layernorm.weight,
-            "w_qkvz": qkvz.weight,
-            "w_qkvz_s": qkvz.weight_scale if _mxfp4(qkvz) else 0,
-            "w_ba": a.in_proj_ba.weight,
-            "w_conv": a.conv1d.weight,
-            "a_log": a.A_log,
-            "dt_bias": a.dt_bias,
-            "gdn_norm": a.norm.weight,
-            "conv_state": conv,
-            "conv_stride": conv.stride(0),
-            "ssm": temporal,
-            "ssm_stride": temporal.stride(0),
-            "st_idx": idx,
             "peers": self.peers,
             "rank": self.rank,
             "epoch": self.epoch,
@@ -502,33 +492,52 @@ def _builds_wide(model, layers, widths) -> bool:
     )
 
 
-def _wide_keys(layers, eps, tp, fault_site, fault_after) -> list:
-    """Each layer's wide launch at WIDE rows: ``attn`` from SGLang's gated core,
-    ``gdn_back`` from its GDN core (decode and verify alike)."""
+def _wide_keys(layers, eps, tp, fault_site, fault_after, front=None) -> list:
+    """Each layer's wide launch at WIDE rows: ``attn`` from SGLang's gated core.
+    A GDN layer runs ``gdn_back`` from SGLang's GDN core, or with ``front`` (the
+    decode step: the gated norm eps, a bf16 SSM state) ``gdn`` from its input
+    rows: the projections, the conv and the recurrence with their state updates.
+    A launch before a ``gdn`` launch with an MXFP4 in_proj_qkvz quantizes the
+    rows of its closing combine for it."""
     from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
+    def q4(x) -> bool:
+        return front is not None and _is_gdn(x) and _mxfp4(x.linear_attn.in_proj_qkvz)
+
     keys = []
-    for x in layers:
+    for n, x in enumerate(layers):
+        q4_next = n + 1 < len(layers) and q4(layers[n + 1])
         common = dict(
             tokens=WIDE,
             tp=tp,
             rip=L.RI,
             eps=eps,
+            next_q4=W.q4_of("mxfp4") if q4_next else "none",
             fault_site=fault_site,
             fault_after=fault_after,
         )
-        if _is_gdn(x):
-            q = _mxfp4(x.linear_attn.out_proj)
-            keys.append(
-                W.LayerBuild(
-                    kind="gdn_back",
-                    out="mxfp4" if q else "bf16",
-                    out_shuffled=q,
-                    **common,
-                )
-            )
-        else:
+        if not _is_gdn(x):
             keys.append(W.LayerBuild(kind="attn", og=False, **common))
+            continue
+        q = _mxfp4(x.linear_attn.out_proj)
+        out = dict(out="mxfp4" if q else "bf16", out_shuffled=q)
+        if front is None:
+            keys.append(W.LayerBuild(kind="gdn_back", **out, **common))
+            continue
+        gdn_eps, state_bf16 = front
+        keys.append(
+            W.LayerBuild(
+                kind="gdn",
+                first=n == 0,
+                first_q4=W.q4_of("mxfp4") if n == 0 and q4(x) else "none",
+                qkvz="mxfp4" if q4(x) else "bf16",
+                qkvz_shuffled=q4(x),
+                gdn_eps=gdn_eps,
+                state_bf16=state_bf16,
+                **out,
+                **common,
+            )
+        )
     return keys
 
 
@@ -585,17 +594,18 @@ class _Wide:
         ids = self.scratch[off : off + 4 * WIDE * (L.TOPK + 1)].view(torch.int32)
         return ids.view(WIDE, L.TOPK + 1)[:, : L.TOPK]
 
-    def launch(self, n, i, layer, core, n_next):
+    def launch(self, n, i, layer, core, n_next, front=None):
         """Layer ``n`` of the step (model layer ``i``) from its out_proj / o_proj
-        input ``core``: the residual and the rows ``n_next`` norms stay in the
-        scratch."""
+        input ``core``, or for a ``gdn`` launch from the scratch rows with
+        ``front`` (``_gdn_front``): the residual and the rows ``n_next`` norms stay
+        in the scratch."""
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
         ex = layer.mlp.experts
         args = dict.fromkeys(W.ABI.names, 0) | {
             "scratch": self.scratch,
-            "core_out" if _is_gdn(layer) else "attn": core,
+            "core_out" if _is_gdn(layer) else "attn": 0 if core is None else core,
             "n_post": layer.post_attention_layernorm.weight,
             "n_next": n_next,
             "w_out": o.weight,
@@ -613,7 +623,31 @@ class _Wide:
             "sync_next": self.slots[n][1],
             "folds": self.folds,
         }
-        W.run(self.keys[n], args)
+        W.run(self.keys[n], args | (front or {}))
+
+
+def _gdn_front(layer, emb, conv, temporal, idx) -> dict:
+    """A ``gdn`` launch's GDN arguments: layer ``layer``'s weights, its conv and
+    SSM states (``_Built._state``) and the step's state indices; ``emb``: the
+    launch's input rows (a split launch: the previous layer's output; a wide
+    step: the embedding rows of its first launch), else None."""
+    a, qkvz = layer.linear_attn, layer.linear_attn.in_proj_qkvz
+    return {
+        "emb": 0 if emb is None else emb,
+        "n_in": layer.input_layernorm.weight,
+        "w_qkvz": qkvz.weight,
+        "w_qkvz_s": qkvz.weight_scale if _mxfp4(qkvz) else 0,
+        "w_ba": a.in_proj_ba.weight,
+        "w_conv": a.conv1d.weight,
+        "a_log": a.A_log,
+        "dt_bias": a.dt_bias,
+        "gdn_norm": a.norm.weight,
+        "conv_state": conv,
+        "conv_stride": conv.stride(0),
+        "ssm": temporal,
+        "ssm_stride": temporal.stride(0),
+        "st_idx": idx,
+    }
 
 
 class _Built:
@@ -721,9 +755,26 @@ class _Built:
         self.epoch[:1].add_(1)
         h = m.embed_tokens(input_ids)
         x, res = w.view("x", L.HIDDEN), w.view("res", L.HIDDEN)
+        idx = None
         for n, i in enumerate(range(m.start_layer, m.end_layer)):
             layer = m.layers[i]
-            if n == 0:
+            core = front = None
+            if w.keys[n].kind == "gdn":
+                idx = self._state_indices(WIDE) if idx is None else idx
+                conv, temporal = self._state(layer.linear_attn, dense=True)
+                if fb is not None:
+                    # SGLang's input norm and GDN on the launch's input rows
+                    head = check.k1_reference(
+                        layer,
+                        h if n == 0 else res,
+                        None,
+                        conv,
+                        temporal,
+                        idx[:WIDE],
+                        fb,
+                    )
+                front = _gdn_front(layer, h if n == 0 else None, conv, temporal, idx)
+            elif n == 0:
                 res.copy_(h)
                 core = self._core(
                     layer, positions, layer.input_layernorm(h), forward_batch
@@ -734,14 +785,24 @@ class _Built:
             if fb is not None:
                 # SGLang's tail on the launch's input, then its next norm
                 o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
-                ref, ids, logits = check.k2_reference(layer, o, core, res.clone(), fb)
+                ref, ids, logits = check.k2_reference(
+                    layer,
+                    o,
+                    core if front is None else head["core"],
+                    (res if front is None else head["res_out"]).clone(),
+                    fb,
+                )
                 ref["out"], ref["res_out"] = nxt(ref["out"], ref["res_out"])
-            w.launch(n, i, layer, core, nxt.weight)
+            w.launch(n, i, layer, core, nxt.weight, front)
             if fb is not None:
                 alike = check.k2_alike(
                     layer.layer_id, ids, logits, w.route_ids(), "wide"
                 )
                 got = {"out": x, "res_out": res}
+                if front is not None:
+                    st = check.k1_outputs(None, None, conv, temporal, idx[:WIDE])
+                    for name in ("conv", "state"):
+                        ref[name], got[name] = head[name], st[name]
                 check.compare("wide", layer.layer_id, WIDE, ref, got, alike)
         # the final norm's rows: the next step's launches rewrite the scratch
         return lm.logits_processor(
@@ -770,8 +831,8 @@ class _Built:
         return idx
 
     def _state(self, a, dense=False):
-        """``dense``: a conv state slot is one dense block (the split launch
-        reads no strides within it; K1 does)."""
+        """``dense``: a conv state slot is one dense block (the split launch and
+        the wide ``gdn`` launch read no strides within it; K1 does)."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         st = get_attn_backend().linear_attn_backend.state_layer_cache(a.layer_id)
@@ -1044,7 +1105,8 @@ def _build(model, hf_config, ctx) -> _Built:
         split_keys = list(dict.fromkeys(k for k in keys if k is not None))
     wide = None
     if builds_wide:
-        keys = _wide_keys(layers, e2, tp, fault_site, fault_after)
+        front = None if verify else (e_norm, bf16)
+        keys = _wide_keys(layers, e2, tp, fault_site, fault_after, front)
         wide = _Wide(keys, _router_gates(layers), peer.addresses, rank, epoch, device)
     built = _Built(
         model,
