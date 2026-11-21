@@ -6,7 +6,8 @@ NEXTN verify steps of up to 8 rows run K2, of 16 rows layer_block (with the fuse
 shared expert); the tokens of covered steps scored again by the normal prefill
 path (KL consistency); each covered layer against SGLang's layer (check mode),
 with the MXFP4 GDN projections of sgl-project/sglang#43839, also with the fused
-shared expert of sgl-project/sglang#41899 (and layer_block at 16 rows); and a
+shared expert of sgl-project/sglang#41899 (and at 16 rows the split GDN launch
+and layer_block); and a
 fault on one rank that stops the server before any token of the failed step is
 sent."""
 
@@ -136,11 +137,13 @@ class TestMonokernelCheck(CustomTestCase):
         # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
         log = self._check(["--enforce-shared-experts-fusion"], wide=True)
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
+        # one in_proj_qkvz format: a split launch for layer 0 and one for the others
+        self.assertIn("layer_block and 2 split launches", log)
 
     def _check(self, extra_args=(), wide=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
         # 1, 3 and 8 rows run widths 1, 3 and 8, and with `wide` 16 rows run
-        # layer_block (checked as k2)
+        # the split launch (checked as k1) and layer_block (checked as k2)
         widths = (1, 3, 8, 16) if wide else (1, 3, 8)
         para = "The river valley archive lists the flood height of every year. "
         with (
@@ -184,7 +187,7 @@ class TestMonokernelCheck(CustomTestCase):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _ in checks}
         want = {(kind, rows) for kind in ("k1", "k2") for rows in (1, 3, 8)}
-        want |= {("k2", rows) for rows in widths if rows > 8}
+        want |= {(kind, rows) for kind in ("k1", "k2") for rows in widths if rows > 8}
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))
