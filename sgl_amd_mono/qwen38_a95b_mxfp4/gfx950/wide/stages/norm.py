@@ -16,6 +16,9 @@ also as MXFP4 (`mx`'s activation quantization, the W4A4 GEMMs' input):
 rotation an `InputHadamardLinearMethod` applies before quantizing; a
 `"_t"` suffix scales as the Triton FP4 GEMM does (`mx.scale_code`). Without
 an exchange (the step's first layer) the residual is the embedding as is.
+With `res_in` (a split launch) the residual is `emb + res_in`, and the norm
+reads that sum before its bf16 rounding, as SGLang's `fused_add_rms_norm`
+and K1 do.
 """
 
 from __future__ import annotations
@@ -109,7 +112,7 @@ def combine(g, xch, out, w, lds, rows: int, eps: float, emb=None, res_in=None):
         if const_expr(xch is None and res_in is not None):
             for q in range_constexpr(4):
                 y = unpack_bf16x8(ld_i32x4(fx.Int64(emb), base + 4 * q, CM_DEV))
-                z += [bf16_round(old[q][e] + y[e]) for e in range(8)]
+                z += [old[q][e] + y[e] for e in range(8)]
         elif const_expr(xch is None):
             for q in range_constexpr(4):
                 z += list(old[q])
