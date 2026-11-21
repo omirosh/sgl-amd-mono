@@ -7,8 +7,9 @@ the wide launches (with the fused shared expert); the tokens of covered steps
 scored again by the normal prefill path (KL consistency); each covered layer
 against SGLang's layer (check mode), with the MXFP4 GDN projections of
 sgl-project/sglang#43839, also with the fused shared expert of
-sgl-project/sglang#41899 (and layer_block at 16 rows, the wide launches at 32); and a
-fault on one rank that stops the server before any token of the failed step is
+sgl-project/sglang#41899 (and layer_block at 16 rows, the wide launches at 32,
+with the GDN front in a decode step: its conv and SSM state rows checked too); and
+a fault on one rank that stops the server before any token of the failed step is
 sent."""
 
 import json
@@ -151,8 +152,11 @@ class TestMonokernelCheck(CustomTestCase):
             wide=True,
         )
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
-        # o_proj and the MXFP4 out_proj: one attn and one gdn_back build
-        self.assertIn("layer_block and 2 wide launches", log)
+        # the decode step's GDN fronts: the first layer and a GDN layer before a
+        # GDN layer (both quantize their closing rows for that in_proj_qkvz), a
+        # GDN layer before an attention layer, an attention layer before a GDN
+        # layer, and the last layer
+        self.assertIn("layer_block and 5 wide launches", log)
 
     def _check(self, extra_args=(), wide=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;

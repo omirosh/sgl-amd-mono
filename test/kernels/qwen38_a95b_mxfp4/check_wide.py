@@ -7,12 +7,19 @@ on random TP8 shards in SGLang's layouts, against float64 references with the
 stock rounding points (``wide_reference``):
 
 - compile: every wide key the spec can make (``attn`` on the gated core,
-  ``gdn_back`` with a bf16 or an MXFP4 out_proj) compiles on every rank, at 17
-  and 32 rows;
+  ``gdn_back`` with a bf16 or an MXFP4 out_proj, at 17 and 32 rows; the decode
+  step's ``gdn`` keys and the launches before them, at 32 rows) compiles on
+  every rank;
 - chain: one step of three launches (``gdn_back``, ``attn``, ``gdn_back``) at 17
   and 32 rows, with a bf16 and an MXFP4 out_proj; each launch's MoE input rows,
   routes, route weights, residual and normed rows against the reference fed the
   previous launch's outputs (relative Frobenius errors);
+- front: one decode step of two ``gdn`` launches at 32 rows (the step's first
+  layer, then the next layer from the first launch's MXFP4 rows), bf16
+  projections and an f32 state, or MXFP4 projections and a bf16 state, with
+  pad rows: each launch's core and conv and SSM state rows against K1 on 8-row
+  chunks of its input rows, every other state slot kept, and its tail as in
+  the chain;
 - fault: rank 3 stalls at its first wait (``stop=False``) in ``gdn_back`` at 32
   rows, with a deadline of 0.5 s and 5 s on the peers: rank 3 sets its deadline
   word and its flag reaches every rank.
@@ -27,14 +34,16 @@ import datetime
 import os
 import sys
 import time
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
 import wide_reference as R
-from inputs import BF, epoch, errors, gen
+from inputs import BF, CORE, MAXT, epoch, errors, gen, k1_state, k1_weights
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import layout as L
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import grid
@@ -111,10 +120,15 @@ def compile_keys(keys):
 
 
 def check_compile():
-    keys = sorted(
-        {key(kind, s, f) for kind in set(STEP) for s in WIDTHS for f in FORMATS},
-        key=repr,
-    )
+    q4 = W.q4_of("mxfp4")
+    keys = {key(kind, s, f) for kind in set(STEP) for s in WIDTHS for f in FORMATS}
+    # the decode keys: the GDN fronts, and the launches before an MXFP4 front
+    keys |= {front_key(32, qq, n) for qq in (False, True) for n in (0, 1)}
+    keys |= {
+        replace(front_key(32, True, 1), next_q4=q4),
+        key("attn", 32, "bf16", next_q4=q4),
+    }
+    keys = sorted(keys, key=repr)
     t0 = time.time()
     ok = compile_keys(keys)
     log(
@@ -160,12 +174,13 @@ class Side:
             torch.float32
         ).view(-1, L.SLOTS)
 
-    def run(self, n, k, layer, core, w, n_post, n_next):
+    def run(self, n, k, layer, core, w, n_post, n_next, front=None):
         """Launch ``n`` of the step: model layer ``layer`` from its out_proj /
-        o_proj input ``core``."""
+        o_proj input ``core``, or for ``gdn`` from the scratch rows with the GDN
+        arguments ``front``."""
         args = dict.fromkeys(W.ABI.names, 0) | {
             "scratch": self.scratch,
-            "core_out" if k.kind == "gdn_back" else "attn": core,
+            "attn" if k.kind == "attn" else "core_out": 0 if core is None else core,
             "n_post": n_post,
             "n_next": n_next,
             "w_out": w["out"],
@@ -183,7 +198,7 @@ class Side:
             "sync_next": self.slots[n][1],
             "folds": self.folds,
         }
-        W.run(k, args)
+        W.run(k, args | (front or {}))
 
     def close(self):
         self.peer.close()
@@ -221,6 +236,49 @@ def weights(shared, mine, kind, fmt):
     }
 
 
+def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
+    """(name, relative error, bound) of a launch's MoE input rows, routes, route
+    weights, residual and normed rows, against the reference fed the launch's
+    residual ``res`` and out_proj / o_proj input ``core``. ``q4_next``: the
+    closing combine quantized its rows for the next in_proj_qkvz into the MoE
+    input rows' buffer: they are checked as that."""
+    rows = side.rows
+    res1 = R.bf(res.double() + allsum(R.linear(core.double(), w["out_r"], w["fmt"])))
+    xn = R.gemma_norm(res1, n_post, EPS)
+    kxd = R.dequant_mx(
+        side.view("x4", L.HIDDEN // 2, torch.uint8),
+        side.view("x4s", L.HIDDEN // 32, torch.int32),
+    )
+    notes = []
+    if not q4_next:
+        notes.append((f"{tag} moe input (MXFP4)", rel(kxd, R.quant_act(xn)), 2e-2))
+    kids, kws = side.route()
+    y, ids, ws = R.moe(
+        xn,
+        w["w_gate"],
+        w["r13"],
+        w["r13s"],
+        w["r2"],
+        w["r2s"],
+        L.EXPERTS,
+        L.TOPK,
+        L.RI,
+        L.RI,
+        prefer=kids[:, : L.TOPK],
+        xd=None if q4_next else kxd,
+    )
+    same = sum(set(kids[r].tolist()) == set(ids[r].tolist()) for r in range(rows))
+    notes.append((f"{tag} routes", 1 - same / rows, 0.0))
+    notes.append((f"{tag} route weights", rel(kws, ws), 1e-2))
+    res2 = R.bf(res1 + allsum(R.bf(y)))
+    notes.append((f"{tag} residual", rel(side.view("res", L.HIDDEN), res2), 1e-2))
+    x2 = R.gemma_norm(res2, n_next, EPS)
+    notes.append((f"{tag} x", rel(side.view("x", L.HIDDEN), x2), 1e-2))
+    if q4_next:
+        notes.append((f"{tag} next qkvz rows (MXFP4)", rel(kxd, R.quant_act(x2)), 2e-2))
+    return notes
+
+
 def check_chain(rows, fmt):
     shared, mine = gen(DEV, 1234), gen(DEV, 1000 + rank)
     norms = [
@@ -246,42 +304,7 @@ def check_chain(rows, fmt):
             if any(words.values()):
                 notes.append((f"L{n} guard error words {words}", 1.0, 0.0))
                 break
-            tag = f"L{n} {kind}"
-            res1 = R.bf(
-                res.double() + allsum(R.linear(core.double(), w["out_r"], w["fmt"]))
-            )
-            xn = R.gemma_norm(res1, n_post, EPS)
-            kxd = R.dequant_mx(
-                side.view("x4", L.HIDDEN // 2, torch.uint8),
-                side.view("x4s", L.HIDDEN // 32, torch.int32),
-            )
-            notes.append((f"{tag} moe input (MXFP4)", rel(kxd, R.quant_act(xn)), 2e-2))
-            kids, kws = side.route()
-            y, ids, ws = R.moe(
-                xn,
-                w["w_gate"],
-                w["r13"],
-                w["r13s"],
-                w["r2"],
-                w["r2s"],
-                L.EXPERTS,
-                L.TOPK,
-                L.RI,
-                L.RI,
-                prefer=kids[:, : L.TOPK],
-                xd=kxd,
-            )
-            same = sum(
-                set(kids[r].tolist()) == set(ids[r].tolist()) for r in range(rows)
-            )
-            notes.append((f"{tag} routes", 1 - same / rows, 0.0))
-            notes.append((f"{tag} route weights", rel(kws, ws), 1e-2))
-            res2 = R.bf(res1 + allsum(R.bf(y)))
-            notes.append(
-                (f"{tag} residual", rel(side.view("res", L.HIDDEN), res2), 1e-2)
-            )
-            x2 = R.gemma_norm(res2, n_next, EPS)
-            notes.append((f"{tag} x", rel(side.view("x", L.HIDDEN), x2), 1e-2))
+            notes += tail_notes(side, f"L{n} {kind}", res, core, w, n_post, n_next)
     finally:
         side.close()
     bad = [f"{name}: {v:.2e} > {tol:.0e}" for name, v, tol in notes if not v <= tol]
@@ -294,6 +317,142 @@ def check_chain(rows, fmt):
         f"{'OK' if ok else 'FAIL'}"
     )
     return [] if ok else [f"chain ({rows} rows, {fmt})"]
+
+
+def front_key(rows, qq, n):
+    """The spec's decode key of GDN layer ``n`` (0: the step's first) of a step
+    of GDN layers; ``qq``: MXFP4 in_proj_qkvz and out_proj and a bf16 state."""
+    fmt, q4 = ("mxfp4", W.q4_of("mxfp4")) if qq else ("bf16", "none")
+    return W.LayerBuild(
+        kind="gdn",
+        tokens=rows,
+        tp=L.TP,
+        first=n == 0,
+        first_q4=q4 if n == 0 else "none",
+        next_q4=q4 if n == 0 else "none",
+        qkvz=fmt,
+        qkvz_shuffled=qq,
+        out=fmt,
+        out_shuffled=qq,
+        state_bf16=qq,
+        rip=L.RI,
+    )
+
+
+def check_front(qq, rows=32, slots=40):
+    """Two ``gdn`` launches, the step's first GDN layer and the next, against K1
+    on 8-row chunks of the same input rows and state: the core, the conv and SSM
+    state rows, the other slots kept; then each launch's tail (``tail_notes``)
+    on its own core."""
+    fmt = "mxfp4" if qq else "bf16"
+    keys = [front_key(rows, qq, n) for n in range(2)]
+    k1 = gdn.K1Build(
+        tokens=MAXT, first=True, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq
+    )
+    try:
+        _compile_only(gdn.build(k1))
+        k1_ok = True
+    except Exception as e:  # reported, then every rank stops
+        print(f"[rank {rank}] compile K1: {type(e).__name__}: {e}", flush=True)
+        k1_ok = False
+    if not (compile_keys(keys) and all_ok(k1_ok)):
+        raise SystemExit("a rank failed to compile the front keys")
+    shared, mine = gen(DEV, 4321), gen(DEV, 2000 + rank)
+    # layer n: input norm norms[2n], post-attention norm norms[2n + 1]
+    norms = [
+        (torch.randn(L.HIDDEN, generator=shared, device=DEV) * 0.1).to(BF)
+        for _ in range(2 * len(keys) + 1)
+    ]
+    idx = (torch.randperm(slots - 1, generator=shared, device=DEV)[:rows] + 1).int()
+    idx[[5, 17, 31]] = torch.tensor([-1, 0, -1], dtype=torch.int32, device=DEV)
+    live = idx[idx > 0].long()
+    keep = torch.ones(slots, dtype=torch.bool, device=DEV)
+    keep[live] = False
+    k1_scratch = torch.zeros(gdn.scratch_bytes(k1), dtype=torch.uint8, device=DEV)
+    k1_epoch = epoch(DEV)
+    side = Side(rows, len(keys))
+    notes = []
+    try:
+        res = torch.randn(rows, L.HIDDEN, generator=shared, device=DEV).to(BF)
+        for n, k in enumerate(keys):
+            n_in, n_post, n_next = norms[2 * n : 2 * n + 3]
+            w1 = k1_weights(mine, qq) | {"ln_w": n_in}
+            conv, state = k1_state(mine, slots, bf16=qq)
+            ref_conv, ref_state = conv.clone(), state.clone()
+            ref_core = torch.empty(rows, CORE, dtype=BF, device=DEV)
+            ref_res = torch.empty_like(res)
+            for c in range(0, rows, MAXT):
+                k1_epoch[:1].add_(1)
+                gdn.gdn_pre(
+                    k1,
+                    **w1,
+                    hidden=res[c : c + MAXT],
+                    residual=None,
+                    res_out=ref_res[c : c + MAXT],
+                    conv_state=ref_conv,
+                    rstate=ref_state,
+                    st_idx=idx[c : c + MAXT],
+                    core=ref_core[c : c + MAXT],
+                    scratch=k1_scratch,
+                    epoch=k1_epoch,
+                    layer=0,
+                )
+            w = weights(shared, mine, "gdn_back", fmt)
+            front = {
+                "emb": res if n == 0 else 0,
+                "n_in": n_in,
+                "w_qkvz": w1["w_qkvz"],
+                "w_qkvz_s": w1.get("w_qkvzs", 0),
+                "w_ba": w1["w_ba"],
+                "w_conv": w1["conv_w"],
+                "a_log": w1["a_log"],
+                "dt_bias": w1["dt_bias"],
+                "gdn_norm": w1["norm_w"],
+                "conv_state": conv,
+                "conv_stride": conv.stride(0),
+                "ssm": state,
+                "ssm_stride": state.stride(0),
+                "st_idx": idx,
+            }
+            conv0, state0 = conv.clone(), state.clone()
+            side.run(n, k, n, None, w, n_post, n_next, front)
+            torch.cuda.synchronize()
+            words = [errors(side.epoch), errors(k1_epoch)]
+            if any(any(e.values()) for e in words):
+                notes.append((f"L{n} guard error words {words}", 1.0, 0.0))
+                break
+            tag = f"front L{n}"
+            if qq:
+                core = R.dequant_mx(
+                    side.view("core", L.VALUE_DIM // 2, torch.uint8),
+                    side.view("core_s", L.VALUE_DIM // 32, torch.int32),
+                )
+                want, tol = R.quant_act(ref_core.double()), 2e-2
+            else:
+                core, want, tol = side.view("core", L.VALUE_DIM).clone(), ref_core, 1e-2
+            notes.append((f"{tag} core", rel(core[idx > 0], want[idx > 0]), tol))
+            notes.append((f"{tag} conv", rel(conv[live], ref_conv[live]), 1e-2))
+            notes.append((f"{tag} state", rel(state[live], ref_state[live]), 1e-2))
+            kept = torch.equal(conv[keep], conv0[keep]) and torch.equal(
+                state[keep], state0[keep]
+            )
+            notes.append((f"{tag} other slots changed", 0.0 if kept else 1.0, 0.0))
+            notes += tail_notes(
+                side, tag, res, core, w, n_post, n_next, k.next_q4 != "none"
+            )
+            res = side.view("res", L.HIDDEN).clone()
+    finally:
+        side.close()
+    bad = [f"{name}: {v:.2e} > {tol:.0e}" for name, v, tol in notes if not v <= tol]
+    for b in bad:
+        print(f"[rank {rank}] front {fmt}: {b}", flush=True)
+    ok = all_ok(not bad)
+    worst = max((v for name, v, _ in notes if "routes" not in name), default=0.0)
+    log(
+        f"front ({rows} rows, {fmt} GDN projections): rank 0 largest error "
+        f"{worst:.2e}: {'OK' if ok else 'FAIL'}"
+    )
+    return [] if ok else [f"front ({rows} rows, {fmt})"]
 
 
 def check_fault(rows=32, fmt="mxfp4"):
@@ -340,6 +499,9 @@ def main():
         for fmt in FORMATS:
             dist.barrier()
             fails += check_chain(rows, fmt)
+    for qq in (False, True):
+        dist.barrier()
+        fails += check_front(qq)
     dist.barrier()
     fails += check_fault()
     for f in fails:
