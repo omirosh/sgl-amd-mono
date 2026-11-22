@@ -345,7 +345,8 @@ def check_front(qq, rows=32, slots=40):
     """Two ``gdn`` launches, the step's first GDN layer and the next, against K1
     on 8-row chunks of the same input rows and state: the core, the conv and SSM
     state rows, the other slots kept; then each launch's tail (``tail_notes``)
-    on its own core."""
+    on its own core. Layer 0's experts add zero (the MoE output of a ``gdn``
+    launch is checked on layer 1)."""
     fmt = "mxfp4" if qq else "bf16"
     keys = [front_key(rows, qq, n) for n in range(2)]
     k1 = gdn.K1Build(
@@ -400,6 +401,11 @@ def check_front(qq, rows=32, slots=40):
                     layer=0,
                 )
             w = weights(shared, mine, "gdn_back", fmt)
+            if n == 0:
+                # The next input norm reads the unrounded residual sum, and K1
+                # below reads only the stored bf16 residual: with no expert
+                # output the sum is bf16-exact, so both norm the same rows.
+                w |= {"w2": torch.zeros_like(w["w2"]), "r2": torch.zeros_like(w["r2"])}
             front = {
                 "emb": res if n == 0 else 0,
                 "n_in": n_in,
