@@ -22,8 +22,8 @@ out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
 from vllm-project/vllm#67421) in place of K2. It keeps no x tile in LDS, so it
 takes the rows K2 cannot; it needs the fused shared expert. In a decode step of
 16 rows, a GDN layer runs its front as one split launch (``gfx950/wide/layer.py``,
-the ``gdn`` kind at 16 rows, from vllm-project/vllm#67421) in place of SGLang's
-GDN: input norm, in_proj_qkvz and in_proj_ba, the conv and the gated delta rule
+the ``gdn`` kind at 16 rows, from vllm-project/vllm#67421 at 28f094565b and
+vllm-project/vllm#67678 at ce476ce305) in place of SGLang's GDN: input norm, in_proj_qkvz and in_proj_ba, the conv and the gated delta rule
 with their state updates, and the gated norm, as K1 does.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
