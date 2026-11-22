@@ -59,13 +59,20 @@ def _live(idx: torch.Tensor) -> torch.Tensor:
     return idx[idx > 0].long()
 
 
-def k1_reference(layer, h, residual, conv, temporal, idx, forward_batch) -> dict:
-    """SGLang's input norm and GDN on K1's input; the state rows are restored."""
+def k1_reference(
+    layer, h, residual, conv, temporal, idx, forward_batch, x=None
+) -> dict:
+    """SGLang's input norm and GDN on K1's input; the state rows are restored.
+    ``x``: the normed rows when the launch before ran the input norm (on the
+    unrounded residual sum, which only that launch has); ``h`` is then the
+    residual that it stored."""
     from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _proj_input
 
     rows = _live(idx)
     saved = conv[rows].clone(), temporal[rows].clone()
-    if residual is None:
+    if x is not None:
+        res, x = h.clone(), x.clone()
+    elif residual is None:
         res, x = h.clone(), layer.input_layernorm(h.clone())
     else:
         x, res = layer.input_layernorm(h.clone(), residual.clone())

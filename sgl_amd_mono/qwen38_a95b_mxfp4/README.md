@@ -301,8 +301,10 @@ conv and SSM state rows. `k1.core.cosine`, `k1.conv.cosine` and `k1.state.cosine
 compares a split launch as it compares K1, and the log names it `k1`.
 Next to each wide launch, check mode runs SGLang's tail on the same input, then SGLang's next norm on its output. It
 compares the normed rows `x` and the residual. On the rows that the wide launch and SGLang route to the same experts,
-`wide.out.cosine` must be at least 0.99. Before a `gdn` launch, check mode runs SGLang's input norm and GDN on the
-launch's input rows and state rows, then restores the state rows. The tail reference starts from that core. Check mode
+`wide.out.cosine` must be at least 0.99. Before a `gdn` launch, check mode runs SGLang's GDN on the launch's input rows
+and state rows, then restores the state rows. On layer 0, SGLang's input norm makes the input rows from the embedding.
+On the other layers, the input rows are the rows `x` that the launch before normed: that launch norms the unrounded
+residual sum, as SGLang does, and stores only the bf16 sum. The tail reference starts from that core. Check mode
 also compares the conv and SSM state rows: `wide.conv.cosine` and `wide.state.cosine` must be at least 0.9999.
 
 The e2e test runs K1 and K2 on decode steps of width 1 to 8, and SGLang's forward on wider steps. The decode server
