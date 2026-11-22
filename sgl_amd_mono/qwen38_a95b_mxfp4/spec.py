@@ -781,7 +781,8 @@ class _Built:
                 idx = self._state_indices(WIDE) if idx is None else idx
                 conv, temporal = self._state(layer.linear_attn, dense=True)
                 if fb is not None:
-                    # SGLang's input norm and GDN on the launch's input rows
+                    # SGLang's GDN on the launch's input rows: after layer 0,
+                    # the rows that the launch before normed
                     head = check.k1_reference(
                         layer,
                         h if n == 0 else res,
@@ -790,6 +791,7 @@ class _Built:
                         temporal,
                         idx[:WIDE],
                         fb,
+                        x=None if n == 0 else x,
                     )
                 front = _gdn_front(layer, h if n == 0 else None, conv, temporal, idx)
             elif n == 0:
