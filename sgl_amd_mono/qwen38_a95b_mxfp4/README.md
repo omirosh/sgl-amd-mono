@@ -50,6 +50,9 @@ step, `_Built.forward` runs each layer in two parts:
    layer, one K1 launch on each rank runs the input norm and the attention block up to the input of `out_proj`.
 2. One K2 launch on each rank runs the rest of the layer. It writes the layer output and the residual.
 
+A decode step of 16 rows runs a split launch in place of K1 and `layer_block` in place of K2, with the fused shared
+expert only. The text after the stages of K2 describes them.
+
 SGLang runs the embedding before the first layer. It runs the final norm and the logits processor after the last layer.
 
 With NEXTN, SGLang runs the MTP layer of Qwen3.8 as a draft model. The target model then runs verify steps instead of
@@ -224,7 +227,7 @@ launch is for the other GDN layers. `_build` also makes one K2 launch for each w
 layout and each `o_proj` or `out_proj` format of the model. It makes one `layer_block` launch for the width 16, each
 shared-expert layout and each `o_proj` or `out_proj` format. With the fused shared expert and without speculative
 decoding, `_build` also makes the split launches: one for layer 0 and one for the other GDN layers, for each
-`in_proj_qkvz` format. It compiles them all before the first step. With the MXFP4 projections, K2 and
+`in_proj_qkvz` format, with 16 in the widths. It compiles them all before the first step. With the MXFP4 projections, K2 and
 `layer_block` run `oq` on the GDN layers, with `oh` when SGLang rotates them, and the bf16 build on the
 full-attention layers. Each layer runs the launch of its own format.
 The log shows "Qwen3.8 monokernel: N K1, M K2, L layer_block and S split launches (widths [...], decode) in T s".
@@ -295,11 +298,12 @@ server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serv
 
 ## 7. Limitations
 
-K1, K2 and `layer_block` run only with:
+K1, K2, `layer_block` and the split launch run only with:
 
 - the checkpoint `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`
 - TP 8 on gfx950
-- decode and NEXTN verify steps of width 1 to 8 and 16
+- decode and NEXTN verify steps of width 1 to 8 and 16. The split launch runs only in decode steps of width 16, with
+  the fused shared expert.
 - one chain of draft tokens for each request, with `--speculative-eagle-topk 1`
 - an f32 or bf16 SSM state and a bf16 conv state
 - `--enable-linear-replayssm` only with speculative decoding
