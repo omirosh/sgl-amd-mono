@@ -243,8 +243,9 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
     closing combine quantized its rows for the next in_proj_qkvz into the MoE
     input rows' buffer: they are checked as that."""
     rows = side.rows
-    res1 = R.bf(res.double() + allsum(R.linear(core.double(), w["out_r"], w["fmt"])))
-    xn = R.gemma_norm(res1, n_post, EPS)
+    z1 = res.double() + allsum(R.linear(core.double(), w["out_r"], w["fmt"]))
+    res1 = R.bf(z1)
+    xn = R.gemma_norm(z1, n_post, EPS)
     kxd = R.dequant_mx(
         side.view("x4", L.HIDDEN // 2, torch.uint8),
         side.view("x4s", L.HIDDEN // 32, torch.int32),
@@ -270,9 +271,10 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
     same = sum(set(kids[r].tolist()) == set(ids[r].tolist()) for r in range(rows))
     notes.append((f"{tag} routes", 1 - same / rows, 0.0))
     notes.append((f"{tag} route weights", rel(kws, ws), 1e-2))
-    res2 = R.bf(res1 + allsum(R.bf(y)))
+    z2 = res1 + allsum(R.bf(y))
+    res2 = R.bf(z2)
     notes.append((f"{tag} residual", rel(side.view("res", L.HIDDEN), res2), 1e-2))
-    x2 = R.gemma_norm(res2, n_next, EPS)
+    x2 = R.gemma_norm(z2, n_next, EPS)
     notes.append((f"{tag} x", rel(side.view("x", L.HIDDEN), x2), 1e-2))
     if q4_next:
         notes.append((f"{tag} next qkvz rows (MXFP4)", rel(kxd, R.quant_act(x2)), 2e-2))

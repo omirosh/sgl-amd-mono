@@ -8,17 +8,17 @@
 `combine`: a CTA a row, thread `t` columns `32 t .. 32 t + 31` (one
 MXFP4 scale group, half an exchange line group). The exchanged sum `y`
 (the ranks' bf16 partials added in rank order, rounded to bf16: the stock
-all-reduce's output) is added to the residual and rounded to bf16 (the new
-residual, stored in place); `x = bf16(res * rsqrt(mean(res^2) + eps) * (1 +
-w))` (the Gemma-style norm of Qwen3.5) is stored as bf16, and with `q4`
-also as MXFP4 (`mx`'s activation quantization, the W4A4 GEMMs' input):
+all-reduce's output) is added to the residual: the f32 sum `z` is stored in
+place rounded to bf16 (the new residual), and the norm reads `z` before that
+rounding, as SGLang's `fused_add_rms_norm` does. The norm rows
+`x = bf16(z * rsqrt(mean(z^2) + eps) * (1 + w))` (the Gemma-style norm of
+Qwen3.5) are stored as bf16, and with `q4` also as MXFP4 (`mx`'s activation
+quantization, the W4A4 GEMMs' input):
 `"plain"` of `x`, `"h32"` of `bf16(x H32)`, the block Hadamard
 rotation an `InputHadamardLinearMethod` applies before quantizing; a
 `"_t"` suffix scales as the Triton FP4 GEMM does (`mx.scale_code`). Without
 an exchange (the step's first layer) the residual is the embedding as is.
-With `res_in` (a split launch) the residual is `emb + res_in`, and the norm
-reads that sum before its bf16 rounding, as SGLang's `fused_add_rms_norm`
-and K1 do.
+With `res_in` (a split launch) `z` is `emb + res_in`, as in K1.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def combine(g, xch, out, w, lds, rows: int, eps: float, emb=None, res_in=None):
             gates = ex_.wait_row(g, xch, row, group)
             for q in range_constexpr(4):
                 y = ex_.row_sum(xch, row, group, seg0 + q, gates)
-                z += [bf16_round(old[q][e] + bf16_round(y[e])) for e in range(8)]
+                z += [old[q][e] + bf16_round(y[e]) for e in range(8)]
         ss = z[0] * z[0]
         for e in range_constexpr(1, COLS):
             ss = ss + z[e] * z[e]

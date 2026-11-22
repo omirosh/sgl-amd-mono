@@ -82,7 +82,8 @@ def linear(x, w, fmt: str):
 
 
 def gemma_norm(z, w, eps):
-    """`GemmaRMSNorm` of bf16-valued rows `z`: (1 + w) weights."""
+    """`GemmaRMSNorm` of rows `z`: (1 + w) weights. `z` is the residual sum
+    before its bf16 rounding, as SGLang's `fused_add_rms_norm` reads it."""
     rr = torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + eps)
     return bf(z * rr * (1 + w.double()))
 
