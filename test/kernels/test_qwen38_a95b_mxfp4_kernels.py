@@ -160,6 +160,18 @@ class TestQwen38MoeD2(CustomTestCase):
     def test_time(self):
         self.assertEqual(_run("check_k2.py", "--time", ranks=8), 0)
 
+    def test_diagnose(self):
+        """layer_block's xq and ps thresholds at 2 .. 4 rows, and the phase table."""
+        for args in (
+            ("--time", "--rows", "1,2,3,4,5"),
+            ("--time", "--rows", "2,3,4", "--xq-min", "2"),
+            ("--time", "--rows", "4", "--ps-min", "5"),
+            ("--time", "--rows", "4", "--ps-min", "5", "--xq-min", "2"),
+            ("--timeline", "--rows", "1,3,4,5"),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(_run("check_k2.py", *args, ranks=8), 0)
+
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 @unittest.skipUnless(_has(SGLANG_43516), "needs the sgl-project/sglang#43516 kernels")
