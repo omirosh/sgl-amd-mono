@@ -14,11 +14,18 @@ SGLang's layouts:
 - fault: rank 3 stalls at its first wait (``stop=False``), in K2 at 1 row and in
   layer_block at 16: rank 3 sets its deadline word and its flag reaches every
   rank.
+
+``--time`` (decision D2) runs only this: K2 against layer_block at 1 .. 8 rows,
+fused shared expert, bf16 and MXFP4 o_proj. At each width the two outputs agree
+(cosine), then each arm's time a launch comes from a CUDA graph that cycles
+through D2_SETS weight sets, so that no layer stays in the MALL between launches.
 """
 
 import argparse
 import datetime
+import itertools
 import os
+import statistics
 import sys
 import time
 
@@ -37,6 +44,11 @@ WIDE = blocks.MAXT  # layer_block's width in the spec
 REPLAY_WIDTHS = (8, WIDE, WIDE, 1, 3, 8, WIDE, 2, 5)
 KINDS = ("rand0", "rand1", "zero", "copy")
 LATE = 20_000_000  # GPU cycles rank 3 sleeps before a launch, about 10 ms
+TIME_ITERS = 200  # launches a timed graph
+TIME_ROUNDS = 6
+# weight sets a timed graph cycles through: at 1 row (about 37 MB of experts a
+# launch) 12 sets are more than the 256 MB MALL
+D2_SETS = 12
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
 # arithmetic, the MoE output differs by about its rounding (the spec's bound)
 AGREE = {"res_out": 0.9999, "out": NUMERICS.bound("k2.out.cosine")}
@@ -70,9 +82,11 @@ def is_wide(key) -> bool:
     return isinstance(key, blocks.LayerBuild)
 
 
-def scratch_bytes(s):
-    """Width s's scratch: its largest variant's, as the spec's ``_scratch``."""
-    if s > MAXT:
+def scratch_bytes(key):
+    """The scratch of key's width and kind: its largest variant's, as the spec's
+    ``_scratch``."""
+    s = key.tokens
+    if is_wide(key):
         return max(
             blocks.scratch_bytes(
                 blocks.layer_scratch_layout(blocks.LayerBuild(tokens=s, oq=q))
@@ -101,9 +115,10 @@ class Side:
 
     def run(self, key, w, core, residual, out, res_out, layer=0, bump=True):
         """``bump=False``: the next layer of the epoch, as the spec's step."""
-        if key.tokens not in self.scratch:
-            n = scratch_bytes(key.tokens)
-            self.scratch[key.tokens] = torch.zeros(n, dtype=torch.uint8, device=DEV)
+        slot = is_wide(key), key.tokens
+        if slot not in self.scratch:
+            n = scratch_bytes(key)
+            self.scratch[slot] = torch.zeros(n, dtype=torch.uint8, device=DEV)
         if bump:
             self.epoch[:1].add_(1)
         (blocks.layer_block if is_wide(key) else k2.layer_post)(
@@ -113,7 +128,7 @@ class Side:
             **w,
             out=out,
             res_out=res_out,
-            scratch=self.scratch[key.tokens],
+            scratch=self.scratch[slot],
             peers=self.peer.addresses,
             rank=rank,
             epoch=self.epoch,
@@ -451,13 +466,125 @@ def check_fault(build, s):
     return [] if ok else [f"fault ({name})"]
 
 
+def time_launches(fn) -> float:
+    """Microseconds a launch (and its epoch bump) in a graph of TIME_ITERS
+    launches, as the server replays them. A rank that starts its replay early
+    waits for the others in its first launch; the last rank to start does not, so
+    the time is the smallest over the ranks."""
+    fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(TIME_ITERS):
+            fn()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    a.record()
+    graph.replay()
+    b.record()
+    torch.cuda.synchronize()
+    t = torch.tensor([a.elapsed_time(b) * 1000 / TIME_ITERS])
+    dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    return round(t.item(), 2)
+
+
+def time_arms(arms) -> dict:
+    """TIME_ROUNDS rounds of every arm in turn, the order reversed each round:
+    {arm: (median, rounds)}."""
+    rows = {k: [] for k in arms}
+    for i in range(TIME_ROUNDS):
+        for k, fn in list(arms.items())[:: 1 if i % 2 == 0 else -1]:
+            rows[k].append(time_launches(fn))
+    return {k: (statistics.median(v), v) for k, v in rows.items()}
+
+
+def time_d2():
+    """Decision D2: K2 and layer_block at each width 1 .. MAXT, fused shared
+    expert, bf16 and MXFP4 o_proj, on the same inputs and weight sets."""
+    widths = []
+    for s in range(1, MAXT + 1):
+        keys = [
+            key
+            for oq in (False, True)
+            for key in (
+                k2.K2Build(tokens=s, fse=True, oq=oq),
+                blocks.LayerBuild(tokens=s, oq=oq),
+            )
+        ]
+        if compile_keys(keys):
+            widths.append(s)
+        else:
+            log(f"d2 s{s}: a key does not compile, the width is skipped")
+    side = Side()
+    bad = [f"s{s}: does not compile" for s in range(1, MAXT + 1) if s not in widths]
+    try:
+        for oq in (False, True):
+            sets = [
+                k2_weights(DEV, rank, 700 + 10 * i, fse=True, oq=oq)
+                for i in range(D2_SETS)
+            ]
+            for s in widths:
+                residual = rnd(gen(DEV, 800 + s), s, HIDDEN)
+                core = rnd(gen(DEV, 900 + 1000 * rank + s), s, CORE)
+                runs = {}
+                for name, key in (
+                    ("k2", k2.K2Build(tokens=s, fse=True, oq=oq)),
+                    ("layer_block", blocks.LayerBuild(tokens=s, oq=oq)),
+                ):
+                    out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
+                    res_out = torch.empty_like(out)
+                    side.run(key, sets[0], core, residual, out, res_out)
+                    torch.cuda.synchronize()
+                    runs[name] = key, out, res_out
+                cos = {
+                    n: cosine(a, b)
+                    for n, a, b in zip(
+                        ("out", "res_out"), runs["layer_block"][1:], runs["k2"][1:]
+                    )
+                }
+                bad += [
+                    f"oq {int(oq)} s{s}: {n} cosine against K2 {v:.6f} < {AGREE[n]}"
+                    for n, v in cos.items()
+                    if not v >= AGREE[n]
+                ]
+
+                def cycle(key, out, res_out):
+                    i = itertools.count()
+                    return lambda: side.run(
+                        key, sets[next(i) % D2_SETS], core, residual, out, res_out
+                    )
+
+                t = time_arms({name: cycle(*r) for name, r in runs.items()})
+                (k, kr), (b, br) = t["k2"], t["layer_block"]
+                log(
+                    f"d2 oq {int(oq)} s{s}: k2 {k:.2f} us, layer_block {b:.2f} us "
+                    f"({100 * (b - k) / k:+.1f}%), cosine out {cos['out']:.6f} "
+                    f"res_out {cos['res_out']:.6f}, rounds k2 {kr} layer_block {br}"
+                )
+            sets.clear()
+            torch.cuda.empty_cache()
+        if any(errors(side.epoch).values()):
+            bad.append(f"error words {errors(side.epoch)}")
+    finally:
+        side.close()
+    if bad:
+        print(f"[rank {rank}] d2: {bad}", flush=True)
+    return [] if all_ok(not bad) else ["d2"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
+    ap.add_argument("--time", action="store_true", help="run only decision D2's timing")
     args = ap.parse_args()
-    if args.case is not None:
-        fails = check_chain(args.case)
+    if args.case is not None or args.time:
+        fails = time_d2() if args.time else check_chain(args.case)
+        for f in fails:
+            log(f"FAIL {f}")
         dist.destroy_process_group()
         sys.exit(1 if fails else 0)
     fails = check_compile()
