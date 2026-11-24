@@ -16,8 +16,8 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | checkpoint | `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`, with MXFP4 routed experts, a bf16 shared expert and bf16 GDN projections |
 | GPU and TP | gfx950 on MI355X, TP 8 |
 | SGLang steps | decode and NEXTN verify |
-| widths | 1 to 8 for K1 and K2, from `layout.MAX_TOKENS`. 16 for `layer_block`, from `mono/layout.SPLIT_MAX`, with the fused shared expert only. |
-| launches per step | 161 on each rank in a decode step of 1 to 8 rows. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2. A verify step of 1 to 8 rows has 92, one K2 launch for each decoder layer. A step of 16 rows has 92, one `layer_block` launch for each decoder layer. |
+| widths | 1 to 8 for K1 and K2, from `layout.MAX_TOKENS`. 16 for `layer_block`, from `mono/layout.SPLIT_MAX`, with the fused shared expert only. With the fused shared expert, `layer_block` also replaces K2 at the widths of `spec.LAYER_WIDTHS` (2, 3 and 5 to 8). |
+| launches per step | 161 on each rank in a decode step of 1 to 8 rows. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2 (`layer_block` in place of K2 at the widths of `LAYER_WIDTHS`). A verify step of 1 to 8 rows has 92, one K2 or `layer_block` launch for each decoder layer. A step of 16 rows has 92, one `layer_block` launch for each decoder layer. |
 | other steps | SGLang's forward runs prefill, extend, the steps wider than 8 except 16, the steps of 16 rows without the fused shared expert, and the MTP draft model |
 
 | file | contents |
@@ -180,8 +180,10 @@ On each rank, `_build` makes two K1 launches for each CUDA graph width of 1 to 8
 model. One K1 launch is for layer 0, which has no residual input. The other K1 launch is for the other GDN layers.
 `_build` also makes one K2 launch for each width of 1 to 8, each shared-expert layout and each `o_proj` or `out_proj`
 dtype of the model. When each layer has the fused shared expert, it makes one `layer_block` launch for the width 16
-and each `o_proj` or `out_proj` dtype. Without the fused shared expert, a step of 16 rows runs SGLang's forward. It
-compiles them before the first step. With the MXFP4 projections, K2 and `layer_block` run `oq` on the GDN layers and
+and each `o_proj` or `out_proj` dtype. It then also makes `layer_block` launches in place of the K2 launches at the
+widths of `LAYER_WIDTHS`: at 1 and 4 rows, the `ug` tasks of `layer_block` (32 columns, K2 16) give its busiest CTA
+more work than K2. Without the fused shared expert, a step of 16 rows runs SGLang's forward. It compiles them before
+the first step. With the MXFP4 projections, K2 and `layer_block` run `oq` on the GDN layers and
 the bf16 build on the full-attention layers.
 The log shows "Qwen3.8 monokernel: N K1, M K2 and L layer_block launches (widths [...], decode) in T s". With
 speculative decoding, `_build` makes no K1 launch, and the log shows "verify" instead of "decode". In the NEXTN test,
@@ -229,10 +231,10 @@ checks at 1, 3 and 8 rows. The e2e servers keep the MXFP4 projections, so K1 run
 check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_proj: N" with N of at least 1. A second
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. This test
-also sends 16 requests, and check mode must log a `layer_block` check at 16 rows. Check mode compares `layer_block`
-as it compares K2, and the log names it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN
-server with the fused shared expert. Its verify steps have 4 to 16 rows. K2 serves the steps of up to 8 rows, and
-`layer_block` the steps of 16 rows.
+also sends 16 requests, and check mode must log a `layer_block` check at 16 rows. With the fused shared expert, the
+checks at 3 and 8 rows also run `layer_block`. Check mode compares `layer_block` as it compares K2, and the log names
+it `k2`. `TestMonokernelVerify` runs GSM8K at 4 concurrent requests on a NEXTN server with the fused shared expert.
+Its verify steps have 4 to 16 rows. K2 serves the steps of 4 rows, and `layer_block` the steps of 8 and 16 rows.
 
 ## 7. Limitations
 

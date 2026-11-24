@@ -2,11 +2,12 @@
 points: decode steps of 1 to 8 rows run K1 and K2, wider ones the normal path (16
 rows too, without the fused shared expert), and requests join and leave a running
 batch that steps past 8 rows and back (a short GSM8K run, for gross failures);
-NEXTN verify steps of up to 8 rows run K2, of 16 rows layer_block (with the fused
-shared expert); the tokens of covered steps scored again by the normal prefill
-path (KL consistency); each covered layer against SGLang's layer (check mode),
-with the MXFP4 GDN projections of sgl-project/sglang#43839, also with the fused
-shared expert of sgl-project/sglang#41899 (and layer_block at 16 rows); and a
+NEXTN verify steps of 4 rows run K2, of 8 and 16 rows layer_block (with the fused
+shared expert, layer_block runs at 2, 3, 5 to 8 and 16 rows); the tokens of
+covered steps scored again by the normal prefill path (KL consistency); each
+covered layer against SGLang's layer (check mode), with the MXFP4 GDN
+projections of sgl-project/sglang#43839, also with the fused shared expert of
+sgl-project/sglang#41899 (and layer_block at 3, 8 and 16 rows); and a
 fault on one rank that stops the server before any token of the failed step is
 sent."""
 
@@ -117,8 +118,8 @@ class TestMonokernelVerify(CustomTestCase):
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_past_the_largest_width(self):
-        # 4 requests at a time: verify steps of 4 to 16 rows, K2 up to 8,
-        # layer_block at 16
+        # 4 requests at a time: verify steps of 4 to 16 rows, K2 at 4,
+        # layer_block at 8 and 16
         metrics = _gsm8k(4)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
@@ -136,11 +137,13 @@ class TestMonokernelCheck(CustomTestCase):
         # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
         log = self._check(["--enforce-shared-experts-fusion"], wide=True)
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
+        # K2 at 1 and 4 rows, layer_block at LAYER_WIDTHS and 16 (bf16 and MXFP4 o_proj)
+        self.assertIn("16 K1, 4 K2 and 14 layer_block launches", log)
 
     def _check(self, extra_args=(), wide=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
-        # 1, 3 and 8 rows run widths 1, 3 and 8, and with `wide` 16 rows run
-        # layer_block (checked as k2)
+        # 1, 3 and 8 rows run widths 1, 3 and 8, and with `wide` 3, 8 and 16 rows
+        # run layer_block (checked as k2)
         widths = (1, 3, 8, 16) if wide else (1, 3, 8)
         para = "The river valley archive lists the flood height of every year. "
         with (
