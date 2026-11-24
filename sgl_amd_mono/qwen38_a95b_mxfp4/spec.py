@@ -20,7 +20,8 @@ layers.
 A step of 16 rows (decode or verify) runs SGLang's GDN or attention up to
 out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
 from vllm-project/vllm#67421) in place of K2. It keeps no x tile in LDS, so it
-takes the rows K2 cannot; it needs the fused shared expert.
+takes the rows K2 cannot; it needs the fused shared expert. With the fused
+shared expert, it also runs in place of K2 at the widths of ``LAYER_WIDTHS``.
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sgl-project/sglang#43839)
@@ -69,6 +70,10 @@ logger = logging.getLogger(__name__)
 # the rows a launch takes (decode requests, or verify tokens): 1 to MAX_TOKENS
 # (K1, K2), or SPLIT_MAX (layer_block)
 WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX)
+# the widths up to MAX_TOKENS where layer_block (fused shared expert) runs in
+# place of K2: at 1 and 4 rows its gate | up tasks (32 columns, K2's 16) leave
+# its busiest CTA more work than K2's
+LAYER_WIDTHS = (2, 3, 5, 6, 7, 8)
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
@@ -550,7 +555,7 @@ class _Built:
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
         key = self.k2_keys[s, fse, oq]
-        wide = s > L.MAX_TOKENS
+        wide = isinstance(key, blocks.LayerBuild)
         shared = (
             {}
             if wide
@@ -668,6 +673,11 @@ def _build(model, hf_config, ctx) -> _Built:
                         fault_after=fault_after,
                     )
     outs = {x.linear_attn.out_proj if _is_gdn(x) else x.o_proj for x in layers}
+    fse_all = all(_fse(x.mlp) for x in layers)
+
+    def wide(w):
+        return fse_all and (w > L.MAX_TOKENS or w in LAYER_WIDTHS)
+
     k2_keys = {
         (w, fse, oq): k2.K2Build(
             tokens=w,
@@ -678,23 +688,22 @@ def _build(model, hf_config, ctx) -> _Built:
             fault_after=fault_after,
         )
         for w in narrow
+        if not wide(w)
         for fse in sorted({_fse(x.mlp) for x in layers})
         for oq in sorted({_mxfp4(o) for o in outs})
     }
-    wide_keys = {}
-    if all(_fse(x.mlp) for x in layers):
-        wide_keys = {
-            (w, True, oq): blocks.LayerBuild(
-                tokens=w,
-                eps=e2,
-                oq=oq,
-                fault_site=fault_site,
-                fault_after=fault_after,
-            )
-            for w in ctx.widths
-            if w > L.MAX_TOKENS
-            for oq in sorted({_mxfp4(o) for o in outs})
-        }
+    wide_keys = {
+        (w, True, oq): blocks.LayerBuild(
+            tokens=w,
+            eps=e2,
+            oq=oq,
+            fault_site=fault_site,
+            fault_after=fault_after,
+        )
+        for w in ctx.widths
+        if wide(w)
+        for oq in sorted({_mxfp4(o) for o in outs})
+    }
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)
     ticks = guard.deadline_ticks(ctx.deadline_s)
     lo = ticks & 0xFFFFFFFF
