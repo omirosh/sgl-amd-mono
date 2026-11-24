@@ -3,16 +3,17 @@ points: decode steps of 1 to 8 rows run K1 and K2, of 16 rows layer_block with t
 bf16 shared expert (with the fused shared expert, decode steps of 12 and 16 rows
 run the split GDN launch and layer_block in graph 16, scored again by the normal
 prefill path), and requests join and leave a running batch that steps past 8
-rows and back (a short GSM8K run, for gross failures); NEXTN verify steps of up to
-8 rows run K2, of 16 rows layer_block and of 32 rows the wide launches (with the
-fused shared expert); the tokens of covered steps scored again by the normal
-prefill path (KL consistency); each covered layer against SGLang's layer (check
-mode, with layer_block at 16 rows), with the MXFP4 GDN projections of
+rows and back (a short GSM8K run, for gross failures); NEXTN verify steps of 4
+rows run K2, of 8 and 16 rows layer_block and of 32 rows the wide launches (with
+the fused shared expert, layer_block runs at 2, 3, 5 to 8 and 16 rows); the
+tokens of covered steps scored again by the normal prefill path (KL
+consistency); each covered layer against SGLang's layer (check mode, with
+layer_block at 16 rows), with the MXFP4 GDN projections of
 sgl-project/sglang#43839, also with the fused shared expert of
-sgl-project/sglang#41899 (and at 16 rows the split GDN launch and layer_block, at
-32 the wide launches, with the GDN front in a decode step: its conv and SSM state
-rows checked too); and a fault on one rank that stops the server before any token
-of the failed step is sent."""
+sgl-project/sglang#41899 (and layer_block at 3, 8 and 16 rows, at 16 rows the
+split GDN launch, at 32 the wide launches, with the GDN front in a decode step:
+its conv and SSM state rows checked too); and a fault on one rank that stops the
+server before any token of the failed step is sent."""
 
 import json
 import math
@@ -159,8 +160,8 @@ class TestMonokernelVerify(CustomTestCase):
             terminate_and_kill_process_tree(cls.process)
 
     def test_gsm8k_past_the_largest_width(self):
-        # 8 requests at a time: verify steps of 4 to 32 rows, K2 up to 8,
-        # layer_block at 16, the wide launches at 32
+        # 8 requests at a time: verify steps of 4 to 32 rows, K2 at 4,
+        # layer_block at 8 and 16, the wide launches at 32
         metrics = _gsm8k(8)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], GSM8K_BOUND)
@@ -171,7 +172,7 @@ class TestMonokernelCheck(CustomTestCase):
         # SGLang quantizes the GDN projections to MXFP4 by default
         # (sgl-project/sglang#43839), so K1 runs qq and K2 oq; 16 rows run
         # layer_block with the bf16 shared expert
-        log = self._check(wide=True)
+        log = self._check()
         self.assertRegex(log, r"Online MXFP4 GDN in_proj_qkvz,out_proj: [1-9]")
 
     def test_each_covered_layer_with_the_fused_shared_expert(self):
@@ -179,22 +180,23 @@ class TestMonokernelCheck(CustomTestCase):
         # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
         log = self._check(
             ["--enforce-shared-experts-fusion", "--max-running-requests", "32"],
-            wide=True,
+            fse=True,
         )
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
-        # one in_proj_qkvz format: a split launch for layer 0 and one for the
-        # others; the decode step's GDN fronts: the first layer and a GDN layer
+        # K2 at 1 and 4 rows, layer_block at LAYER_WIDTHS and 16 (bf16 and MXFP4
+        # o_proj); one in_proj_qkvz format: a split launch for layer 0 and one for
+        # the others; the decode step's GDN fronts: the first layer and a GDN layer
         # before a GDN layer (both quantize their closing rows for that
         # in_proj_qkvz), a GDN layer before an attention layer, an attention layer
         # before a GDN layer, and the last layer
-        self.assertIn("layer_block, 2 split and 5 wide launches", log)
+        self.assertIn("16 K1, 4 K2, 14 layer_block, 2 split and 5 wide launches", log)
 
-    def _check(self, extra_args=(), wide=False):
+    def _check(self, extra_args=(), fse=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
-        # 1, 3 and 8 rows run widths 1, 3 and 8, and with `wide` 16 rows run
-        # the split launch (checked as k1) and layer_block (checked as k2), and 32
-        # rows the wide launches
-        widths = (1, 3, 8, 16, 32) if wide else (1, 3, 8)
+        # 1, 3 and 8 rows run widths 1, 3 and 8, and 16 rows layer_block (checked
+        # as k2); with `fse`, 3 and 8 rows run layer_block too, 16 rows also the
+        # split launch (checked as k1), and 32 rows the wide launches
+        widths = (1, 3, 8, 16, 32) if fse else (1, 3, 8, 16)
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -237,8 +239,9 @@ class TestMonokernelCheck(CustomTestCase):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} checks)")
         seen = {(kind, int(rows)) for kind, rows, _ in checks}
         want = {(kind, rows) for kind in ("k1", "k2") for rows in (1, 3, 8)}
-        want |= {(kind, 16) for kind in ("k1", "k2") if 16 in widths}
-        want |= {("wide", rows) for rows in widths if rows > 16}
+        want.add(("k2", 16))
+        if fse:
+            want |= {("k1", 16), ("wide", 32)}
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))

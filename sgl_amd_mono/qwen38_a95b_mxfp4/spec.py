@@ -20,8 +20,9 @@ layers.
 A step of 16 rows (decode or verify) runs SGLang's GDN or attention up to
 out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
 from vllm-project/vllm#67421) in place of K2. It keeps no x tile in LDS, so it
-takes the rows K2 cannot, with or without the fused shared expert. In a decode
-16 rows, a GDN layer runs its front as one split launch (``gfx950/wide/layer.py``,
+takes the rows K2 cannot, with or without the fused shared expert. With the
+fused shared expert, it also runs in place of K2 at the widths of
+``LAYER_WIDTHS``. In a decode step of 16 rows, a GDN layer runs its front as one split launch (``gfx950/wide/layer.py``,
 the ``gdn`` kind at 16 rows, from vllm-project/vllm#67421 at 28f094565b and
 vllm-project/vllm#67678 at ce476ce305) in place of SGLang's GDN: input norm, in_proj_qkvz and in_proj_ba, the conv and the gated delta rule
 with their state updates, and the gated norm, as K1 does.
@@ -84,6 +85,10 @@ logger = logging.getLogger(__name__)
 # (K1, K2), SPLIT_MAX (layer_block) or WIDE (the wide launches)
 WIDE = 32
 WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX, WIDE)
+# the widths up to MAX_TOKENS where layer_block (fused shared expert) runs in
+# place of K2: at 1 and 4 rows its gate | up tasks (32 columns, K2's 16) leave
+# its busiest CTA more work than K2's
+LAYER_WIDTHS = (2, 3, 5, 6, 7, 8)
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
@@ -965,7 +970,7 @@ class _Built:
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
         key = self.k2_keys[s, fse, oq, oh]
-        wide = s > L.MAX_TOKENS
+        wide = isinstance(key, blocks.LayerBuild)
         (blocks.layer_block if wide else k2.layer_post)(
             key,
             core=core,
@@ -1080,6 +1085,10 @@ def _build(model, hf_config, ctx) -> _Built:
                     )
     outs = {x.linear_attn.out_proj if _is_gdn(x) else x.o_proj for x in layers}
     out_formats = sorted({_format(o) for o in outs})
+
+    def layer_block_at(w, fse):
+        return L.MAX_TOKENS < w <= ML.SPLIT_MAX or (fse and w in LAYER_WIDTHS)
+
     k2_keys = {
         (w, fse, oq, oh): k2.K2Build(
             tokens=w,
@@ -1092,6 +1101,7 @@ def _build(model, hf_config, ctx) -> _Built:
         )
         for w in narrow
         for fse in sorted({_fse(x.mlp) for x in layers})
+        if not layer_block_at(w, fse)
         for oq, oh in out_formats
     }
     wide_keys = {
@@ -1105,8 +1115,8 @@ def _build(model, hf_config, ctx) -> _Built:
             fault_after=fault_after,
         )
         for w in ctx.widths
-        if L.MAX_TOKENS < w <= ML.SPLIT_MAX
         for fse in sorted({_fse(x.mlp) for x in layers})
+        if layer_block_at(w, fse)
         for oq, oh in out_formats
     }
     builds_wide = _builds_wide(model, layers, ctx.widths)
@@ -1127,10 +1137,13 @@ def _build(model, hf_config, ctx) -> _Built:
     peer.bytes.zero_()
     torch.cuda.synchronize()
     torch.distributed.barrier(group=group)  # no peer writes before its owner zeroed
-    k2_scratch = _scratch(k2_keys, k2.scratch_bytes, device)
-    k2_scratch |= _scratch(
-        wide_keys,
-        lambda k: blocks.scratch_bytes(blocks.layer_scratch_layout(k)),
+    k2_scratch = _scratch(
+        k2_keys | wide_keys,
+        lambda k: (
+            blocks.scratch_bytes(blocks.layer_scratch_layout(k))
+            if isinstance(k, blocks.LayerBuild)
+            else k2.scratch_bytes(k)
+        ),
         device,
     )
     split, split_keys = None, []
