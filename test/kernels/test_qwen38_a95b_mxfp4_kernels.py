@@ -156,6 +156,15 @@ class TestQwen38MoeD2(CustomTestCase):
             with self.subTest(args=args):
                 self.assertEqual(_run("check_k2.py", *args, ranks=8), 0)
 
+    def test_ug16(self):
+        """layer_block with 16-column ug tasks (lb16) at 1 .. 7 rows, and the phase table."""
+        for args in (
+            ("--time", "--rows", "1,2,3,4,5,6,7"),
+            ("--timeline", "--rows", "1,4,7"),
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(_run("check_k2.py", *args, ranks=8), 0)
+
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 @unittest.skipUnless(_has(SGLANG_43516), "needs the sgl-project/sglang#43516 kernels")

@@ -87,7 +87,7 @@ LAYER_XQ_MIN = 5
 SPLIT_MIN = 8
 
 assert SPLIT_MIN >= PS_MIN
-assert OTASKS == 2 * BLOCKS and PS0 + L.RI // moe.UG_COLS <= BLOCKS
+assert OTASKS == 2 * BLOCKS and PS0 + 2 * L.RI // moe.UG_COLS <= BLOCKS
 assert RIP % 128 == 0 and k2.TAG_SLOTS == moe.TAG_SLOTS
 
 _STREAM = fx.Stream(None)
@@ -106,6 +106,8 @@ class LayerBuild(msgspec.Struct, frozen=True):
     stop: bool = True
     # each CTA marks the end of each phase (k2.TL_PHASES) in a scratch timeline (tests)
     timeline: bool = False
+    # ug tasks of 16 columns with an fp32 INTER, as K2's (below SPLIT_MIN rows)
+    ug16: bool = False
 
     @property
     def u1(self) -> bool:
@@ -164,7 +166,7 @@ def layer_scratch_layout(key: LayerBuild) -> dict:
             "rpart": R_TASKS * s * ROWS,
             "sgate": s,
             "route": s * 2 * TOPK,
-            "inter": s * KT * moe.inter_pairs(MOE),
+            "inter": s * KT * (MOE.ri if key.ug16 else moe.inter_pairs(MOE)),
         }.items()
     )
     lay |= pair_layout([("xbuf", s * H * 2 // 8)], 16, scratch_bytes(lay))
@@ -303,6 +305,7 @@ def build_layer(key: LayerBuild):
         return _LAYER[key]
     s = key.tokens
     need(1 <= s <= MAXT, f"{s} rows, layer_block takes 1..{MAXT}")
+    need(not (key.ug16 and key.split), f"ug16 takes fewer than {SPLIT_MIN} rows")
     scr = layer_scratch_layout(key)
     max_u = s * TOPK + 1  # distinct experts the step can touch + the fused shared
     d = MOE
@@ -340,6 +343,8 @@ def build_layer(key: LayerBuild):
     name = f"qwen38_mono_layer_s{s}_o{int(key.oq)}_a{int(key.og)}"
     if key.timeline:
         name += "_tl"
+    if key.ug16:
+        name += "_u16"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def klayer(
@@ -410,6 +415,7 @@ def build_layer(key: LayerBuild):
                 "og": key.og,
                 "shuffled": True,
                 "u1": key.u1,
+                "ug16": key.ug16,
                 "KT": KT,
                 "kof_t": s,
                 "max_u": max_u,

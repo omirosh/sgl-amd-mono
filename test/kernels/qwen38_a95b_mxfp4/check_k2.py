@@ -19,7 +19,9 @@ SGLang's layouts:
 fused shared expert, bf16 and MXFP4 o_proj. At each width the two outputs agree
 (cosine), then each arm's time a launch comes from a CUDA graph that cycles
 through D2_SETS weight sets, so that no layer stays in the MALL between launches.
-``--timeline`` prints the phase table of both kernels instead; ``--rows`` picks
+Below SPLIT_MIN rows, layer_block with 16-column ug tasks (lb16) runs too, and its
+out and res_out must equal layer_block's bit for bit.
+``--timeline`` prints the phase table of the kernels instead; ``--rows`` picks
 the widths, ``--ps-min`` / ``--xq-min`` move layer_block's thresholds.
 """
 
@@ -93,10 +95,11 @@ def scratch_bytes(key):
         return max(
             blocks.scratch_bytes(
                 blocks.layer_scratch_layout(
-                    blocks.LayerBuild(tokens=s, oq=q, timeline=tl)
+                    blocks.LayerBuild(tokens=s, oq=q, timeline=tl, ug16=u)
                 )
             )
             for q in (False, True)
+            for u in (False, s < blocks.SPLIT_MIN)
         )
     return max(
         k2.scratch_bytes(k2.K2Build(tokens=s, fse=f, oq=q, timeline=tl))
@@ -506,19 +509,25 @@ def time_arms(arms) -> dict:
     return {k: (statistics.median(v), v) for k, v in rows.items()}
 
 
+def d2_arms(s, oq):
+    """K2, layer_block and below SPLIT_MIN rows layer_block with 16-column ug
+    tasks (lb16)."""
+    arms = {
+        "k2": k2.K2Build(tokens=s, fse=True, oq=oq),
+        "layer_block": blocks.LayerBuild(tokens=s, oq=oq),
+    }
+    if s < blocks.SPLIT_MIN:
+        arms["lb16"] = blocks.LayerBuild(tokens=s, oq=oq, ug16=True)
+    return arms
+
+
 def time_d2(rows):
-    """Decision D2: K2 and layer_block at each width of ``rows``, fused shared
-    expert, bf16 and MXFP4 o_proj, on the same inputs and weight sets."""
+    """Decision D2: K2 and layer_block (`d2_arms`) at each width of ``rows``,
+    fused shared expert, bf16 and MXFP4 o_proj, on the same inputs and weight
+    sets. lb16's out and res_out must equal layer_block's."""
     widths = []
     for s in rows:
-        keys = [
-            key
-            for oq in (False, True)
-            for key in (
-                k2.K2Build(tokens=s, fse=True, oq=oq),
-                blocks.LayerBuild(tokens=s, oq=oq),
-            )
-        ]
+        keys = [key for oq in (False, True) for key in d2_arms(s, oq).values()]
         if compile_keys(keys):
             widths.append(s)
         else:
@@ -535,10 +544,7 @@ def time_d2(rows):
                 residual = rnd(gen(DEV, 800 + s), s, HIDDEN)
                 core = rnd(gen(DEV, 900 + 1000 * rank + s), s, CORE)
                 runs = {}
-                for name, key in (
-                    ("k2", k2.K2Build(tokens=s, fse=True, oq=oq)),
-                    ("layer_block", blocks.LayerBuild(tokens=s, oq=oq)),
-                ):
+                for name, key in d2_arms(s, oq).items():
                     out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
                     res_out = torch.empty_like(out)
                     side.run(key, sets[0], core, residual, out, res_out)
@@ -555,6 +561,10 @@ def time_d2(rows):
                     for n, v in cos.items()
                     if not v >= AGREE[n]
                 ]
+                if "lb16" in runs and not all(
+                    map(torch.equal, runs["lb16"][1:], runs["layer_block"][1:])
+                ):
+                    bad.append(f"oq {int(oq)} s{s}: lb16 differs from layer_block")
 
                 def cycle(key, out, res_out):
                     i = itertools.count()
@@ -564,10 +574,16 @@ def time_d2(rows):
 
                 t = time_arms({name: cycle(*r) for name, r in runs.items()})
                 (k, kr), (b, br) = t["k2"], t["layer_block"]
+                u = (
+                    f", lb16 {t['lb16'][0]:.2f} us ({100 * (t['lb16'][0] - k) / k:+.1f}%)"
+                    f" rounds {t['lb16'][1]}"
+                    if "lb16" in t
+                    else ""
+                )
                 log(
                     f"d2 oq {int(oq)} s{s}: k2 {k:.2f} us, layer_block {b:.2f} us "
                     f"({100 * (b - k) / k:+.1f}%), cosine out {cos['out']:.6f} "
-                    f"res_out {cos['res_out']:.6f}, rounds k2 {kr} layer_block {br}"
+                    f"res_out {cos['res_out']:.6f}, rounds k2 {kr} layer_block {br}{u}"
                 )
             sets.clear()
             torch.cuda.empty_cache()
@@ -596,6 +612,7 @@ def time_phases(rows, replays=50, chain=4):
         for n, b, f in (
             ("k2", k2.K2Build, {"fse": True}),
             ("lb", blocks.LayerBuild, {}),
+            *([("lb16", blocks.LayerBuild, {"ug16": True})] * (s < blocks.SPLIT_MIN)),
         )
     }
     if not compile_keys(k for pair in arms.values() for k in pair):

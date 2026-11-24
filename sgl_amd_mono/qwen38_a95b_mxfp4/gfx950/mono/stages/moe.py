@@ -812,26 +812,51 @@ def ug_put(c, slot, g, hv0, hv1, shared):
 
 
 @traced
+def ug_put16(c, slot, j, hv, shared):
+    """Half task j's silu(g) u (`ug_half`: columns 16 j + 2 cp, + 1 of token
+    tid / 8) -> the pick's fp32 INTER (`load_inter` quantizes it)."""
+    s, tid, rt, d = c["S"], c["tid"], c["rt"], c["moe"]
+    i = fx.min(tid // 8, s - 1)
+    cp = tid % 8
+    if const_expr(shared):
+        k = fx.Int32(TOPK)
+    else:
+        k = fx.ptr_load(rt["kof"] + (slot * kof_t(c) + i))
+    if (tid < s * 8) & (k >= 0):
+        at = (i * c["KT"] + k) * d.ri + 16 * j + 2 * cp
+        c["put_words"](c["inter"], at, [v.bitcast(fx.Int32) for v in hv])
+
+
+@traced
 def run_ug(c, ps, ps0, x_to_lds):
     """The routed experts' gate | up: x into LDS (`x_to_lds`, as MXFP4
     codes) while the logits come in, the route, then the union's ug tasks
     over every CTA, a task's halves in turn with the next half's weights in
     flight. `ps`: the fused shared expert's tasks run first on CTAs `ps0`
-    .. (they need no route). Returns |U|."""
-    bid, d = c["bid"], c["moe"]
-    groups = d.ri // UG_COLS
+    .. (they need no route). With `c["ug16"]` a task is one half (16
+    columns, fp32 INTER) with the next task's weights in flight, as K2's.
+    Returns |U|."""
+    bid, d, h16 = c["bid"], c["moe"], c["ug16"]
+    groups = d.ri // UG_COLS * (1 + int(h16))
     is_ps = (bid >= ps0) & (bid < ps0 + groups)
     if const_expr(ps):
         gi = fx.min(fx.max(bid - ps0, 0), groups - 1)
-        sops = [ug_loads(c, gi, h, is_ps, True) for h in range(2)]
+        if const_expr(h16):
+            sops = [ug_loads(c, gi // 2, gi % 2, is_ps, True)]
+        else:
+            sops = [ug_loads(c, gi, h, is_ps, True) for h in range(2)]
     x_to_lds()
     stamp(c, 4)  # x in and quantized: one step here
     stamp(c, 5)
     if const_expr(ps):  # noqa: SIM102 (traced: `and` does not combine traced values)
         if is_ps:
-            hv0 = ug_half(c, bid - ps0, 0, sops[0])
-            hv1 = ug_half(c, bid - ps0, 1, sops[1])
-            ug_put(c, 0, bid - ps0, hv0, hv1, True)
+            if const_expr(h16):
+                j = bid - ps0
+                ug_put16(c, 0, j, ug_half(c, j // 2, j % 2, sops[0]), True)
+            else:
+                hv0 = ug_half(c, bid - ps0, 0, sops[0])
+                hv1 = ug_half(c, bid - ps0, 1, sops[1])
+                ug_put(c, 0, bid - ps0, hv0, hv1, True)
     local_route(c)
     nu = load_route(c)
     stamp(c, 6)
@@ -840,6 +865,20 @@ def run_ug(c, ps, ps0, x_to_lds):
     # reversed placement: the round's leftover tasks go to the high CTAs,
     # past the reduction ones; a prefetch past the last task loads nothing
     task = BLOCKS - 1 - bid
+    if const_expr(h16):
+
+        def loads(n):
+            m = fx.min(n, last)
+            return ug_loads(c, m // 2, m % 2, n <= last)
+
+        ops = loads(task)
+        while task < total:
+            nxt = loads(task + BLOCKS)
+            hv = ug_half(c, task // 2, task % 2, ops)
+            ug_put16(c, task // groups, task % groups, hv, False)
+            ops = nxt
+            task = task + BLOCKS
+        return nu
 
     def half_loads(n, h):
         return ug_loads(c, fx.min(n, last), h, n <= last)
@@ -895,6 +934,9 @@ def load_inter(c, cut=None, early=True):
     ri, rip = d.ri, d.rip
     ir = irow(d)
     nb = rip // 32
+    if const_expr(c["ug16"]):
+        assert cut is None and rip == ri
+        return _load_inter_f32(c)
     pp = inter_pairs(d) // 2  # pair pairs a pick (code words and codes apart)
     n = s * kt * pp
     per = (n + THREADS - 1) // THREADS
@@ -945,6 +987,42 @@ def load_inter(c, cut=None, early=True):
                 fx.Int32(127),
                 c["il"]
                 + (iq_scales(d, s, kt) + (tid // pb) * nb + ri // 32 + tid % pb),
+            )
+    gpu.barrier()
+
+
+@traced
+def _load_inter_f32(c):
+    """Every pick's fp32 INTER (`ug_put16`) through MXFP4 by 32 columns (RCEIL
+    scale, the block's 16 column pairs on 16 lanes), as `ug_put` quantizes it
+    -> LDS as `load_inter`'s, a poll batch at a time."""
+    s, tid, d, kt = c["S"], c["tid"], c["moe"], c["KT"]
+    n = s * kt * d.ri // 2
+    per = (n + THREADS - 1) // THREADS
+    got = []
+    for i in range_constexpr(per):
+        if const_expr(i % POLL_MAX == 0):
+            js = range(i, min(i + POLL_MAX, per))
+            got = c["poll"](
+                [(c["inter"], 2 * fx.min(tid + THREADS * j, n - 1), 2) for j in js]
+            )
+        p = fx.min(tid + THREADS * i, n - 1)
+        pick = p // (d.ri // 2)
+        cp = p % (d.ri // 2)
+        h0, h1 = (f32_of(w) for w in got[i % POLL_MAX])
+        amax = fx.max(fx.Float32(fmath.absf(h0)), fx.Float32(fmath.absf(h1)))
+        for off in range_constexpr(4):
+            amax = xred(amax, 1 << off, fx.max)
+        e = mx_scale(amax)
+        v = pk_fp4_f32(fx.Int32(0), h0, h1, pow2(e), 0) << (8 * (cp % 4))
+        for off in range_constexpr(2):
+            v = xred(v, 1 << off, lambda a, b: a | b)
+        ok = tid + THREADS * i < n
+        if ok & (cp % 4 == 0):
+            fx.ptr_store(v, c["il"] + (pick * irow(d) + cp) // 4)
+        if ok & (cp % 16 == 0):
+            fx.ptr_store(
+                e, c["il"] + (iq_scales(d, s, kt) + pick * (d.rip // 32) + cp // 16)
             )
     gpu.barrier()
 
