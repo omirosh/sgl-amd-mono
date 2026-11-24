@@ -34,6 +34,7 @@ from flydsl.expr.typing import Int32, Int64
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.plan import kernel_sources, key_tuple
+from sgl_amd_mono.common.stamps import TL_POINTS, stamp, timeline_row
 from sgl_amd_mono.common.sync import Mailbox, preg, sreg
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950._k3 import KernelAbi, shift
@@ -103,6 +104,8 @@ class LayerBuild(msgspec.Struct, frozen=True):
     fault_after: int = 0
     # False: a failed wait keeps the launch running and leaves its error words (tests)
     stop: bool = True
+    # each CTA marks the end of each phase (k2.TL_PHASES) in a scratch timeline (tests)
+    timeline: bool = False
 
     @property
     def u1(self) -> bool:
@@ -167,6 +170,8 @@ def layer_scratch_layout(key: LayerBuild) -> dict:
     lay |= pair_layout([("xbuf", s * H * 2 // 8)], 16, scratch_bytes(lay))
     if key.xq:
         lay |= pair_layout([("xq", N.xq_dwords(s) // 2)], 16, scratch_bytes(lay))
+    if key.timeline:
+        lay |= pair_layout([("timeline", BLOCKS * TL_POINTS)], 16, scratch_bytes(lay))
     return lay
 
 
@@ -333,6 +338,8 @@ def build_layer(key: LayerBuild):
 
     keyed = key_tuple(key, SOURCES)
     name = f"qwen38_mono_layer_s{s}_o{int(key.oq)}_a{int(key.og)}"
+    if key.timeline:
+        name += "_tl"
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def klayer(
@@ -444,6 +451,9 @@ def build_layer(key: LayerBuild):
             }
             for region in LAYER_REGIONS:
                 c[region] = sreg(scratch, scr[region][0], region)
+            if const_expr(key.timeline):
+                c["tl"] = timeline_row(scratch, scr["timeline"][0], bid)
+            stamp(c, 0)
             src = (c["xbuf"], CM_DEV, residual)
             is_r = (bid >= R0) & (bid < RT0)
             is_g = (bid >= RT0) & (bid < RT0 + s)
@@ -462,21 +472,26 @@ def build_layer(key: LayerBuild):
                 moe.run_oproj(
                     c, [moe.o_loads(c, bid + BLOCKS * j, ck) for j in range(2)], ck
                 )
+            stamp(c, 1)
             if bid < NRED:
                 N.stage_norm(c, bid)
                 if const_expr(key.xq):
                     N.load_rstd(c)
                     N.stage_xq(c, bid, src)
+            stamp(c, 2)
             if is_g:
                 N.load_rstd(c)
                 N.stage_sgate(c, bid - RT0, src)
+            stamp(c, 3)
             # ---- the routed experts, then down: two row groups a CTA
             missing = ~(is_r | is_g)
             nu = moe.run_ug(c, key.ps, PS0, lambda: _x_ug(c, src, key.xq, missing))
+            stamp(c, 7)
             dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1))
             if const_expr(key.split):
                 cut = moe.early_slots(c, nu)
                 moe.load_inter(c, cut, True)
+                stamp(c, 8)
                 b2 = bid + BLOCKS
                 moe.down_zero(c, 2)
                 dops = moe.down_slots(c, bid, nu, dops, 0, cut, (b2, 0, cut))
@@ -488,10 +503,13 @@ def build_layer(key: LayerBuild):
                 moe.down_put(c, b2, 1)
             else:
                 moe.load_inter(c)
+                stamp(c, 8)
                 dops2 = moe.stage_down(c, bid, nu, dops, bid + BLOCKS)
                 moe.stage_down(c, bid + BLOCKS, nu, dops2)
+            stamp(c, 9)
             if bid < NRED:
                 N.stage_final(c, bid)
+            stamp(c, 10)
 
     @flyc.jit
     def launch(
