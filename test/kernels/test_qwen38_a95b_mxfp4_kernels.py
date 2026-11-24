@@ -154,6 +154,14 @@ class TestQwen38MoeK2(CustomTestCase):
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
+class TestQwen38MoeD2(CustomTestCase):
+    """Decision D2: K2 against layer_block at 1 .. 8 rows (``check_k2.py --time``)."""
+
+    def test_time(self):
+        self.assertEqual(_run("check_k2.py", "--time", ranks=8), 0)
+
+
+@unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 @unittest.skipUnless(_has(SGLANG_43516), "needs the sgl-project/sglang#43516 kernels")
 class TestQwen38MoePort(CustomTestCase):
     def test_bitwise_against_sglang_43516(self):
