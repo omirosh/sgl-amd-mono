@@ -19,6 +19,8 @@ SGLang's layouts:
 fused shared expert, bf16 and MXFP4 o_proj. At each width the two outputs agree
 (cosine), then each arm's time a launch comes from a CUDA graph that cycles
 through D2_SETS weight sets, so that no layer stays in the MALL between launches.
+``--timeline`` prints the phase table of both kernels instead; ``--rows`` picks
+the widths, ``--ps-min`` / ``--xq-min`` move layer_block's thresholds.
 """
 
 import argparse
@@ -35,6 +37,7 @@ from inputs import BF, CORE, HIDDEN, MAXT, epoch, errors, gen, k2_weights, rnd
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.common.stamps import TL_POINTS
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import blocks
@@ -85,16 +88,18 @@ def is_wide(key) -> bool:
 def scratch_bytes(key):
     """The scratch of key's width and kind: its largest variant's, as the spec's
     ``_scratch``."""
-    s = key.tokens
+    s, tl = key.tokens, key.timeline
     if is_wide(key):
         return max(
             blocks.scratch_bytes(
-                blocks.layer_scratch_layout(blocks.LayerBuild(tokens=s, oq=q))
+                blocks.layer_scratch_layout(
+                    blocks.LayerBuild(tokens=s, oq=q, timeline=tl)
+                )
             )
             for q in (False, True)
         )
     return max(
-        k2.scratch_bytes(k2.K2Build(tokens=s, fse=f, oq=q))
+        k2.scratch_bytes(k2.K2Build(tokens=s, fse=f, oq=q, timeline=tl))
         for f in (False, True)
         for q in (False, True)
     )
@@ -115,7 +120,7 @@ class Side:
 
     def run(self, key, w, core, residual, out, res_out, layer=0, bump=True):
         """``bump=False``: the next layer of the epoch, as the spec's step."""
-        slot = is_wide(key), key.tokens
+        slot = is_wide(key), key.tokens, key.timeline
         if slot not in self.scratch:
             n = scratch_bytes(key)
             self.scratch[slot] = torch.zeros(n, dtype=torch.uint8, device=DEV)
@@ -501,11 +506,11 @@ def time_arms(arms) -> dict:
     return {k: (statistics.median(v), v) for k, v in rows.items()}
 
 
-def time_d2():
-    """Decision D2: K2 and layer_block at each width 1 .. MAXT, fused shared
+def time_d2(rows):
+    """Decision D2: K2 and layer_block at each width of ``rows``, fused shared
     expert, bf16 and MXFP4 o_proj, on the same inputs and weight sets."""
     widths = []
-    for s in range(1, MAXT + 1):
+    for s in rows:
         keys = [
             key
             for oq in (False, True)
@@ -519,7 +524,7 @@ def time_d2():
         else:
             log(f"d2 s{s}: a key does not compile, the width is skipped")
     side = Side()
-    bad = [f"s{s}: does not compile" for s in range(1, MAXT + 1) if s not in widths]
+    bad = [f"s{s}: does not compile" for s in rows if s not in widths]
     try:
         for oq in (False, True):
             sets = [
@@ -575,14 +580,137 @@ def time_d2():
     return [] if all_ok(not bad) else ["d2"]
 
 
+def time_phases(rows, replays=50, chain=4):
+    """``--timeline``: the phases of K2 and layer_block (fused shared expert,
+    MXFP4 o_proj) at each width of ``rows``, rank 0, the median of graph
+    replays. A graph runs ``chain`` launches back to back, as a step's layers
+    do, and the marks are the last launch's: the ranks start it together, so
+    its waits hold no start skew of the ranks. A phase's time is when the last
+    CTA of its group ends it (p50: the median CTA), from the first CTA's start
+    (s_memrealtime, 100 MHz). ``graph`` is a replay's event time over
+    ``chain``. The timeline build's out and res_out must equal the plain
+    build's."""
+    arms = {
+        (n, s): (b(tokens=s, oq=True, **f), b(tokens=s, oq=True, timeline=True, **f))
+        for s in rows
+        for n, b, f in (
+            ("k2", k2.K2Build, {"fse": True}),
+            ("lb", blocks.LayerBuild, {}),
+        )
+    }
+    if not compile_keys(k for pair in arms.values() for k in pair):
+        return ["timeline: compile"]
+    w = k2_weights(DEV, rank, 700, fse=True, oq=True)
+    side, cols, same = Side(), {}, True
+    try:
+        for (n, s), (plain, key) in arms.items():
+            m = blocks if is_wide(key) else k2
+            b = torch.arange(m.BLOCKS)
+            router = (b >= m.R0) & (b < m.R0 + m.R_TASKS)
+            groups = [
+                ("launch", 0, b >= 0, "max"),
+                ("o_proj", 1, ~router, "max"),
+                ("router", 1, router, "max"),
+                ("norm", 2, b < m.NRED, "max"),
+                ("sgate", 3, (b >= m.RT0) & (b < m.RT0 + s), "max"),
+                *[(p, i, b >= 0, "max") for i, p in enumerate(k2.TL_PHASES) if i >= 4],
+                ("gate-up p50", 7, b >= 0, "median"),
+                ("down p50", 9, b >= 0, "median"),
+            ]
+            residual = rnd(gen(DEV, 800 + s), s, HIDDEN)
+            core = rnd(gen(DEV, 900 + 1000 * rank + s), s, CORE)
+            out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
+            res_out = torch.empty_like(out)
+            side.run(key, w, core, residual, out, res_out)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                for _ in range(chain):
+                    side.run(key, w, core, residual, out, res_out)
+            lay = (blocks.layer_scratch_layout if is_wide(key) else k2.scratch_layout)(
+                key
+            )
+            off, nb = lay["timeline"]
+            tl = side.scratch[is_wide(key), s, True][off : off + nb]
+            tl = tl.view(torch.int64).view(m.BLOCKS, TL_POINTS)
+            dist.barrier()
+            ends, us = [], []
+            for _ in range(replays):
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                e0.record()
+                graph.replay()
+                e1.record()
+                torch.cuda.synchronize()
+                t = tl.cpu()
+                t = (t - t[:, 0].min()).double() / 100
+                ends.append([getattr(t[g, p], r)().item() for _, p, g, r in groups])
+                us.append(e0.elapsed_time(e1) * 1000 / chain)
+            ref = torch.empty_like(out), torch.empty_like(out)
+            side.run(plain, w, core, residual, *ref)
+            torch.cuda.synchronize()
+            same &= torch.equal(out, ref[0]) and torch.equal(res_out, ref[1])
+            cols[f"{n} s{s}"] = (
+                [g[0] for g in groups],
+                torch.tensor(ends).median(0).values.tolist(),
+                torch.tensor(us).median().item(),
+            )
+        if any(errors(side.epoch).values()):
+            same = False
+            print(
+                f"[rank {rank}] timeline: error words {errors(side.epoch)}", flush=True
+            )
+    finally:
+        side.close()
+    names = next(iter(cols.values()))[0]
+    lines = [
+        f"timeline: FSE, MXFP4 o_proj, rank 0, median of {replays} graph replays of"
+        f" {chain} launches, the last launch's marks, us from the first CTA's start"
+        " to the last CTA's end of each phase (lb: layer_block)",
+        f"{'phase':<12}" + "".join(f"{c:>9}" for c in cols),
+    ]
+    for i, name in enumerate(names):
+        lines.append(f"{name:<12}" + "".join(f"{v[1][i]:9.2f}" for v in cols.values()))
+    lines.append(f"{'graph':<12}" + "".join(f"{v[2]:9.2f}" for v in cols.values()))
+    log("\n".join(lines))
+    ok = all_ok(same)
+    log(f"timeline: out and res_out equal the plain build's: {'OK' if ok else 'FAIL'}")
+    return [] if ok else ["timeline: out differs from the plain build"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
     ap.add_argument("--time", action="store_true", help="run only decision D2's timing")
+    ap.add_argument(
+        "--timeline", action="store_true", help="run only the phase table (D2)"
+    )
+    ap.add_argument(
+        "--rows",
+        type=lambda v: [int(x) for x in v.split(",")],
+        default=list(range(1, MAXT + 1)),
+        help="the widths of --time and --timeline, for example 1,4",
+    )
+    ap.add_argument("--ps-min", type=int, help="layer_block's PS_MIN (D2)")
+    ap.add_argument("--xq-min", type=int, help="layer_block's LAYER_XQ_MIN (D2)")
     args = ap.parse_args()
-    if args.case is not None or args.time:
-        fails = time_d2() if args.time else check_chain(args.case)
+    over = {"PS_MIN": args.ps_min, "LAYER_XQ_MIN": args.xq_min}
+    over = {k: v for k, v in over.items() if v is not None}
+    if over:
+        # the disk cache key of a build holds its LayerBuild, not these thresholds
+        root = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
+        tag = "_".join(f"{k}{v}" for k, v in over.items())
+        os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = os.path.expanduser(f"{root}_{tag}")
+        for k, v in over.items():
+            setattr(blocks, k, v)
+        log(f"layer_block thresholds: {over}")
+    if args.case is not None or args.time or args.timeline:
+        if args.timeline:
+            fails = time_phases(args.rows)
+        elif args.time:
+            fails = time_d2(args.rows)
+        else:
+            fails = check_chain(args.case)
         for f in fails:
             log(f"FAIL {f}")
         dist.destroy_process_group()

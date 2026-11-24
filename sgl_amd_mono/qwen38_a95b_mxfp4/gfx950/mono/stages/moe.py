@@ -26,6 +26,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
+from sgl_amd_mono.common.stamps import stamp
 from sgl_amd_mono.common.sync import POLL_MAX
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import mx_layout as L
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono.common import (
@@ -824,6 +825,8 @@ def run_ug(c, ps, ps0, x_to_lds):
         gi = fx.min(fx.max(bid - ps0, 0), groups - 1)
         sops = [ug_loads(c, gi, h, is_ps, True) for h in range(2)]
     x_to_lds()
+    stamp(c, 4)  # x in and quantized: one step here
+    stamp(c, 5)
     if const_expr(ps):  # noqa: SIM102 (traced: `and` does not combine traced values)
         if is_ps:
             hv0 = ug_half(c, bid - ps0, 0, sops[0])
@@ -831,6 +834,7 @@ def run_ug(c, ps, ps0, x_to_lds):
             ug_put(c, 0, bid - ps0, hv0, hv1, True)
     local_route(c)
     nu = load_route(c)
+    stamp(c, 6)
     total = (nu - int(ps)) * groups
     last = total - 1
     # reversed placement: the round's leftover tasks go to the high CTAs,
