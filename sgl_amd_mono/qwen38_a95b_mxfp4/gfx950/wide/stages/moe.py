@@ -22,6 +22,15 @@ phases, for the steps past `layout.SPLIT_MAX` rows:
 The experts are vLLM's tensors in place: `shuffle_weight(16, 16)` codes and
 `e8m0_shuffle` scales; gate and up each padded from `RI` to `rip` rows,
 the down projection's K likewise.
+
+Without the fused shared expert (`Shape.fse` False, SGLang's bf16 shared
+expert as `Qwen2MoeSparseMoeBlock` runs it), the router matrix is `[W_gate;
+gate_up_proj; w_shared_gate]` (`router_rows`): the router phase also makes the
+shared gate | up, `route` rounds the shared weight to bf16 and its spare waves
+make `h = bf16(silu(bf16 g) bf16 u)` (`sact`), the experts phase runs no unit
+of expert `EXPERTS` and its least busy CTAs run the bf16 down projection
+(`shared_down`: `bf16(h @ down_proj.T)` to slot `TOPK` of `mpart`), and the
+combine adds `bf16(bf16(down) sigmoid)` to the routed sum rounded to bf16.
 """
 
 from __future__ import annotations
@@ -65,6 +74,7 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide.stages import exchange as ex_
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide.stages import mx, tiled
 
 ROUTER_SPLITS = 28  # 9 row groups x 28 = 252 units
+ROUTER_SPLITS_F0 = 15  # without the fused shared expert: 17 row groups x 15 = 255
 TILE = 16
 NEG_INF = float("-inf")
 XGROUPS = HIDDEN // mx.GROUP  # scale groups an input row
@@ -77,16 +87,36 @@ def i32(v):
     return fx.Int32(v)
 
 
-def router_plan():
-    return tiled.SplitK(E_ALL, HIDDEN, ROUTER_SPLITS)
+def router_rows(fse: bool = True) -> int:
+    """The router matrix's rows: the routed gates, then (not `fse`) the shared
+    expert's gate | up, then the shared gate."""
+    return E_ALL if fse else E_ALL + 2 * RI
+
+
+def shared_row(fse: bool = True) -> int:
+    """The shared gate's row of the router matrix."""
+    return router_rows(fse) - 1
+
+
+def router_plan(fse: bool = True):
+    return tiled.SplitK(
+        router_rows(fse), HIDDEN, ROUTER_SPLITS if fse else ROUTER_SPLITS_F0
+    )
+
+
+def shared_down_plan():
+    """The bf16 shared expert's down projection: 64-row groups of HIDDEN over
+    its whole K (`RI`, 2 chunks), 128 units."""
+    return tiled.SplitK(HIDDEN, RI, 1)
 
 
 class Shape:
     """A step's MoE sizes: `rows` tokens, `rip` the experts' padded
-    intermediate rows a rank (the weights' layout)."""
+    intermediate rows a rank (the weights' layout); `fse`: the shared expert
+    fused as expert `EXPERTS`, else SGLang's bf16 shared expert."""
 
-    def __init__(self, rows: int, rip: int):
-        self.rows, self.rip = rows, rip
+    def __init__(self, rows: int, rip: int, fse: bool = True):
+        self.rows, self.rip, self.fse = rows, rip, fse
         self.assignments = rows * SLOTS
         self.mask_words = -(-rows // 32)
         self.max_units = min(E_ALL, self.assignments) + self.assignments // TILE
@@ -106,17 +136,18 @@ class Shape:
 
 
 class Weights(TraceInvariant):
-    """A layer's MoE weights (byte addresses): the fused router gate, the
-    experts' gate/up and down codes and scales (the shared expert is expert
-    EXPERTS)."""
+    """A layer's MoE weights (byte addresses): the router matrix
+    (`router_rows`), the experts' gate/up and down codes and scales (with
+    `fse` the shared expert is expert EXPERTS), and without `fse` the bf16
+    shared expert's down_proj `w_sd` ([HIDDEN, RI])."""
 
-    def __init__(self, w_gate, w13, w13s, w2, w2s):
+    def __init__(self, w_gate, w13, w13s, w2, w2s, w_sd=0):
         self.w_gate, self.w13, self.w13s = (
             fx.Int64(w_gate),
             fx.Int64(w13),
             fx.Int64(w13s),
         )
-        self.w2, self.w2s = fx.Int64(w2), fx.Int64(w2s)
+        self.w2, self.w2s, self.w_sd = fx.Int64(w2), fx.Int64(w2s), fx.Int64(w_sd)
 
 
 class Bufs(TraceInvariant):
@@ -124,7 +155,8 @@ class Bufs(TraceInvariant):
     `route` ([rows * SLOTS] ids, then their f32 weights), `x4` / `x4s`
     the MXFP4 rows of `x`, `mpart` / `mpart2` the (row, slot) results
     ([rows * SLOTS, HIDDEN] f32; a split unit's second half), `split`
-    the second halves' tags."""
+    the second halves' tags, `sact` the bf16 shared expert's h ([rows, RI]
+    bf16, not `fse`)."""
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -142,6 +174,7 @@ def scratch_words(s: Shape) -> dict[str, int]:
         "mpart": s.assignments * HIDDEN,
         "mpart2": s.assignments * HIDDEN,
         "split": s.assignments,
+        "sact": s.rows * RI // 2,
     }
 
 
@@ -188,31 +221,69 @@ class Lds(TraceInvariant):
 # --------------------------------------------------------------------------
 
 
-def router_weights(w_gate):
-    return tiled.Bf16Weights(w_gate, E_ALL, HIDDEN)
+def router_weights(w_gate, fse: bool = True):
+    return tiled.Bf16Weights(w_gate, router_rows(fse), HIDDEN)
 
 
-def router(g, gemm, w_gate, x, b):
-    """The router logits' K-slice partials to `b.part`."""
-    plan = router_plan()
+def router(g, gemm, w_gate, x, b, fse: bool = True):
+    """The router matrix's K-slice partials to `b.part`."""
+    plan = router_plan(fse)
     tiled.gemm_units(
         g.bid,
         BLOCKS,
         gemm,
         tiled.Source(x, HIDDEN),
-        router_weights(w_gate),
+        router_weights(w_gate, fse),
         plan,
         tiled.partial_epilogue(gemm, plan, b.part),
     )
 
 
 @traced
-def route(g, part, route_buf, rows: int):
+def shared_act(g, part, sact, rows: int):
+    """The bf16 shared expert's h of row `g.spread - rows` (a wave that
+    `route` leaves idle): lane `l`'s 4 columns of the summed gate and up
+    partials (each rounded to bf16, the stock GEMM's output), `bf16(silu(g)
+    u)` (SiluAndMul on bf16) to `sact` [rows, RI] bf16."""
+    plan = router_plan(False)
+    row = g.spread - i32(rows)
+    if (row >= 0) & (row < i32(rows)):
+        col = g.lane * 4
+        gu = []
+        for half in range_constexpr(2):
+            loads = [
+                ld(
+                    part,
+                    (i32(s * rows) + row) * i32(plan.padded)
+                    + i32(EXPERTS + half * RI)
+                    + col,
+                    fx.Float32,
+                    4,
+                    cm=CM_DEV,
+                )
+                for s in range(plan.splits)
+            ]
+            tot = [loads[0][e] for e in range(4)]
+            for s in range_constexpr(1, plan.splits):
+                tot = [tot[e] + loads[s][e] for e in range(4)]
+            gu.append([bf16_round(v) for v in tot])
+        h = [silu(gu[0][e]) * gu[1][e] for e in range(4)]
+        st(
+            sact,
+            row * i32(RI // 2) + g.lane * 2,
+            fx.Vector.from_elements(h, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32),
+            CM_DEV,
+        )
+
+
+@traced
+def route(g, part, route_buf, rows: int, fse: bool = True):
     """A wave a row: the top-k of the summed router partials (rounded to bf16)
     and their renormalized softmax weights; slot TOPK is the shared expert
-    with its sigmoid weight. `route_buf`: [rows * SLOTS] ids, then [rows *
-    SLOTS] f32 weights."""
-    plan = router_plan()
+    with its sigmoid weight (not `fse`: rounded to bf16, SGLang's sigmoid of
+    the bf16 gate). `route_buf`: [rows * SLOTS] ids, then [rows * SLOTS] f32
+    weights."""
+    plan = router_plan(fse)
     first = g.lane * PER
     index = [first + i32(p) for p in range(PER)]
     for row in range(g.spread, rows, BLOCKS * WAVES):
@@ -232,7 +303,7 @@ def route(g, part, route_buf, rows: int):
         shared = [
             ld(
                 part,
-                (i32(s * rows) + row) * i32(plan.padded) + EXPERTS,
+                (i32(s * rows) + row) * i32(plan.padded) + shared_row(fse),
                 fx.Float32,
                 cm=CM_DEV,
             )
@@ -277,11 +348,12 @@ def route(g, part, route_buf, rows: int):
                     (ex[j] * scale).bitcast(fx.Int32),
                     CM_DEV,
                 )
+            sw = sigmoid(bf16_round(sg))
             st(route_buf, base + TOPK, i32(EXPERTS), CM_DEV)
             st(
                 route_buf,
                 rows * SLOTS + base + TOPK,
-                sigmoid(bf16_round(sg)).bitcast(fx.Int32),
+                (sw if fse else bf16_round(sw)).bitcast(fx.Int32),
                 CM_DEV,
             )
 
@@ -318,8 +390,10 @@ def build_schedule(tid, s: Shape, lds, load_id):
     expert ids (`load_id(a)`): per-expert token bitmasks, counts, starts, a
     flat unit list `lds.units` (`[n][3]`: expert, start, count) and the
     sorted assignments; bitmask ranks give every CTA the same order. The
-    unit count is `index[2 E_ALL]`."""
+    unit count is `index[2 E_ALL]`. Without `fse`, expert EXPERTS (slot
+    TOPK, the bf16 shared expert) gets no unit."""
     E, A = E_ALL, s.assignments
+    live = E if s.fse else EXPERTS
     idx = lds.index
     rounds = -(-E // THREADS)
     for r in range_constexpr(-(-(E * s.mask_words) // THREADS)):
@@ -349,7 +423,7 @@ def build_schedule(tid, s: Shape, lds, load_id):
             count = count + fx.Int32(
                 fx.ctpop(lds_ld(idx + s.mask_base + safe * s.mask_words + word))
             )
-        counts.append((e < E).select(count, i32(0)))
+        counts.append((e < live).select(count, i32(0)))
     blocks = [(c + TILE - 1) // TILE for c in counts]
     count_sum, block_sum = counts[0], blocks[0]
     for r in range_constexpr(1, rounds):
@@ -518,6 +592,49 @@ def experts(g, s, lds, w, b, tag):
             tag,
             uniform(half),
         )
+
+
+def _shared_epilogue(gemm, mpart, rows: int):
+    """A shared down unit's accumulators, rounded to bf16 (the stock GEMM's
+    output), to slot TOPK of each row of `mpart` (f32)."""
+
+    @traced
+    def epilogue(unit, split, first_row, lane, acc):
+        for t in range_constexpr(gemm.tiles):
+            token = i32(t * TILE) + lane % i32(TILE)
+            col = first_row + lane // i32(TILE) * i32(4)
+            if token < i32(rows):
+                vals = [bf16_round(acc[t][e]) for e in range(4)]
+                st(
+                    mpart,
+                    (token * i32(SLOTS) + i32(TOPK)) * i32(HIDDEN) + col,
+                    fx.Vector.from_elements(vals, fx.Float32),
+                    CM_DEV,
+                )
+
+    return epilogue
+
+
+@traced
+def shared_down(g, gemm, s, lds, w, b):
+    """The bf16 shared expert's down projection (`shared_down_plan`, h from
+    `sact`) on the CTAs that the experts phase gives the fewest pieces: of
+    the `n` pieces, slots `n % BLOCKS ..` run one piece fewer, so they take
+    the units first. Its LDS stage aliases the schedule's, read before."""
+    whole, split = pieces(unit_count(lds))
+    first = (whole + 2 * split) % i32(BLOCKS)
+    su = (unit_slot(g.bid) + i32(BLOCKS) - first) % i32(BLOCKS)
+    fx.barrier()
+    plan = shared_down_plan()
+    tiled.gemm_units(
+        su,
+        BLOCKS,
+        gemm,
+        tiled.Source(b.sact, RI),
+        tiled.Bf16Weights(w.w_sd, HIDDEN, RI),
+        plan,
+        _shared_epilogue(gemm, b.mpart, s.rows),
+    )
 
 
 @traced
@@ -711,10 +828,13 @@ def _down_store(g, lds, out, dest, first, acc):
 
 
 @traced
-def major_combine(g, xch, b, rows: int):
+def major_combine(g, xch, b, rows: int, fse: bool = True):
     """`y[r] = sum_j w[r, j] part[r, j]` in slot order (a split unit's two
     halves added first), a wave an exchange line: lane `l` sums 8 columns
-    of token `l // 8` and pushes them, then lane 0 the line's flag."""
+    of token `l // 8` and pushes them, then lane 0 the line's flag. Without
+    `fse`: the routed slots' sum rounded to bf16, plus `bf16(down w)` of
+    slot TOPK (the bf16 shared expert), rounded to bf16."""
+    routed = SLOTS if fse else TOPK
     lpg = ex_.lines_per_group(rows)
     for line in range(g.spread, ex_.GROUPS * lpg, BLOCKS * WAVES):
         grp, blk = line // lpg, line % lpg
@@ -727,7 +847,7 @@ def major_combine(g, xch, b, rows: int):
         ]
         halves = [
             ld(b.split, tk * SLOTS + j, fx.Int32, cm=CM_DEV) == xch.tag
-            for j in range(SLOTS)
+            for j in range(routed)
         ]
         ps, ps2 = [], []
         for j in range_constexpr(SLOTS):
@@ -735,24 +855,32 @@ def major_combine(g, xch, b, rows: int):
             ps.append(
                 [ld(b.mpart, at + 4 * h, fx.Float32, 4, cm=CM_DEV) for h in range(2)]
             )
-            ps2.append(
-                [
-                    ld(
-                        b.mpart2,
-                        at + 4 * h,
-                        fx.Float32,
-                        4,
-                        cm=CM_DEV,
-                        nbytes=rows * SLOTS * HIDDEN * 4,
-                        mask=halves[j],
-                    )
-                    for h in range(2)
-                ]
-            )
+            if const_expr(j < routed):
+                ps2.append(
+                    [
+                        ld(
+                            b.mpart2,
+                            at + 4 * h,
+                            fx.Float32,
+                            4,
+                            cm=CM_DEV,
+                            nbytes=rows * SLOTS * HIDDEN * 4,
+                            mask=halves[j],
+                        )
+                        for h in range(2)
+                    ]
+                )
         sums = [fx.Float32(0.0)] * 8
-        for j in range_constexpr(SLOTS):
+        for j in range_constexpr(routed):
             sums = [
                 sums[e] + ws[j] * (ps[j][e // 4][e % 4] + ps2[j][e // 4][e % 4])
+                for e in range(8)
+            ]
+        if const_expr(not fse):
+            sums = [
+                bf16_round(
+                    bf16_round(sums[e]) + bf16_round(ps[TOPK][e // 4][e % 4] * ws[TOPK])
+                )
                 for e in range(8)
             ]
         xch.put(grp, token, g.lane % 8, sums)
@@ -773,11 +901,15 @@ def mlp(g, s: Shape, gemm, ml, x, w: Weights, b: Bufs, xch, end_phase):
     `end_phase(name)` after each but the last. `ml`: the `lds_struct`
     view."""
     lds = Lds(ml, lds_words(s))
-    router(g, gemm, w.w_gate, x, b)
+    router(g, gemm, w.w_gate, x, b, s.fse)
     end_phase(PHASES[0])
-    route(g, b.part, b.route, s.rows)
+    route(g, b.part, b.route, s.rows, s.fse)
+    if const_expr(not s.fse):
+        shared_act(g, b.part, b.sact, s.rows)
     end_phase(PHASES[1])
     build_schedule(g.tid, s, lds, lambda a: ld(b.route, a, fx.Int32, cm=CM_DEV))
     experts(g, s, lds, w, b, xch.tag)
+    if const_expr(not s.fse):
+        shared_down(g, gemm, s, lds, w, b)
     end_phase(PHASES[2])
-    major_combine(g, xch, b, s.rows)
+    major_combine(g, xch, b, s.rows, s.fse)

@@ -118,21 +118,48 @@ def route(x, w_gate, experts: int, topk: int, prefer=None, margin: float = 1e-2)
     return ids, ws, logits
 
 
-def moe(x, w_gate, w13, w13s, w2, w2s, experts, topk, ri, rip, prefer=None, xd=None):
+def moe(
+    x,
+    w_gate,
+    w13,
+    w13s,
+    w2,
+    w2s,
+    experts,
+    topk,
+    ri,
+    rip,
+    prefer=None,
+    xd=None,
+    shared=None,
+):
     """The MoE of rows `x` (one rank's intermediate slice; unshuffled MXFP4
     expert codes and scales), activations quantized to MXFP4 as AITER does
     (the input and the gate-up product). Returns (y f64, ids, weights);
     `prefer`: as `route`; `xd`: the experts' dequantized input rows
-    (default `quant_act(x)`)."""
+    (default `quant_act(x)`). `shared`: SGLang's bf16 shared expert
+    (gate_up_proj, down_proj) of this rank, else the shared expert is expert
+    `experts`: y is then the rank's bf16 partial `bf16(bf16(routed) +
+    bf16(bf16(down) bf16(sigmoid)))`."""
     ids, ws, _ = route(x, w_gate, experts, topk, prefer)
     if xd is None:
         xd = quant_act(x)
     y = torch.zeros_like(xd)
     for e in ids.unique().tolist():
+        if shared is not None and e == experts:
+            continue
         w13d = dequant_mx(w13[e], w13s[e])
         w2d = dequant_mx(w2[e], w2s[e])[:, :ri]
         for b, j in (ids == e).nonzero().tolist():
+            if shared is not None and j == topk:
+                continue
             gu = w13d @ xd[b]
             act = F.silu(gu[:ri]) * gu[rip : rip + ri]
             y[b] += ws[b, j] * (w2d @ quant_act(act[None].float())[0])
+    if shared is not None:
+        sgu, sd = shared
+        gu = bf(x.double() @ sgu.double().T)
+        h = bf(F.silu(gu[:, :ri]) * gu[:, ri:])
+        ws[:, topk] = bf(ws[:, topk])
+        y = bf(bf(y) + bf(bf(h @ sd.double().T) * ws[:, topk : topk + 1]))
     return y, ids, ws

@@ -1,8 +1,8 @@
 # Adapted from vllm-project/vllm#67678 at ce476ce305 (Apache-2.0):
 # tests/models/qwen3_5/amd_specialized_decode/test_layer.py
 """Check the wide launches (``wide.layer``: out_proj or o_proj, its TP reduce,
-the post-attention norm, the router, the experts with the fused shared expert,
-the MoE TP reduce and the next layer's input norm) on 8 gfx950 GPUs (torchrun),
+the post-attention norm, the router, the experts with the fused shared expert
+or SGLang's bf16 shared expert, the MoE TP reduce and the next layer's input norm) on 8 gfx950 GPUs (torchrun),
 on random TP8 shards in SGLang's layouts, against float64 references with the
 stock rounding points (``wide_reference``):
 
@@ -11,13 +11,14 @@ stock rounding points (``wide_reference``):
   step's ``gdn`` keys and the launches before them, at 32 rows) compiles on
   every rank;
 - chain: one step of three launches (``gdn_back``, ``attn``, ``gdn_back``) at 17
-  and 32 rows, with a bf16 and an MXFP4 out_proj; each launch's MoE input rows,
+  and 32 rows, with a bf16 and an MXFP4 out_proj, with the fused and the bf16
+  shared expert; each launch's MoE input rows,
   routes, route weights, residual and normed rows against the reference fed the
   previous launch's outputs (relative Frobenius errors);
 - front: one decode step of two ``gdn`` launches at 32 rows (the step's first
   layer, then the next layer from the first launch's MXFP4 rows), bf16
-  projections and an f32 state, or MXFP4 projections and a bf16 state, with
-  pad rows: each launch's core and conv and SSM state rows against K1 on 8-row
+  projections and an f32 state, or MXFP4 projections and a bf16 state (also
+  with the bf16 shared expert), with pad rows: each launch's core and conv and SSM state rows against K1 on 8-row
   chunks of its input rows, every other state slot kept, and its tail as in
   the chain;
 - fault: rank 3 stalls at its first wait (``stop=False``) in ``gdn_back`` at 32
@@ -121,9 +122,16 @@ def compile_keys(keys):
 
 def check_compile():
     q4 = W.q4_of("mxfp4")
-    keys = {key(kind, s, f) for kind in set(STEP) for s in WIDTHS for f in FORMATS}
+    keys = {
+        key(kind, s, f, fse=fse)
+        for kind in set(STEP)
+        for s in WIDTHS
+        for f in FORMATS
+        for fse in (True, False)
+    }
     # the decode keys: the GDN fronts, and the launches before an MXFP4 front
     keys |= {front_key(32, qq, n) for qq in (False, True) for n in (0, 1)}
+    keys |= {front_key(32, True, n, fse=False) for n in (0, 1)}
     keys |= {
         replace(front_key(32, True, 1), next_q4=q4),
         key("attn", 32, "bf16", next_q4=q4),
@@ -190,6 +198,7 @@ class Side:
             "w13s": w["w13s"],
             "w2": w["w2"],
             "w2s": w["w2s"],
+            "w_sd": w.get("sd", 0),
             "peers": self.peer.addresses,
             "rank": rank,
             "epoch": self.epoch,
@@ -204,8 +213,10 @@ class Side:
         self.peer.close()
 
 
-def weights(shared, mine, kind, fmt):
-    """One layer's tail weights (kernel layouts) and their float64 references."""
+def weights(shared, mine, kind, fmt, fse=True):
+    """One layer's tail weights (kernel layouts) and their float64 references;
+    without ``fse`` the experts are the 512 routed ones, and the router matrix
+    holds this rank's bf16 shared gate | up rows (``moe.router_rows``)."""
 
     def rn(*shape, scale=1.0, g=mine):
         return (torch.randn(*shape, generator=g, device=DEV) * scale).to(BF)
@@ -219,11 +230,17 @@ def weights(shared, mine, kind, fmt):
         codes, sc = R.mxfp4(L.HIDDEN, cols, mine, lo=119, hi=123, device=DEV)
         w["out"], w["out_s"] = R.shuffle_data(codes), R.shuffle_scale(sc)
         w["out_r"] = R.dequant_mx(codes, sc)
-    e, rip = L.E_ALL, L.RI
+    e, rip = (L.E_ALL if fse else L.EXPERTS), L.RI
     w13, w13s = R.mxfp4(e * 2 * rip, L.HIDDEN, mine, lo=119, hi=123, device=DEV)
     w2, w2s = R.mxfp4(e * L.HIDDEN, rip, mine, lo=119, hi=123, device=DEV)
+    gate = rn(L.E_ALL, L.HIDDEN, scale=0.02, g=shared)
+    w["w_gate"] = w["w_gate_r"] = gate
+    if not fse:
+        w["sgu"] = rn(2 * L.RI, L.HIDDEN, scale=0.02)
+        w["sd"] = rn(L.HIDDEN, L.RI, scale=0.05)
+        w["w_gate"] = torch.cat([gate[: L.EXPERTS], w["sgu"], gate[L.EXPERTS :]])
     return w | {
-        "w_gate": rn(e, L.HIDDEN, scale=0.02, g=shared),
+        "fse": fse,
         "w13": R.shuffle_data(w13).view(e, 2 * rip, L.HIDDEN // 2),
         "w13s": R.shuffle_scale(w13s).view(e, 2 * rip, -1),
         "w2": R.shuffle_data(w2).view(e, L.HIDDEN, rip // 2),
@@ -256,7 +273,7 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
     kids, kws = side.route()
     y, ids, ws = R.moe(
         xn,
-        w["w_gate"],
+        w["w_gate_r"],
         w["r13"],
         w["r13s"],
         w["r2"],
@@ -267,6 +284,7 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
         L.RI,
         prefer=kids[:, : L.TOPK],
         xd=None if q4_next else kxd,
+        shared=None if w["fse"] else (w["sgu"], w["sd"]),
     )
     same = sum(set(kids[r].tolist()) == set(ids[r].tolist()) for r in range(rows))
     notes.append((f"{tag} routes", 1 - same / rows, 0.0))
@@ -281,13 +299,13 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
     return notes
 
 
-def check_chain(rows, fmt):
+def check_chain(rows, fmt, fse=True):
     shared, mine = gen(DEV, 1234), gen(DEV, 1000 + rank)
     norms = [
         (torch.randn(L.HIDDEN, generator=shared, device=DEV) * 0.1).to(BF)
         for _ in range(2 * len(STEP))
     ]
-    keys = [key(kind, rows, fmt) for kind in STEP]
+    keys = [key(kind, rows, fmt, fse=fse) for kind in STEP]
     side = Side(rows, len(STEP))
     notes = []
     try:
@@ -295,7 +313,7 @@ def check_chain(rows, fmt):
             (torch.randn(rows, L.HIDDEN, generator=shared, device=DEV)).to(BF)
         )
         for n, (kind, k) in enumerate(zip(STEP, keys)):
-            w = weights(shared, mine, kind, fmt)
+            w = weights(shared, mine, kind, fmt, fse)
             cols = L.ATTN_CORE if kind == "attn" else L.VALUE_DIM
             core = (torch.randn(rows, cols, generator=mine, device=DEV)).to(BF)
             n_post, n_next = norms[2 * n], norms[2 * n + 1]
@@ -309,19 +327,20 @@ def check_chain(rows, fmt):
             notes += tail_notes(side, f"L{n} {kind}", res, core, w, n_post, n_next)
     finally:
         side.close()
+    se = "fused" if fse else "bf16"
     bad = [f"{name}: {v:.2e} > {tol:.0e}" for name, v, tol in notes if not v <= tol]
     for b in bad:
-        print(f"[rank {rank}] chain {rows} rows {fmt}: {b}", flush=True)
+        print(f"[rank {rank}] chain {rows} rows {fmt} {se}: {b}", flush=True)
     ok = all_ok(not bad)
     worst = max((v for name, v, _ in notes if "routes" not in name), default=0.0)
     log(
-        f"chain ({rows} rows, {fmt} out_proj): rank 0 largest error {worst:.2e}: "
-        f"{'OK' if ok else 'FAIL'}"
+        f"chain ({rows} rows, {fmt} out_proj, {se} shared expert): rank 0 largest "
+        f"error {worst:.2e}: {'OK' if ok else 'FAIL'}"
     )
-    return [] if ok else [f"chain ({rows} rows, {fmt})"]
+    return [] if ok else [f"chain ({rows} rows, {fmt}, {se} shared expert)"]
 
 
-def front_key(rows, qq, n):
+def front_key(rows, qq, n, fse=True):
     """The spec's decode key of GDN layer ``n`` (0: the step's first) of a step
     of GDN layers; ``qq``: MXFP4 in_proj_qkvz and out_proj and a bf16 state."""
     fmt, q4 = ("mxfp4", W.q4_of("mxfp4")) if qq else ("bf16", "none")
@@ -338,17 +357,18 @@ def front_key(rows, qq, n):
         out_shuffled=qq,
         state_bf16=qq,
         rip=L.RI,
+        fse=fse,
     )
 
 
-def check_front(qq, rows=32, slots=40):
+def check_front(qq, rows=32, slots=40, fse=True):
     """Two ``gdn`` launches, the step's first GDN layer and the next, against K1
     on 8-row chunks of the same input rows and state: the core, the conv and SSM
     state rows, the other slots kept; then each launch's tail (``tail_notes``)
     on its own core. Layer 0's experts add zero (the MoE output of a ``gdn``
     launch is checked on layer 1)."""
-    fmt = "mxfp4" if qq else "bf16"
-    keys = [front_key(rows, qq, n) for n in range(2)]
+    fmt, se = ("mxfp4" if qq else "bf16"), ("fused" if fse else "bf16")
+    keys = [front_key(rows, qq, n, fse) for n in range(2)]
     k1 = gdn.K1Build(
         tokens=MAXT, first=True, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq
     )
@@ -400,12 +420,14 @@ def check_front(qq, rows=32, slots=40):
                     epoch=k1_epoch,
                     layer=0,
                 )
-            w = weights(shared, mine, "gdn_back", fmt)
+            w = weights(shared, mine, "gdn_back", fmt, fse)
             if n == 0:
                 # The next input norm reads the unrounded residual sum, and K1
                 # below reads only the stored bf16 residual: with no expert
                 # output the sum is bf16-exact, so both norm the same rows.
                 w |= {"w2": torch.zeros_like(w["w2"]), "r2": torch.zeros_like(w["r2"])}
+                if not fse:
+                    w["sd"] = torch.zeros_like(w["sd"])
             front = {
                 "emb": res if n == 0 else 0,
                 "n_in": n_in,
@@ -453,14 +475,14 @@ def check_front(qq, rows=32, slots=40):
         side.close()
     bad = [f"{name}: {v:.2e} > {tol:.0e}" for name, v, tol in notes if not v <= tol]
     for b in bad:
-        print(f"[rank {rank}] front {fmt}: {b}", flush=True)
+        print(f"[rank {rank}] front {fmt} {se}: {b}", flush=True)
     ok = all_ok(not bad)
     worst = max((v for name, v, _ in notes if "routes" not in name), default=0.0)
     log(
-        f"front ({rows} rows, {fmt} GDN projections): rank 0 largest error "
-        f"{worst:.2e}: {'OK' if ok else 'FAIL'}"
+        f"front ({rows} rows, {fmt} GDN projections, {se} shared expert): rank 0 "
+        f"largest error {worst:.2e}: {'OK' if ok else 'FAIL'}"
     )
-    return [] if ok else [f"front ({rows} rows, {fmt})"]
+    return [] if ok else [f"front ({rows} rows, {fmt}, {se} shared expert)"]
 
 
 def check_fault(rows=32, fmt="mxfp4"):
@@ -503,13 +525,14 @@ def check_fault(rows=32, fmt="mxfp4"):
 
 def main():
     fails = check_compile()
-    for rows in WIDTHS:
-        for fmt in FORMATS:
-            dist.barrier()
-            fails += check_chain(rows, fmt)
-    for qq in (False, True):
+    for fse in (True, False):
+        for rows in WIDTHS:
+            for fmt in FORMATS:
+                dist.barrier()
+                fails += check_chain(rows, fmt, fse)
+    for qq, fse in ((False, True), (True, True), (True, False)):
         dist.barrier()
-        fails += check_front(qq)
+        fails += check_front(qq, fse=fse)
     dist.barrier()
     fails += check_fault()
     for f in fails:
