@@ -160,6 +160,9 @@ class TestQwen38MoeD2(CustomTestCase):
     def test_time(self):
         self.assertEqual(_run("check_k2.py", "--time", ranks=8), 0)
 
+    def test_time_no_fse(self):
+        self.assertEqual(_run("check_k2.py", "--time", "--no-fse", ranks=8), 0)
+
     def test_diagnose(self):
         """layer_block's xq and ps thresholds at 2 .. 4 rows, and the phase table."""
         for args in (

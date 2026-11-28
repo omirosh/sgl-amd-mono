@@ -584,17 +584,18 @@ def time_arms(arms) -> dict:
     return {k: (statistics.median(v), v) for k, v in rows.items()}
 
 
-def time_d2(rows):
-    """Decision D2: K2 and layer_block at each width of ``rows``, fused shared
-    expert, bf16 and MXFP4 o_proj, on the same inputs and weight sets."""
+def time_d2(rows, fse=True):
+    """Decision D2: K2 and layer_block at each width of ``rows``, with or
+    without the fused shared expert, bf16 and MXFP4 o_proj, on the same inputs
+    and weight sets."""
     widths = []
     for s in rows:
         keys = [
             key
             for oq in (False, True)
             for key in (
-                k2.K2Build(tokens=s, fse=True, oq=oq),
-                blocks.LayerBuild(tokens=s, oq=oq),
+                k2.K2Build(tokens=s, fse=fse, oq=oq),
+                blocks.LayerBuild(tokens=s, fse=fse, oq=oq),
             )
         ]
         if compile_keys(keys):
@@ -606,7 +607,7 @@ def time_d2(rows):
     try:
         for oq in (False, True):
             sets = [
-                k2_weights(DEV, rank, 700 + 10 * i, fse=True, oq=oq)
+                k2_weights(DEV, rank, 700 + 10 * i, fse=fse, oq=oq)
                 for i in range(D2_SETS)
             ]
             for s in widths:
@@ -614,8 +615,8 @@ def time_d2(rows):
                 core = rnd(gen(DEV, 900 + 1000 * rank + s), s, CORE)
                 runs = {}
                 for name, key in (
-                    ("k2", k2.K2Build(tokens=s, fse=True, oq=oq)),
-                    ("layer_block", blocks.LayerBuild(tokens=s, oq=oq)),
+                    ("k2", k2.K2Build(tokens=s, fse=fse, oq=oq)),
+                    ("layer_block", blocks.LayerBuild(tokens=s, fse=fse, oq=oq)),
                 ):
                     out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
                     res_out = torch.empty_like(out)
@@ -643,7 +644,8 @@ def time_d2(rows):
                 t = time_arms({name: cycle(*r) for name, r in runs.items()})
                 (k, kr), (b, br) = t["k2"], t["layer_block"]
                 log(
-                    f"d2 oq {int(oq)} s{s}: k2 {k:.2f} us, layer_block {b:.2f} us "
+                    f"d2 fse {int(fse)} oq {int(oq)} s{s}: k2 {k:.2f} us, "
+                    f"layer_block {b:.2f} us "
                     f"({100 * (b - k) / k:+.1f}%), cosine out {cos['out']:.6f} "
                     f"res_out {cos['res_out']:.6f}, rounds k2 {kr} layer_block {br}"
                 )
@@ -761,6 +763,9 @@ def main():
     ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
     ap.add_argument("--time", action="store_true", help="run only decision D2's timing")
     ap.add_argument(
+        "--no-fse", action="store_true", help="--time with the bf16 shared expert"
+    )
+    ap.add_argument(
         "--timeline", action="store_true", help="run only the phase table (D2)"
     )
     ap.add_argument(
@@ -786,7 +791,7 @@ def main():
         if args.timeline:
             fails = time_phases(args.rows)
         elif args.time:
-            fails = time_d2(args.rows)
+            fails = time_d2(args.rows, fse=not args.no_fse)
         else:
             fails = check_chain(args.case)
         for f in fails:
