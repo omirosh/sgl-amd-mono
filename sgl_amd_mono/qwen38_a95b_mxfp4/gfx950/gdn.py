@@ -40,9 +40,24 @@ writes no state and a zero core row.
 A GDN round is 256 consecutive tasks on distinct CTAs; a task waits only on
 tasks of its own round (a key head's 64 tasks, a head's 8 chunks), so no CTA
 waits on work queued behind it.
+
+With ``spec`` = T (K1v), the launch runs the GDN layer of a NEXTN target-verify
+step on SGLang's compact ReplaySSM ring (``--enable-linear-replayssm-spec``, a
+bf16 SSM state): rows r T .. r T + T - 1 are the T draft tokens of request r. A
+GDN task is (request, value head, chunk) and runs the request's tokens in order
+from the checkpoint rows, in registers. It writes no state and no conv state.
+For draft token s it writes what SGLang's verify kernel
+(``gdn_replayssm_spec_circular_kernel``) writes: the conv window after the token
+to the intermediate conv window, and the ring records at
+``(cache_base + write_pos + s) & (L - 1)`` while ``write_pos + s < L``: the update
+vector d (bf16 high and low parts), the normalized key (high and low parts) and
+the log decay g. SGLang's commit folds the accepted records into the
+checkpoint. A bf16 checkpoint folds at each commit, so each verify step starts
+with ``write_pos`` 0: K1v reads no history.
 """
 
 import math
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -128,6 +143,8 @@ class K1Build(msgspec.Struct, frozen=True):
     state_bf16: bool = False  # bf16 recurrent state: fp32 math, rounded on store
     qq: bool = False  # in_proj_qkvz MXFP4 (ASM FP4 GEMM layout)
     qh: bool = False  # in_proj_qkvz rotated by Hadamard-32 (sgl-project/sglang#46059)
+    spec: int = 0  # K1v: T draft tokens a request (tokens = requests x T); 0 decode
+    ring_len: int = 0  # K1v: the ReplaySSM ring length L, a power of two
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this rank stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
@@ -160,8 +177,31 @@ ABI = KernelAbi(
         "scratch",
         "epoch",
         "layer",
+        # K1v only (0 in a decode launch); strides in elements
+        "rp_idx",
+        "wpos",
+        "wp_st",
+        "cbase",
+        "cb_st",
+        "ring_d",
+        "rd_seq",
+        "ring_dlo",
+        "rdl_seq",
+        "ring_k",
+        "rk_seq",
+        "ring_klo",
+        "rkl_seq",
+        "ring_g",
+        "rg_seq",
+        "icw",
+        "icw_seq",
+        "icw_t",
+        "icw_dim",
+        "icw_tok",
+        "icw_idx",
     )
 )
+SPEC_ARGS = ABI.names[ABI.names.index("rp_idx") :]
 
 
 ROUNDS = -(-L.MAX_TOKENS * GTASKS // BLOCKS)  # 4: GDN rounds at the widest
@@ -376,14 +416,25 @@ def stage_proj(c, rg, ops, fp4=False):
 
 
 # ---------------------------------------------------------------- gdn
-def gdn_stage(c, t, h, ch):
+def gdn_stage(c, q, h, ch):
     """The task's inputs that need no hand-off, issued before its first poll:
-    the slot, the owned channels' conv window and weights, the state rows and
-    the head's constants."""
+    request q's slot (K1v: its ring row, cursors and intermediate conv window),
+    the owned channels' conv window and weights, the state rows and the head's
+    constants. A decode step's request is its row."""
     tid = c["tid"]
     a = c["args"]
     k = {}
-    k["slot"] = uniform(ld_i32(a["st_idx"], t))
+    k["slot"] = uniform(ld_i32(a["st_idx"], q))
+    k["live"] = k["slot"] > 0
+    if const_expr(c["spec"]):
+        ri = uniform(ld_i32(a["rp_idx"], q))
+        k["live"] = k["live"] & (ri >= 0)
+        ri = fx.max(ri, 0)
+        k["wp"] = uniform(ld_i32(a["wpos"], ri * a["wp_st"]))
+        k["cb"] = uniform(ld_i32(a["cbase"], ri * a["cb_st"]))
+        k["ri"] = fx.Int64(ri)
+        icw_row = fx.max(uniform(ld_i32(a["icw_idx"], q)), 0)
+        k["icw"] = a["icw"] + fx.Int64(icw_row) * fx.Int64(a["icw_seq"]) * 2
     kh = h // HPK
     k["owner"] = (h % HPK) == 0
     # conv: thread < 48 owns channel i of part (q, k, v)
@@ -419,61 +470,89 @@ def gdn_stage(c, t, h, ch):
 
 
 @flyc.jit
-def gdn_conv(c, k, t, h, ch):
-    """The owned channels' conv update: the window shifted (in place), the
-    width-4 conv (each product rounded to bf16, fp32 sum), SiLU -> bf16; q / k
-    out through QK (the key head's owner tasks), v to LDS."""
+def gdn_conv(c, k, q, h, ch):
+    """The owned channels' conv update, request q's tokens in order: the window
+    shifts in registers, the width-4 conv (each product rounded to bf16, fp32
+    sum), SiLU -> bf16; q / k out through QK (the key head's owner tasks), v to
+    LDS. Decode writes the shifted window to the conv state; K1v writes the
+    window after each token to the intermediate conv window (through its
+    strides: SGLang's deduplicated layout overlaps the windows)."""
     tid = c["tid"]
     a = c["args"]
+    nt = c["T"]
     part, owner = k["part"], k["owner"]
     if tid < 3 * VCH:
-        x = f32_of(c["poll"]([(c["proj"], t * NPROJ + k["chan"], 1)])[0][0])
+        got = c["poll"](
+            [(c["proj"], (q * nt + s) * NPROJ + k["chan"], 1) for s in range(nt)]
+        )
         owned = (part == 2) | owner
-        if (k["slot"] > 0) & owned:
-            rs = rsrc(k["cs"])
-            for j in range_constexpr(SL):
-                nv = k["win"][j + 1] if j < SL - 1 else x
-                bo.buffer_store(
-                    fx.Float32(nv).to(fx.BFloat16), rs, k["co"] + j * a["cs_tok"]
-                )
-        w, win = k["cw"], k["win"]
-        acc = bf16_round(w[0] * win[0]) + bf16_round(w[1] * win[1])
-        acc = acc + bf16_round(w[2] * win[2])
-        acc = acc + bf16_round(w[3] * x)
-        o = bf16_round(silu(acc))
-        if (part < 2) & owner:
-            kh = h // HPK
-            at = ((t * NK + kh) * 2 + part) * HD + ch * VCH + k["i"]
-            c["put"](c["qk"], at, o)
-        if part == 2:
-            fx.ptr_store(o, c["vloc"] + k["i"])
+        w, win = k["cw"], list(k["win"])
+        for s in range_constexpr(nt):
+            x = f32_of(got[s][0])
+            acc = bf16_round(w[0] * win[0]) + bf16_round(w[1] * win[1])
+            acc = acc + bf16_round(w[2] * win[2])
+            acc = acc + bf16_round(w[3] * x)
+            o = bf16_round(silu(acc))
+            win = win[1:] + [x]
+            if const_expr(c["spec"]):
+                if k["live"] & owned:
+                    rs = rsrc(k["icw"])
+                    at = s * a["icw_t"] + k["chan"] * a["icw_dim"]
+                    for j in range_constexpr(SL):
+                        bo.buffer_store(
+                            fx.Float32(win[j]).to(fx.BFloat16),
+                            rs,
+                            at + j * a["icw_tok"],
+                        )
+            if (part < 2) & owner:
+                kh = h // HPK
+                at = (((q * nt + s) * NK + kh) * 2 + part) * HD + ch * VCH + k["i"]
+                c["put"](c["qk"], at, o)
+            if part == 2:
+                fx.ptr_store(o, c["vloc"] + (s * VCH + k["i"]))
+        if const_expr(not c["spec"]):
+            if k["live"] & owned:
+                rs = rsrc(k["cs"])
+                for j in range_constexpr(SL):
+                    bo.buffer_store(
+                        fx.Float32(win[j]).to(fx.BFloat16),
+                        rs,
+                        k["co"] + j * a["cs_tok"],
+                    )
     gpu.barrier()
 
 
 @flyc.jit
-def gdn_gates(c, k, t, h):
-    """The key head's q and k (QK) l2-normed (q scaled by HD^-1/2); the head's
-    decay exp(-exp(A_log) softplus(a + dt_bias)) and beta = sigmoid(b)."""
+def gdn_gates(c, k, q, h):
+    """Request q's tokens: the key head's q and k (QK) l2-normed (q scaled by
+    HD^-1/2); the head's log decay g = -exp(A_log) softplus(a + dt_bias), exp(g)
+    and beta = sigmoid(b), thread 2 HD + s for token s."""
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
+    nt = c["T"]
     kh = h // HPK
     if tid < 2 * HD:
-        v = c["poll"]([(c["qk"], (t * NK + kh) * 2 * HD + tid, 1)])[0][0]
-        fx.ptr_store(f32_of(v), c["qkl"] + tid)
-    if tid == 2 * HD:
+        got = c["poll"](
+            [(c["qk"], ((q * nt + s) * NK + kh) * 2 * HD + tid, 1) for s in range(nt)]
+        )
+        for s in range_constexpr(nt):
+            fx.ptr_store(f32_of(got[s][0]), c["qkl"] + (s * 2 * HD + tid))
+    if (tid >= 2 * HD) & (tid < 2 * HD + nt):
+        s = tid - 2 * HD
+        t = q * nt + s
         if const_expr(c["qq"]):
-            s = c["S"]
+            rows = c["S"]
             parts = c["poll"](
                 [
-                    (c["bapart"], ((g * BA_PARTS + q) * s + t) * ROWS + h, 1)
+                    (c["bapart"], ((g * BA_PARTS + p) * rows + t) * ROWS + h, 1)
                     for g in range(2)
-                    for q in range(BA_PARTS)
+                    for p in range(BA_PARTS)
                 ]
             )
             ba = []
             for g in range_constexpr(2):
                 v = f32_of(parts[g * BA_PARTS][0])
-                for q in range_constexpr(1, BA_PARTS):
-                    v = v + f32_of(parts[g * BA_PARTS + q][0])
+                for p in range_constexpr(1, BA_PARTS):
+                    v = v + f32_of(parts[g * BA_PARTS + p][0])
                 ba.append([bf16_round(v)])
             got = ba
         else:
@@ -485,99 +564,148 @@ def gdn_gates(c, k, t, h):
         sp = hw_log2(fx.Float32(1.0) + hw_exp(x)) * fx.Float32(LN2)
         sp = (x <= fx.Float32(SOFTPLUS_THRESHOLD)).select(sp, x)
         g = -hw_exp(k["a_log"]) * sp
-        fx.ptr_store(hw_exp(g), c["scal"] + 0)
-        fx.ptr_store(sigmoid(got[0][0]), c["scal"] + 1)
+        fx.ptr_store(hw_exp(g), c["scal"] + s * 4)
+        fx.ptr_store(sigmoid(got[0][0]), c["scal"] + (s * 4 + 1))
+        fx.ptr_store(g, c["scal"] + (s * 4 + 2))
     gpu.barrier()
-    if wave < 2:
+    # wave 2 s + 0: token s's q, wave 2 s + 1: its k
+    if wave < 2 * nt:
         x0 = fx.ptr_load(c["qkl"] + (wave * HD + lane))
         x1 = fx.ptr_load(c["qkl"] + (wave * HD + 64 + lane))
         sc = hw_rsq(wave_sum(x0 * x0 + x1 * x1) + fx.Float32(1e-6))
         y0, y1 = x0 * sc, x1 * sc
         qs = fx.Float32(HD**-0.5)
-        y0 = (wave == 0).select(y0 * qs, y0)
-        y1 = (wave == 0).select(y1 * qs, y1)
+        is_q = wave % 2 == 0
+        y0 = is_q.select(y0 * qs, y0)
+        y1 = is_q.select(y1 * qs, y1)
         fx.ptr_store(y0, c["qkl"] + (wave * HD + lane))
         fx.ptr_store(y1, c["qkl"] + (wave * HD + 64 + lane))
     gpu.barrier()
 
 
+def ring_store(base, i, x):
+    """bf16(x) and bf16(x - bf16(x)) at element i of two bf16 rings."""
+    hi = bf16_round(x)
+    bo.buffer_store(hi.to(fx.BFloat16), rsrc(base[0]), i)
+    bo.buffer_store((x - hi).to(fx.BFloat16), rsrc(base[1]), i)
+
+
 @flyc.jit
-def gdn_recur(c, k, t, h, ch):
-    """State rows 16 ch .. of head h, one token: decay, the delta rule, the new
-    state (in place), o = bf16(h q) -> LDS ``ol``, the chunk's sum of squares
-    -> ONRM."""
+def gdn_recur(c, k, q, h, ch):
+    """State rows 16 ch .. of head h, request q's tokens in order: decay, the
+    delta rule, o = bf16(h q) -> LDS ``ol``, each token's sum of squares ->
+    ONRM. Decode stores the new state in place. K1v stores no state; it writes
+    token s's ring records: d (the delta rule's update), and the normalized key
+    and g once a key head and a value head."""
     tid, lane = c["tid"], c["lane"]
+    a = c["args"]
+    nt, ring = c["T"], c["L"]
     v = tid // 32
     k0 = (tid % 32) * 4
-    live = k["slot"] > 0
-    decay = fx.ptr_load(c["scal"] + 0)
-    beta = fx.ptr_load(c["scal"] + 1)
-    qv = [fx.ptr_load(c["qkl"] + (k0 + e)) for e in range(4)]
-    kv = [fx.ptr_load(c["qkl"] + (HD + k0 + e)) for e in range(4)]
-    stv = [live.select(k["st"][e], fx.Float32(0.0)) * decay for e in range(4)]
-    p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
-    p = butterfly(p, (16, 8, 4, 2, 1))
-    vn = (fx.ptr_load(c["vloc"] + v) - p) * beta
-    stv = [stv[e] + vn * kv[e] for e in range(4)]
-    o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
-    o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
-    o = live.select(o, fx.Float32(0.0))
-    new = fx.Vector.from_elements(stv, fx.Float32)
-    if const_expr(c["state_bf16"]):
-        new = new.to(fx.BFloat16)
-    if live:
-        bo.buffer_store(new, rsrc(k["sbase"]), k["head_off"])
-    if lane % 32 == 0:
-        fx.ptr_store(o, c["ol"] + v)
+    live = k["live"]
+    stv = [live.select(k["st"][e], fx.Float32(0.0)) for e in range(4)]
+    if const_expr(c["spec"]):
+        ri, kh = k["ri"], h // HPK
+        rd = [
+            a[n] + ri * fx.Int64(a[n2]) * 2
+            for n, n2 in (("ring_d", "rd_seq"), ("ring_dlo", "rdl_seq"))
+        ]
+        rk = [
+            a[n] + ri * fx.Int64(a[n2]) * 2
+            for n, n2 in (("ring_k", "rk_seq"), ("ring_klo", "rkl_seq"))
+        ]
+        rg = a["ring_g"] + ri * fx.Int64(a["rg_seq"]) * 4
+    for s in range_constexpr(nt):
+        qk = c["qkl"] + s * 2 * HD
+        decay = fx.ptr_load(c["scal"] + s * 4)
+        beta = fx.ptr_load(c["scal"] + (s * 4 + 1))
+        qv = [fx.ptr_load(qk + (k0 + e)) for e in range(4)]
+        kv = [fx.ptr_load(qk + (HD + k0 + e)) for e in range(4)]
+        stv = [stv[e] * decay for e in range(4)]
+        p = stv[0] * kv[0] + stv[1] * kv[1] + stv[2] * kv[2] + stv[3] * kv[3]
+        p = butterfly(p, (16, 8, 4, 2, 1))
+        vn = (fx.ptr_load(c["vloc"] + (s * VCH + v)) - p) * beta
+        stv = [stv[e] + vn * kv[e] for e in range(4)]
+        o = stv[0] * qv[0] + stv[1] * qv[1] + stv[2] * qv[2] + stv[3] * qv[3]
+        o = bf16_round(butterfly(o, (16, 8, 4, 2, 1)))
+        o = live.select(o, fx.Float32(0.0))
+        if lane % 32 == 0:
+            fx.ptr_store(o, c["ol"] + (s * VCH + v))
+        if const_expr(c["spec"]):
+            rec = live & (k["wp"] + s < ring)
+            phys = (k["cb"] + k["wp"] + s) % ring
+            if rec & (lane % 32 == 0):
+                ring_store(rd, (h * ring + phys) * HD + ch * VCH + v, vn)
+            if rec & k["owner"] & (ch == 0) & (tid < HD):
+                kn = fx.ptr_load(qk + (HD + tid))
+                ring_store(rk, (kh * ring + phys) * HD + tid, kn)
+            if rec & (ch == 0) & (tid == 0):
+                g = fx.ptr_load(c["scal"] + (s * 4 + 2))
+                bo.buffer_store(g, rsrc(rg), h * ring + phys)
+    if const_expr(not c["spec"]):
+        new = fx.Vector.from_elements(stv, fx.Float32)
+        if const_expr(c["state_bf16"]):
+            new = new.to(fx.BFloat16)
+        if live:
+            bo.buffer_store(new, rsrc(k["sbase"]), k["head_off"])
     gpu.barrier()
-    if tid == 0:
+    if tid < nt:
         ss = fx.Float32(0.0)
         for e in range_constexpr(VCH):
-            x = fx.ptr_load(c["ol"] + e)
+            x = fx.ptr_load(c["ol"] + (tid * VCH + e))
             ss = ss + x * x
-        c["put"](c["onrm"], (t * NV + h) * NVCH + ch, ss)
+        c["put"](c["onrm"], ((q * nt + tid) * NV + h) * NVCH + ch, ss)
     gpu.barrier()
 
 
 @flyc.jit
-def gdn_norm(c, k, t, h, ch):
-    """Rows 16 ch ..: RMSNormGated over the head's 128 (every chunk's partial):
+def gdn_norm(c, k, q, h, ch):
+    """Rows 16 ch .. of request q's tokens (thread 16 s + e: token s, row e):
+    RMSNormGated over the head's 128 (every chunk's partial):
     bf16(o rstd w silu(z)) -> ``core``."""
     tid = c["tid"]
     a = c["args"]
-    if tid < VCH:
-        vr = ch * VCH + tid
+    nt = c["T"]
+    if tid < VCH * nt:
+        t = q * nt + tid // VCH
+        vr = ch * VCH + tid % VCH
         got = c["poll"](
-            [(c["onrm"], (t * NV + h) * NVCH + q, 1) for q in range(NVCH)]
+            [(c["onrm"], (t * NV + h) * NVCH + p, 1) for p in range(NVCH)]
             + [(c["proj"], t * NPROJ + Z0 + h * HD + vr, 1)]
         )
         ss = f32_of(got[0][0])
-        for q in range_constexpr(1, NVCH):
-            ss = ss + f32_of(got[q][0])
+        for p in range_constexpr(1, NVCH):
+            ss = ss + f32_of(got[p][0])
         r = hw_rsq(ss * fx.Float32(1.0 / HD) + fx.Float32(c["norm_eps"]))
         y = fx.ptr_load(c["ol"] + tid) * r * ld_bf(a["norm_w"], vr)
         y = y * silu(f32_of(got[NVCH][0]))
-        y = (k["slot"] > 0).select(y, fx.Float32(0.0))
+        y = k["live"].select(y, fx.Float32(0.0))
         bo.buffer_store(y.to(fx.BFloat16), rsrc(a["core"]), t * L.CORE + h * HD + vr)
     gpu.barrier()
+
+
+def requests(key) -> int:
+    """The GDN tasks' requests: the rows of a decode step, rows / T in K1v."""
+    return key.tokens // max(key.spec, 1)
 
 
 def gdn_offset(key) -> int:
     """The first GDN CTA: past the front CTAs (whose in_proj weights go out
     late) and short of the two-task in_proj ones, if a single round fits."""
-    fits = key.tokens * GTASKS <= 2 * BLOCKS - QKVZ_TASKS - NRED
+    fits = requests(key) * GTASKS <= 2 * BLOCKS - QKVZ_TASKS - NRED
     return NRED if fits else 0
 
 
 def gdn_round(c, r):
     """Round r's task of this CTA (``bid - goff`` cyclically + ``BLOCKS r``,
-    clamped into range), its (token, head, chunk) and the round's LDS."""
-    n = c["S"] * GTASKS
+    clamped into range), its (request, head, chunk) and the round's LDS."""
+    n = c["R"] * GTASKS
     task = (c["bid"] + (BLOCKS - c["goff"])) % BLOCKS + BLOCKS * r
     tc = fx.min(task, n - 1)
     cr = dict(c)
+    nt = c["T"]
     for name, m in (("qkl", 2 * HD), ("vloc", VCH), ("ol", VCH), ("scal", 4)):
-        cr[name] = c[name] + r * m
+        cr[name] = c[name] + r * m * nt
     return cr, task < n, tc // GTASKS, (tc // NVCH) % NV, tc % NVCH
 
 
@@ -586,19 +714,19 @@ def gdn_tasks(c):
     """This CTA's GDN tasks phase by phase: a task waits only on earlier phases
     of other CTAs' tasks, and every CTA finishes a phase's work before it
     waits in the next."""
-    rounds = -(-c["S"] * GTASKS // BLOCKS)
+    rounds = -(-c["R"] * GTASKS // BLOCKS)
     tasks = [gdn_round(c, r) for r in range(rounds)]
-    ks = [gdn_stage(cr, t, h, ch) for cr, _, t, h, ch in tasks]
+    ks = [gdn_stage(cr, q, h, ch) for cr, _, q, h, ch in tasks]
     phases = (
-        lambda cr, k, t, h, ch: gdn_conv(cr, k, t, h, ch),
-        lambda cr, k, t, h, ch: gdn_gates(cr, k, t, h),
-        lambda cr, k, t, h, ch: gdn_recur(cr, k, t, h, ch),
-        lambda cr, k, t, h, ch: gdn_norm(cr, k, t, h, ch),
+        lambda cr, k, q, h, ch: gdn_conv(cr, k, q, h, ch),
+        lambda cr, k, q, h, ch: gdn_gates(cr, k, q, h),
+        lambda cr, k, q, h, ch: gdn_recur(cr, k, q, h, ch),
+        lambda cr, k, q, h, ch: gdn_norm(cr, k, q, h, ch),
     )
     for phase in phases:
-        for (cr, live, t, h, ch), k in zip(tasks, ks):
+        for (cr, live, q, h, ch), k in zip(tasks, ks):
             if live:
-                phase(cr, k, t, h, ch)
+                phase(cr, k, q, h, ch)
 
 
 # ---------------------------------------------------------------- kernel
@@ -611,8 +739,20 @@ def build(key: K1Build):
     s = key.tokens
     need(1 <= s <= L.MAX_TOKENS, f"{s} rows, the kernels take 1..{L.MAX_TOKENS}")
     need(key.qq or not key.qh, "qh rotates the MXFP4 in_proj_qkvz: it needs qq")
+    nt = max(key.spec, 1)
+    if key.spec:
+        need(
+            2 <= key.spec <= 4 and s % key.spec == 0,
+            f"K1v takes 2 .. 4 draft tokens a request and whole requests, got "
+            f"{key.spec} tokens, {s} rows",
+        )
+        need(
+            key.ring_len >= key.spec and key.ring_len & (key.ring_len - 1) == 0,
+            f"the ReplaySSM ring length {key.ring_len}: a power of two that "
+            f"holds the {key.spec} draft tokens",
+        )
     lay = scratch_layout(key)
-    nr = -(-s * GTASKS // BLOCKS)  # GDN rounds: each its own LDS
+    nr = -(-requests(key) * GTASKS // BLOCKS)  # GDN rounds: each its own LDS
 
     @fx.struct
     class XLds:
@@ -620,10 +760,10 @@ def build(key: K1Build):
 
     @fx.struct
     class GdnLds:
-        qkl: fx.Array[fx.Float32, nr * 2 * HD, 16]
-        vloc: fx.Array[fx.Float32, nr * VCH, 16]
-        ol: fx.Array[fx.Float32, nr * VCH, 16]
-        scal: fx.Array[fx.Float32, nr * 4, 16]
+        qkl: fx.Array[fx.Float32, nr * nt * 2 * HD, 16]
+        vloc: fx.Array[fx.Float32, nr * nt * VCH, 16]
+        ol: fx.Array[fx.Float32, nr * nt * VCH, 16]
+        scal: fx.Array[fx.Float32, nr * nt * 4, 16]
 
     @fx.union
     class StageLds:
@@ -639,6 +779,7 @@ def build(key: K1Build):
     name = (
         f"qwen38_mono_k1_s{s}_f{int(key.first)}_b{int(key.state_bf16)}_q{int(key.qq)}"
         f"{'_h1' if key.qh else ''}"
+        f"{f'_v{key.spec}l{key.ring_len}' if key.spec else ''}"
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -665,6 +806,27 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        rp_idx: Int64,
+        wpos: Int64,
+        wp_st: Int32,
+        cbase: Int64,
+        cb_st: Int32,
+        ring_d: Int64,
+        rd_seq: Int32,
+        ring_dlo: Int64,
+        rdl_seq: Int32,
+        ring_k: Int64,
+        rk_seq: Int32,
+        ring_klo: Int64,
+        rkl_seq: Int32,
+        ring_g: Int64,
+        rg_seq: Int32,
+        icw: Int64,
+        icw_seq: Int32,
+        icw_t: Int32,
+        icw_dim: Int32,
+        icw_tok: Int32,
+        icw_idx: Int64,
     ):
         _ = keyed
         tid = fx.thread_idx.x
@@ -690,6 +852,10 @@ def build(key: K1Build):
                 "goff": gdn_offset(key),
                 "rs": lds.rs.ptr,
                 "S": s,
+                "T": nt,
+                "R": requests(key),
+                "spec": bool(key.spec),
+                "L": key.ring_len,
                 "tid": tid,
                 "bid": bid,
                 "lane": tid % 64,
@@ -726,6 +892,27 @@ def build(key: K1Build):
                     "rs_seq": rs_seq,
                     "st_idx": st_idx,
                     "core": core,
+                    "rp_idx": rp_idx,
+                    "wpos": wpos,
+                    "wp_st": wp_st,
+                    "cbase": cbase,
+                    "cb_st": cb_st,
+                    "ring_d": ring_d,
+                    "rd_seq": rd_seq,
+                    "ring_dlo": ring_dlo,
+                    "rdl_seq": rdl_seq,
+                    "ring_k": ring_k,
+                    "rk_seq": rk_seq,
+                    "ring_klo": ring_klo,
+                    "rkl_seq": rkl_seq,
+                    "ring_g": ring_g,
+                    "rg_seq": rg_seq,
+                    "icw": icw,
+                    "icw_seq": icw_seq,
+                    "icw_t": icw_t,
+                    "icw_dim": icw_dim,
+                    "icw_tok": icw_tok,
+                    "icw_idx": icw_idx,
                 },
             }
             for region in REGIONS:
@@ -791,6 +978,27 @@ def build(key: K1Build):
         scratch: Int64,
         epoch: Int64,
         layer: Int32,
+        rp_idx: Int64,
+        wpos: Int64,
+        wp_st: Int32,
+        cbase: Int64,
+        cb_st: Int32,
+        ring_d: Int64,
+        rd_seq: Int32,
+        ring_dlo: Int64,
+        rdl_seq: Int32,
+        ring_k: Int64,
+        rk_seq: Int32,
+        ring_klo: Int64,
+        rkl_seq: Int32,
+        ring_g: Int64,
+        rg_seq: Int32,
+        icw: Int64,
+        icw_seq: Int32,
+        icw_t: Int32,
+        icw_dim: Int32,
+        icw_tok: Int32,
+        icw_idx: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -817,11 +1025,111 @@ def build(key: K1Build):
             scratch,
             epoch,
             layer,
+            rp_idx,
+            wpos,
+            wp_st,
+            cbase,
+            cb_st,
+            ring_d,
+            rd_seq,
+            ring_dlo,
+            rdl_seq,
+            ring_k,
+            rk_seq,
+            ring_klo,
+            rkl_seq,
+            ring_g,
+            rg_seq,
+            icw,
+            icw_seq,
+            icw_t,
+            icw_dim,
+            icw_tok,
+            icw_idx,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI.check(k1, launch)
     _BUILDS[key] = launch
     return launch
+
+
+class Ring(NamedTuple):
+    """K1v's view of SGLang's compact ReplaySSM ring for one GDN layer (the names of
+    ``GDNAttnBackend._replayssm_target_verify``): ``ring_indices`` [>= R] int32 (a
+    request's ring row, -1 a pad); the int32 cursors ``write_pos`` and
+    ``cache_base`` [ring rows], strided; per ring row ``d`` and ``rawv`` [HV, L, V]
+    bf16, ``k`` and ``rawk`` [H, L, K] bf16, ``g`` [HV, L] fp32, each dense;
+    ``conv_window`` [rows, T, dim, 3] bf16 (strides read) and
+    ``conv_window_indices`` [>= R] int32."""
+
+    ring_indices: torch.Tensor
+    write_pos: torch.Tensor
+    cache_base: torch.Tensor
+    d: torch.Tensor
+    rawv: torch.Tensor
+    k: torch.Tensor
+    rawk: torch.Tensor
+    g: torch.Tensor
+    conv_window: torch.Tensor
+    conv_window_indices: torch.Tensor
+
+
+def ring_args(key: K1Build, ring: Ring | None) -> dict:
+    """The K1v arguments of a launch (all 0 in a decode launch)."""
+    if not key.spec:
+        need(ring is None, "a decode launch takes no ring")
+        return dict.fromkeys(SPEC_ARGS, 0)
+    need(ring is not None, "a K1v launch needs the ring")
+    r, n, bf = requests(key), key.ring_len, torch.bfloat16
+    want = {
+        "d": ((NV, n, HD), bf),
+        "rawv": ((NV, n, HD), bf),
+        "k": ((NK, n, HD), bf),
+        "rawk": ((NK, n, HD), bf),
+        "g": ((NV, n), torch.float32),
+    }
+    for name, (shape, dtype) in want.items():
+        t = getattr(ring, name)
+        need(
+            t.dtype == dtype and tuple(t.shape[1:]) == shape and t[0].is_contiguous(),
+            f"ring {name}: {dtype} [rows, {shape}], a row dense, got {t.dtype} "
+            f"{tuple(t.shape)}",
+        )
+    for name in ("ring_indices", "write_pos", "cache_base", "conv_window_indices"):
+        t = getattr(ring, name)
+        need(t.dtype == torch.int32 and t.dim() == 1, f"ring {name}: int32 [n]")
+    need(
+        ring.ring_indices.numel() >= r and ring.conv_window_indices.numel() >= r,
+        f"ring indices for {r} requests",
+    )
+    w = ring.conv_window
+    need(
+        w.dtype == bf and tuple(w.shape[1:]) == (key.spec, L.CONV, SL),
+        f"intermediate conv window: bf16 [rows, {key.spec}, {L.CONV}, {SL}]",
+    )
+    return {
+        "rp_idx": ring.ring_indices.data_ptr(),
+        "wpos": ring.write_pos.data_ptr(),
+        "wp_st": ring.write_pos.stride(0),
+        "cbase": ring.cache_base.data_ptr(),
+        "cb_st": ring.cache_base.stride(0),
+        "ring_d": ring.d.data_ptr(),
+        "rd_seq": ring.d.stride(0),
+        "ring_dlo": ring.rawv.data_ptr(),
+        "rdl_seq": ring.rawv.stride(0),
+        "ring_k": ring.k.data_ptr(),
+        "rk_seq": ring.k.stride(0),
+        "ring_klo": ring.rawk.data_ptr(),
+        "rkl_seq": ring.rawk.stride(0),
+        "ring_g": ring.g.data_ptr(),
+        "rg_seq": ring.g.stride(0),
+        "icw": w.data_ptr(),
+        "icw_seq": w.stride(0),
+        "icw_t": w.stride(1),
+        "icw_dim": w.stride(2),
+        "icw_tok": w.stride(3),
+        "icw_idx": ring.conv_window_indices.data_ptr(),
+    }
 
 
 def gdn_pre(
@@ -845,15 +1153,17 @@ def gdn_pre(
     epoch,
     layer,
     w_qkvzs=None,
+    ring: Ring | None = None,
 ):
     """Host launcher; every weight as SGLang holds it after loading (``w_qkvzs``:
     an fp4 in_proj_qkvz's scales, ``key.qq``). ``residual``
     None on the first layer (``key.first``). ``conv_state`` [slots, dim, 3] or a
     transposed view of [slots, 3, dim] (strides read); ``rstate`` [slots, 16,
     128, 128] fp32 (bf16 with ``key.state_bf16``), a slot dense, slots strided;
-    ``st_idx`` [>= S] int32, <= 0 a pad row; ``epoch`` the ``common/guard.py``
-    block (word 0 the step epoch, bumped once a step), ``layer`` this launch's
-    slot below ``TAG_SLOTS``."""
+    ``st_idx`` [>= S] int32 (K1v: [>= requests], a request's slot), <= 0 a pad
+    row; ``epoch`` the ``common/guard.py`` block (word 0 the step epoch, bumped
+    once a step), ``layer`` this launch's slot below ``TAG_SLOTS``; ``ring`` the
+    layer's ReplaySSM ring (K1v only)."""
     s = key.tokens
     bf = torch.bfloat16
     need((residual is None) == key.first, "residual given iff not the first layer")
@@ -894,13 +1204,17 @@ def gdn_pre(
     need(rstate[0].is_contiguous(), "a recurrent state slot must be dense")
     need(a_log.dtype == torch.float32 and dt_bias.dtype == bf, "A_log / dt_bias dtype")
     need(norm_w.dtype == bf and norm_w.numel() == HD, "gated norm weight")
-    need(st_idx.dtype == torch.int32 and st_idx.numel() >= s, "state indices")
+    need(
+        st_idx.dtype == torch.int32 and st_idx.numel() >= requests(key),
+        "state indices",
+    )
     weights = (hidden, res_out, w_qkvz, w_ba, conv_w, core)
     need(all(t.is_contiguous() for t in weights), "a non-contiguous input")
     need(
         all(t.dtype == bf for t in (hidden, res_out, ln_w, w_ba, core)),
         "activations and dense weights must be bf16",
     )
+    spec = ring_args(key, ring)
     f = build(key)
     f(
         *ABI.pack(
@@ -930,6 +1244,7 @@ def gdn_pre(
                 "epoch": epoch.data_ptr(),
                 "layer": layer,
             }
+            | spec
         ),
         stream=torch.cuda.current_stream(),
     )
