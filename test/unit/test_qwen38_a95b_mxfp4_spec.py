@@ -275,6 +275,16 @@ def test_the_wide_launches_need_the_fused_shared_expert_and_one_eps():
     assert not qwen._builds_wide(*_wide_model(final_eps=1e-5), widths)
 
 
+@pytest.mark.parametrize("proj", ["in_proj_qkvz", "out_proj"])
+def test_a_rotated_gdn_projection_runs_no_split_or_wide_launch(proj):
+    widths = (*range(1, 9), 16, 32)
+    m, layers = _wide_model()
+    assert qwen._builds_split(layers, widths, verify=False)
+    getattr(layers[1].linear_attn, proj).quant_method = _Online(**ROTATED)
+    assert not qwen._builds_wide(m, layers, widths)
+    assert not qwen._builds_split(layers, widths, verify=False)
+
+
 @pytest.mark.parametrize("mxfp4", [False, True])
 def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4):
     _, layers = _wide_model(mxfp4=mxfp4)

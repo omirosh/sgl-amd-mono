@@ -409,10 +409,26 @@ def _proj_input(module, name: str):
         setattr(module, name, proj)
 
 
+def _rotates(layers) -> bool:
+    """Whether SGLang rotates a GDN projection: the split and wide launches
+    quantize their activations without the rotation."""
+    return any(
+        _format(p)[1]
+        for x in layers
+        if _is_gdn(x)
+        for p in (x.linear_attn.in_proj_qkvz, x.linear_attn.out_proj)
+    )
+
+
 def _builds_split(layers, widths, verify) -> bool:
     """The 16-row decode steps run split launches: ``layer_block`` runs their
     MLP half, so every layer needs the fused shared expert."""
-    return ML.SPLIT_MAX in widths and not verify and all(_fse(x.mlp) for x in layers)
+    return (
+        ML.SPLIT_MAX in widths
+        and not verify
+        and all(_fse(x.mlp) for x in layers)
+        and not _rotates(layers)
+    )
 
 
 def _split_keys(layers, eps, gdn_eps, state_bf16, tp, fault_site, fault_after):
@@ -501,13 +517,15 @@ class _Split:
 
 def _builds_wide(model, layers, widths) -> bool:
     """Whether a WIDE-row step runs the wide launches: every shared expert fused,
-    and one eps for the input, post-attention and final norms (a launch's closing
-    combine is the next layer's input norm, with the post-attention eps)."""
+    one eps for the input, post-attention and final norms (a launch's closing
+    combine is the next layer's input norm, with the post-attention eps), and no
+    rotated GDN projection."""
     e1, _, e2 = _eps(layers)
     return (
         WIDE in widths
         and all(_fse(x.mlp) for x in layers)
         and e1 == e2 == model.model.norm.variance_epsilon
+        and not _rotates(layers)
     )
 
 
