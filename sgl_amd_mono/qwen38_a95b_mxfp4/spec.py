@@ -1106,6 +1106,7 @@ class _Built:
             got = {"core": core, "res_out": res_out}
             got |= check.k1v_records(ring, idx[:reqs], self.k1v)
             ref = {n: ref[n] for n in got}
+            check.dump_k1v(layer, h, residual, conv, temporal, idx[:reqs], ref, got, s)
             check.compare("k1v", layer.layer_id, s, ref, got)
         return core, res_out
 

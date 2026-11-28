@@ -88,6 +88,63 @@ def k1_reference(
     return ref
 
 
+K1V_DUMP = "/root/.cache/huggingface/hub/k1v_dump"
+_dumps: list[str] = []
+
+
+def dump_k1v(layer, h, residual, conv, temporal, idx, ref, got, rows) -> None:
+    """Diagnosis only: on rank 0, the inputs, SGLang's normed rows, the layer's
+    weights and both outputs of the first two K1v checks and of each K1v check
+    with a core cosine under 0.9999, to ``K1V_DUMP`` (12 files at most).
+    ``check_k1v_dump.py`` compares both cores with the float64 GDN layer."""
+    import os
+
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().tp_rank != 0 or len(_dumps) >= 12:
+        return
+    cos = _metrics(got["core"], ref["core"]).get("cosine", 1.0)
+    if cos >= 0.9999 and len(_dumps) >= 2:
+        return
+    a = layer.linear_attn
+    if residual is None:
+        x = layer.input_layernorm(h.clone())
+    else:
+        x = layer.input_layernorm(h.clone(), residual.clone())[0]
+
+    def cpu(v):
+        if isinstance(v, dict):
+            return {n: cpu(t) for n, t in v.items()}
+        return v.detach().cpu() if torch.is_tensor(v) else v
+
+    d = {
+        "layer": layer.layer_id,
+        "rows": rows,
+        "cos": cos,
+        "idx": idx,
+        "h": h,
+        "residual": residual,
+        "x_sglang": x,
+        "conv": conv[_live(idx)],
+        "state": temporal[_live(idx)],
+        "ln_w": layer.input_layernorm.weight,
+        "w_qkvz": a.in_proj_qkvz.weight,
+        "w_qkvzs": getattr(a.in_proj_qkvz, "weight_scale", None),
+        "w_ba": a.in_proj_ba.weight,
+        "conv_w": a.conv1d.weight,
+        "a_log": a.A_log,
+        "dt_bias": a.dt_bias,
+        "norm_w": a.norm.weight,
+        "ref": ref,
+        "got": got,
+    }
+    os.makedirs(K1V_DUMP, exist_ok=True)
+    path = f"{K1V_DUMP}/L{layer.layer_id}_{len(_dumps)}.pt"
+    torch.save(cpu(d), path)
+    _dumps.append(path)
+    logger.info("monokernel check dump %s (k1v core cosine %.6g)", path, cos)
+
+
 def k1_outputs(core, res_out, conv, temporal, idx) -> dict:
     rows = _live(idx)
     return {
