@@ -1047,7 +1047,8 @@ class _Built:
             got = check.k1_outputs(core, res_out, conv, temporal, idx[:s])
             check.compare("k1", layer.layer_id, s, ref, got)
         elif check_batch is not None:
-            got = {"core": core} | check.k1v_records(ring, idx[:reqs], self.k1v)
+            got = {"core": core, "res_out": res_out}
+            got |= check.k1v_records(ring, idx[:reqs], self.k1v)
             ref = {n: ref[n] for n in got}
             check.compare("k1v", layer.layer_id, s, ref, got)
         return core, res_out
