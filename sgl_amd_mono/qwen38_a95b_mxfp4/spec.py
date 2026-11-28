@@ -96,10 +96,11 @@ WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX, WIDE)
 # place of K2: at 1 and 4 rows its gate | up tasks (32 columns, K2's 16) leave
 # its busiest CTA more work than K2's
 LAYER_WIDTHS = (2, 3, 5, 6, 7, 8)
-# the same with SGLang's bf16 shared expert: layer_block is 4 to 5% faster at
-# 3, 6 and 8 rows, within 2% at 1, 2, 5 and 7, and 5 to 7% slower at 4
+# the same with SGLang's bf16 shared expert: with one slot an expert pick at 2
+# and 3 rows (UP_MAX), layer_block is 4 to 8% faster at 2, 3, 6 and 8 rows,
+# within 1.3% at 1, 5 and 7, and 5 to 6% slower at 4
 # (TestQwen38MoeD2::test_time_no_fse)
-LAYER_WIDTHS_F0 = (3, 6, 8)
+LAYER_WIDTHS_F0 = (2, 3, 6, 8)
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
