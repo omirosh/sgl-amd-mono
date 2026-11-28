@@ -205,7 +205,8 @@ def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
     """The GDN layer of SGLang's decode (T = 1) or target verify (T draft tokens
     a request: rows r T .. r T + T - 1, from the request's state) from the normed
     input rows `x` to the gated core, in float64 at the stock path's bf16 points
-    (the projections, the conv output, o, the core). `w`: `inputs.k1_weights`
+    (the projections, each conv product as Triton's bf16 multiply rounds it, the
+    conv output, o, the core). `w`: `inputs.k1_weights`
     (`w_qkvzs` there means an MXFP4 in_proj_qkvz in the ASM FP4 GEMM layout);
     `conv` [slots, 2560, 3] and `state` [slots, NV, V, K] are read only; `idx`:
     one state slot a request, <= 0 a pad request (zero core rows).
@@ -242,7 +243,7 @@ def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
         h = state[slot].double()
         for t in range(r * T, r * T + T):
             win = torch.cat([win, proj[t, :ch, None]], 1)
-            mixed[t] = bf(F.silu((win * cw).sum(1)))
+            mixed[t] = bf(F.silu(bf(win * cw).sum(1)))
             win = win[:, 1:]
             q = mixed[t, :key].view(nk, hd)
             k = mixed[t, key : 2 * key].view(nk, hd)
