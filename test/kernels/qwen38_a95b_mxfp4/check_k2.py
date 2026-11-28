@@ -24,11 +24,14 @@ fused shared expert, bf16 and MXFP4 o_proj. At each width the two outputs agree
 (cosine), then each arm's time a launch comes from a CUDA graph that cycles
 through D2_SETS weight sets, so that no layer stays in the MALL between launches.
 ``--timeline`` prints the phase table of both kernels instead; ``--rows`` picks
-the widths, ``--ps-min`` / ``--xq-min`` move layer_block's thresholds.
+the widths, ``--ps-min`` / ``--xq-min`` / ``--up-max`` move layer_block's
+thresholds. The sha1 of layer_block's outputs shows whether a threshold
+changes the bits.
 """
 
 import argparse
 import datetime
+import hashlib
 import itertools
 import os
 import statistics
@@ -634,6 +637,10 @@ def time_d2(rows, fse=True):
                     for n, v in cos.items()
                     if not v >= AGREE[n]
                 ]
+                # equal across builds when the bits are (--up-max 1 against the default)
+                digest = hashlib.sha1(
+                    torch.cat(runs["layer_block"][1:]).view(torch.int16).cpu().numpy()
+                ).hexdigest()[:12]
 
                 def cycle(key, out, res_out):
                     i = itertools.count()
@@ -647,7 +654,8 @@ def time_d2(rows, fse=True):
                     f"d2 fse {int(fse)} oq {int(oq)} s{s}: k2 {k:.2f} us, "
                     f"layer_block {b:.2f} us "
                     f"({100 * (b - k) / k:+.1f}%), cosine out {cos['out']:.6f} "
-                    f"res_out {cos['res_out']:.6f}, rounds k2 {kr} layer_block {br}"
+                    f"res_out {cos['res_out']:.6f}, layer_block sha1 {digest}, "
+                    f"rounds k2 {kr} layer_block {br}"
                 )
             sets.clear()
             torch.cuda.empty_cache()
@@ -776,8 +784,9 @@ def main():
     )
     ap.add_argument("--ps-min", type=int, help="layer_block's PS_MIN (D2)")
     ap.add_argument("--xq-min", type=int, help="layer_block's LAYER_XQ_MIN (D2)")
+    ap.add_argument("--up-max", type=int, help="layer_block's UP_MAX (1: the union)")
     args = ap.parse_args()
-    over = {"PS_MIN": args.ps_min, "LAYER_XQ_MIN": args.xq_min}
+    over = {"PS_MIN": args.ps_min, "LAYER_XQ_MIN": args.xq_min, "UP_MAX": args.up_max}
     over = {k: v for k, v in over.items() if v is not None}
     if over:
         # the disk cache key of a build holds its LayerBuild, not these thresholds
