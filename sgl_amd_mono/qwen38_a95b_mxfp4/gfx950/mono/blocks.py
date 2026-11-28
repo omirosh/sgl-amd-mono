@@ -363,10 +363,6 @@ def build_layer(key: LayerBuild):
     s = key.tokens
     need(1 <= s <= MAXT, f"{s} rows, layer_block takes 1..{MAXT}")
     need(key.oq or not key.oh, "oh rotates the MXFP4 out_proj: it needs oq")
-    need(
-        key.fse or s == MAXT,
-        f"layer_block with the bf16 shared expert: {MAXT} rows only (the spec's)",
-    )
     scr = layer_scratch_layout(key)
     kt = key.kt
     # distinct experts the step can touch + the fused shared

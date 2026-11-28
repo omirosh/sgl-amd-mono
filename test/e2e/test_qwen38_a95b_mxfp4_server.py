@@ -11,8 +11,8 @@ against SGLang's layer (check mode, with the split GDN launch and layer_block at
 16 rows, and at 32 rows the wide launches with the GDN front in a decode step:
 its conv and SSM state rows checked too), with the MXFP4 GDN projections of
 sgl-project/sglang#43839, with SGLang's bf16 shared expert and with the fused
-shared expert of sgl-project/sglang#41899 (and layer_block at 3 and 8 rows); the
-NEXTN verify steps of 4 and 8 rows with and without the fused shared expert
+shared expert of sgl-project/sglang#41899 (layer_block at 3 and 8 rows in both);
+the NEXTN verify steps of 4 and 8 rows with and without the fused shared expert
 (K1v's core rows, conv windows and ReplaySSM ring records against SGLang's
 verify); and a fault on one rank that stops the server before any token of the
 failed step is sent."""
@@ -219,7 +219,7 @@ class TestMonokernelCheck(CustomTestCase):
 
     def test_verify_steps_on_the_replayssm_ring(self):
         # NEXTN verify steps of 1 and 2 requests (4 and 8 rows): K1v on SGLang's
-        # ReplaySSM ring, then K2
+        # ReplaySSM ring, then K2 at 4 rows and layer_block at 8 (checked as k2)
         log = self._check(NEXTN, verify=True)
         self.assertIn("K1 (K1v, 4 draft tokens)", log)
 
@@ -232,9 +232,8 @@ class TestMonokernelCheck(CustomTestCase):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
         # 1, 3 and 8 rows run widths 1, 3 and 8, 16 rows the split launch
         # (checked as k1) and layer_block (checked as k2), and 32 rows the wide
-        # launches; with the fused shared expert, 3 and 8 rows run layer_block
-        # too; with `verify` (NEXTN), 1 and 2 requests run verify steps of 4 and
-        # 8 rows
+        # launches; 3 and 8 rows run layer_block too (LAYER_WIDTHS, LAYER_WIDTHS_F0);
+        # with `verify` (NEXTN), 1 and 2 requests run verify steps of 4 and 8 rows
         widths = (1, 2) if verify else (1, 3, 8, 16, 32)
         para = "The river valley archive lists the flood height of every year. "
         with (
