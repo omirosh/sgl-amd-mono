@@ -205,6 +205,7 @@ SGLANG_READS = {
         "o_proj",
         "q_size",
         "attn_output_gate",
+        "fused_sigmoid_mul",
     ),
     "srt/models/qwen3_5_text.py": (
         "model",
@@ -461,6 +462,43 @@ def _proj_input(module, name: str):
         setattr(module, name, proj)
 
 
+@contextmanager
+def _gate_input(gates: list):
+    """SGLang's attention keeps o_proj's input ungated: the ``fused_sigmoid_mul``
+    of ``qwen3_5`` appends its gate to ``gates`` and returns its input, and the
+    launch after multiplies the gate in (``og``). ponytail: a module-global swap
+    around SGLang's call; the upgrade is a core / gate split in SGLang's Qwen3.5
+    attention."""
+    import sglang.srt.models.qwen3_5 as qwen35
+
+    mul = qwen35.fused_sigmoid_mul
+
+    def keep(x, gate, inplace=False, quant=False, round_sigmoid=False):
+        if quant or round_sigmoid:
+            raise RuntimeError(
+                "Qwen3.8 monokernel: the launches multiply the attention output "
+                "gate in fp32 into a bf16 o_proj input, SGLang asks for "
+                f"quant={quant} round_sigmoid={round_sigmoid}"
+            )
+        gates.append(gate)
+        return x
+
+    qwen35.fused_sigmoid_mul = keep
+    try:
+        yield
+    finally:
+        qwen35.fused_sigmoid_mul = mul
+
+
+def _gated(core, gate):
+    """SGLang's o_proj input from ``_core``'s outputs (check mode)."""
+    if gate is None:
+        return core
+    import sglang.srt.models.qwen3_5 as qwen35
+
+    return qwen35.fused_sigmoid_mul(core, gate)
+
+
 def _wide_format(linear) -> str:
     """A GDN projection's weight format in the split and wide launches
     (``wide.layer.FORMATS``): "mxfp4_h32" rotates the activation by
@@ -601,7 +639,7 @@ def _wide_keys(layers, eps, tp, fault_site, fault_after, front=None) -> list:
             fault_after=fault_after,
         )
         if not _is_gdn(x):
-            keys.append(W.LayerBuild(kind="attn", og=False, **common))
+            keys.append(W.LayerBuild(kind="attn", og=True, **common))
             continue
         o = _wide_format(x.linear_attn.out_proj)
         out = dict(out=o, out_shuffled=o != "bf16")
@@ -686,11 +724,11 @@ class _Wide:
         ids = self.scratch[off : off + 4 * WIDE * (L.TOPK + 1)].view(torch.int32)
         return ids.view(WIDE, L.TOPK + 1)[:, : L.TOPK]
 
-    def launch(self, n, i, layer, core, n_next, front=None):
+    def launch(self, n, i, layer, core, n_next, front=None, gate=None):
         """Layer ``n`` of the step (model layer ``i``) from its out_proj / o_proj
-        input ``core``, or for a ``gdn`` launch from the scratch rows with
-        ``front`` (``_gdn_front``): the residual and the rows ``n_next`` norms stay
-        in the scratch."""
+        input ``core`` (an attention layer's times sigmoid(``gate``)), or for a
+        ``gdn`` launch from the scratch rows with ``front`` (``_gdn_front``): the
+        residual and the rows ``n_next`` norms stay in the scratch."""
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
@@ -698,6 +736,7 @@ class _Wide:
         args = dict.fromkeys(W.ABI.names, 0) | {
             "scratch": self.scratch,
             "core_out" if _is_gdn(layer) else "attn": 0 if core is None else core,
+            "gate": 0 if gate is None else gate,
             "n_post": layer.post_attention_layernorm.weight,
             "n_next": n_next,
             "w_out": o.weight,
@@ -825,6 +864,7 @@ class _Built:
         idx = self._state_indices(reqs) if k1 or split else None
         for n, i in enumerate(range(m.start_layer, m.end_layer)):
             layer = m.layers[i]
+            gate = None
             if _is_gdn(layer) and k1:
                 ring = (
                     self._ring(layer.linear_attn, forward_batch, reqs)
@@ -839,8 +879,8 @@ class _Built:
                     res_attn, x = h, layer.input_layernorm(h)
                 else:
                     x, res_attn = layer.input_layernorm(h, residual)
-                core = self._core(layer, positions, x, forward_batch)
-            h, residual = self._k2(i, layer, core, res_attn, s, fb)
+                core, gate = self._core(layer, positions, x, forward_batch)
+            h, residual = self._k2(i, layer, core, res_attn, s, fb, gate)
         h, _ = m.norm(h, residual)
         return lm.logits_processor(input_ids, h, lm.lm_head, forward_batch, None)
 
@@ -859,7 +899,7 @@ class _Built:
         idx = None
         for n, i in enumerate(range(m.start_layer, m.end_layer)):
             layer = m.layers[i]
-            core = front = None
+            core = front = gate = None
             if w.keys[n].kind == "gdn":
                 idx = self._state_indices(WIDE) if idx is None else idx
                 conv, temporal = self._state(layer.linear_attn, dense=True)
@@ -879,11 +919,11 @@ class _Built:
                 front = _gdn_front(layer, h if n == 0 else None, conv, temporal, idx)
             elif n == 0:
                 res.copy_(h)
-                core = self._core(
+                core, gate = self._core(
                     layer, positions, layer.input_layernorm(h), forward_batch
                 )
             else:
-                core = self._core(layer, positions, x, forward_batch)
+                core, gate = self._core(layer, positions, x, forward_batch)
             nxt = m.layers[i + 1].input_layernorm if i + 1 < m.end_layer else m.norm
             if fb is not None:
                 # SGLang's tail on the launch's input, then its next norm
@@ -891,12 +931,12 @@ class _Built:
                 ref, ids, logits = check.k2_reference(
                     layer,
                     o,
-                    core if front is None else head["core"],
+                    _gated(core, gate) if front is None else head["core"],
                     (res if front is None else head["res_out"]).clone(),
                     fb,
                 )
                 ref["out"], ref["res_out"] = nxt(ref["out"], ref["res_out"])
-            w.launch(n, i, layer, core, nxt.weight, front)
+            w.launch(n, i, layer, core, nxt.weight, front, gate)
             if fb is not None:
                 alike = check.k2_alike(
                     layer.layer_id, ids, logits, w.route_ids(), "wide"
@@ -914,11 +954,16 @@ class _Built:
 
     @staticmethod
     def _core(layer, positions, x, forward_batch):
+        """The out_proj / o_proj input and, for an attention layer, its output
+        gate (``_gate_input``; None for a GDN layer)."""
         if _is_gdn(layer):
             with _proj_input(layer.linear_attn, "out_proj"):
-                return layer.linear_attn(x, forward_batch).contiguous()
-        with _proj_input(layer, "o_proj"):
-            return layer.self_attention(positions, x, forward_batch).contiguous()
+                return layer.linear_attn(x, forward_batch).contiguous(), None
+        gates = []
+        with _proj_input(layer, "o_proj"), _gate_input(gates):
+            core = layer.self_attention(positions, x, forward_batch).contiguous()
+        (gate,) = gates
+        return core, gate.reshape(core.shape).contiguous()
 
     @staticmethod
     def _state_indices(s):
@@ -1081,7 +1126,8 @@ class _Built:
             check.compare("k1", layer.layer_id, s, ref, got)
         return core, res
 
-    def _k2(self, i, layer, core, residual, s, check_batch=None):
+    def _k2(self, i, layer, core, residual, s, check_batch=None, gate=None):
+        """``gate``: an attention layer's output gate (``_core``)."""
         from sgl_amd_mono.qwen38_a95b_mxfp4 import check
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import blocks
@@ -1089,12 +1135,14 @@ class _Built:
         mlp = layer.mlp
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
         if check_batch is not None:
-            ref, ids, logits = check.k2_reference(layer, o, core, residual, check_batch)
+            ref, ids, logits = check.k2_reference(
+                layer, o, _gated(core, gate), residual, check_batch
+            )
         (oq, oh), fse = _format(o), _fse(mlp)
         se, ex = mlp.shared_expert, mlp.experts
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
-        key = self.k2_keys[s, fse, oq, oh]
+        key = self.k2_keys[s, fse, oq, oh, gate is not None]
         wide = isinstance(key, blocks.LayerBuild)
         (blocks.layer_block if wide else k2.layer_post)(
             key,
@@ -1118,6 +1166,7 @@ class _Built:
             w_os=o.weight_scale if oq else None,
             w_sgu=None if se is None else se.gate_up_proj.weight,
             w_sd=None if se is None else se.down_proj.weight,
+            gate=gate,
         )
         if check_batch is not None:
             # ROUTE: (value, tag) pairs; token t's experts at 2 k t, then its weights
@@ -1233,8 +1282,15 @@ def _build(model, hf_config, ctx) -> _Built:
                         fault_site=fault_site,
                         fault_after=fault_after,
                     )
-    outs = {x.linear_attn.out_proj if _is_gdn(x) else x.o_proj for x in layers}
-    out_formats = sorted({_format(o) for o in outs})
+    # o_proj's input format and output gate (``og``: the attention layers)
+    out_formats = sorted(
+        {
+            (*_format(x.linear_attn.out_proj), False)
+            if _is_gdn(x)
+            else (*_format(x.o_proj), True)
+            for x in layers
+        }
+    )
 
     def layer_block_at(w, fse):
         return L.MAX_TOKENS < w <= ML.SPLIT_MAX or w in (
@@ -1242,34 +1298,36 @@ def _build(model, hf_config, ctx) -> _Built:
         )
 
     k2_keys = {
-        (w, fse, oq, oh): k2.K2Build(
+        (w, fse, oq, oh, og): k2.K2Build(
             tokens=w,
             eps=e2,
             fse=fse,
             oq=oq,
             oh=oh,
+            og=og,
             fault_site=fault_site,
             fault_after=fault_after,
         )
         for w in narrow
         for fse in sorted({_fse(x.mlp) for x in layers})
         if not layer_block_at(w, fse)
-        for oq, oh in out_formats
+        for oq, oh, og in out_formats
     }
     wide_keys = {
-        (w, fse, oq, oh): blocks.LayerBuild(
+        (w, fse, oq, oh, og): blocks.LayerBuild(
             tokens=w,
             eps=e2,
             fse=fse,
             oq=oq,
             oh=oh,
+            og=og,
             fault_site=fault_site,
             fault_after=fault_after,
         )
         for w in ctx.widths
         for fse in sorted({_fse(x.mlp) for x in layers})
         if layer_block_at(w, fse)
-        for oq, oh in out_formats
+        for oq, oh, og in out_formats
     }
     builds_wide = _builds_wide(model, layers, ctx.widths)
     epoch = torch.zeros(guard.GUARD_WORDS, dtype=torch.int32, device=device)

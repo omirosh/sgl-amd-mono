@@ -766,8 +766,8 @@ def quant_core(g, src, b, rows: int, core: str):
 
 
 class GatedCore(tiled.Source):
-    """An attention layer's o_proj input: `bf16(attn * bf16(sigmoid(gate)))`,
-    as the stock path's two bf16 tensors multiply."""
+    """An attention layer's o_proj input: `bf16(attn * sigmoid(gate))` in fp32,
+    as SGLang's `fused_sigmoid_mul`."""
 
     def __init__(self, attn, gate, ld_elems: int):
         self.attn, self.gate, self.ld = fx.Int64(attn), fx.Int64(gate), ld_elems
@@ -778,7 +778,7 @@ class GatedCore(tiled.Source):
 
     def convert(self, raw):
         a, gt = unpack_bf16x8(raw[0]), unpack_bf16x8(raw[1])
-        return pack_bf16x8([a[e] * bf16_round(sigmoid(gt[e])) for e in range(8)])
+        return pack_bf16x8([a[e] * sigmoid(gt[e]) for e in range(8)])
 
 
 def out_weights(w_out, w_out_s, fmt: str, shuffled: bool, k: int = VALUE_DIM):

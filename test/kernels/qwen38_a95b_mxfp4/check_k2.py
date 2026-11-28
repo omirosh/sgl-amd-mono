@@ -19,6 +19,13 @@ GPUs (torchrun), on random TP8 shards in SGLang's layouts:
   wait's, or another wait's that needs the stalled CTA) and its flag reaches every
   rank.
 
+``--og`` runs only the attention output gate: K2 and layer_block at each width
+the spec builds, with and without the fused shared expert, multiply ``gate`` into
+``core`` (``og``) as the same build without ``og`` on SGLang's
+``fused_sigmoid_mul(core, gate)``: the outputs agree (cosine OG_COSINE). Both
+round once, so they differ only where the last fp32 ulp of a sigmoid moves a bf16
+product; the number of the bit-equal cases is printed.
+
 ``--time`` (decision D2) runs only this: K2 against layer_block at 1 .. 8 rows,
 fused shared expert, bf16 and MXFP4 o_proj. At each width the two outputs agree
 (cosine), then each arm's time a launch comes from a CUDA graph that cycles
@@ -59,7 +66,12 @@ from sgl_amd_mono.common.stamps import TL_POINTS
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layer as k2
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import layout as L
 from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.mono import blocks
-from sgl_amd_mono.qwen38_a95b_mxfp4.spec import NUMERICS, _compile_only
+from sgl_amd_mono.qwen38_a95b_mxfp4.spec import (
+    LAYER_WIDTHS,
+    LAYER_WIDTHS_F0,
+    NUMERICS,
+    _compile_only,
+)
 
 WIDE = blocks.MAXT  # layer_block's width in the spec
 # (width, fused shared expert) of each launch of the graph replay
@@ -84,6 +96,7 @@ D2_SETS = 12
 # layer_block against K2 on the same rows: the residual sum is K2's o_proj
 # arithmetic, the MoE output differs by about its rounding (the spec's bound)
 AGREE = {"res_out": 0.9999, "out": NUMERICS.bound("k2.out.cosine")}
+OG_COSINE = 0.99999
 
 rank = int(os.environ["RANK"])
 assert int(os.environ["WORLD_SIZE"]) == L.TP, f"needs {L.TP} ranks"
@@ -148,8 +161,9 @@ class Side:
         self.epoch = epoch(DEV, seconds)
         self.scratch = {}
 
-    def run(self, key, w, core, residual, out, res_out, layer=0, bump=True):
-        """``bump=False``: the next layer of the epoch, as the spec's step."""
+    def run(self, key, w, core, residual, out, res_out, layer=0, bump=True, gate=None):
+        """``bump=False``: the next layer of the epoch, as the spec's step;
+        ``gate``: the attention output gate (``key.og``)."""
         slot = is_wide(key), key.tokens, key.timeline
         if slot not in self.scratch:
             n = scratch_bytes(key)
@@ -168,6 +182,7 @@ class Side:
             rank=rank,
             epoch=self.epoch,
             layer=k2.TAG_SLOTS // 2 + layer,
+            gate=gate,
         )
 
     def close(self):
@@ -350,6 +365,53 @@ def check_layer_block(side):
     return ([] if ok else ["layer_block"]) + (
         [] if same else ["layer_block: ranks differ"]
     )
+
+
+def check_og(side):
+    """``--og`` (the module docstring); also one MXFP4 o_proj at 1 and WIDE rows."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    def build(s, fse, oq, og):
+        lb = s == WIDE or s in (LAYER_WIDTHS if fse else LAYER_WIDTHS_F0)
+        kind = blocks.LayerBuild if lb else k2.K2Build
+        return kind(tokens=s, fse=fse, oq=oq, og=og)
+
+    cases = [(s, f, False) for f in (True, False) for s in (*range(1, MAXT + 1), WIDE)]
+    cases += [(1, True, True), (WIDE, True, True)]
+    if not compile_keys(build(*c, og) for c in cases for og in (False, True)):
+        raise SystemExit("a rank failed to compile")
+    bad, equal, worst = [], 0, 1.0
+    for s, fse, oq in cases:
+        w = k2_weights(DEV, rank, 700, fse=fse, oq=oq)
+        g = gen(DEV, 300 + rank)
+        core, gate = rnd(g, s, CORE), rnd(g, s, CORE, scale=2.0)
+        residual = rnd(gen(DEV, 5), s, HIDDEN)
+        got = []
+        for og in (False, True):
+            out = torch.empty(s, HIDDEN, dtype=BF, device=DEV)
+            res_out = torch.empty_like(out)
+            x = core if og else fused_sigmoid_mul(core, gate)
+            key = build(s, fse, oq, og)
+            side.run(key, w, x, residual, out, res_out, gate=gate if og else None)
+            got.append((out, res_out))
+        torch.cuda.synchronize()
+        equal += all(map(torch.equal, *got))
+        for name, a, b in zip(("out", "res_out"), *got):
+            v = cosine(a, b)
+            worst = min(worst, v)
+            if not v >= OG_COSINE:
+                bad.append(f"{s} rows fse {fse} oq {oq} {name}: cosine {v:.7f}")
+    if any(errors(side.epoch).values()):
+        bad.append(f"error words {errors(side.epoch)}")
+    if bad:
+        print(f"[rank {rank}] og: {bad}", flush=True)
+    ok = all_ok(not bad)
+    log(
+        f"og: {len(cases)} K2 and layer_block cases against SGLang's gate, "
+        f"{equal} bit-equal on rank 0, worst cosine {worst:.7f}: "
+        f"{'OK' if ok else 'FAIL'}"
+    )
+    return [] if ok else ["og"]
 
 
 def check_graph_replay(side, replays):
@@ -770,6 +832,7 @@ def main():
     ap.add_argument("--replays", type=int, default=200)
     ap.add_argument("--case", type=int, help="run only chain case CASE (CHAIN_CASES)")
     ap.add_argument("--time", action="store_true", help="run only decision D2's timing")
+    ap.add_argument("--og", action="store_true", help="run only the output gate check")
     ap.add_argument(
         "--no-fse", action="store_true", help="--time with the bf16 shared expert"
     )
@@ -796,6 +859,16 @@ def main():
         for k, v in over.items():
             setattr(blocks, k, v)
         log(f"layer_block thresholds: {over}")
+    if args.og:
+        side = Side()
+        try:
+            fails = check_og(side)
+        finally:
+            side.close()
+        for f in fails:
+            log(f"FAIL {f}")
+        dist.destroy_process_group()
+        sys.exit(1 if fails else 0)
     if args.case is not None or args.time or args.timeline:
         if args.timeline:
             fails = time_phases(args.rows)

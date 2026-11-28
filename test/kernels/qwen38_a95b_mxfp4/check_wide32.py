@@ -6,14 +6,15 @@ or SGLang's bf16 shared expert, the MoE TP reduce and the next layer's input nor
 on random TP8 shards in SGLang's layouts, against float64 references with the
 stock rounding points (``wide_reference``):
 
-- compile: every wide key the spec can make (``attn`` on the gated core,
+- compile: every wide key the spec can make (``attn`` with the output gate,
   ``gdn_back`` with a bf16, an MXFP4 or a Hadamard-32 MXFP4 out_proj, at 17 and
   32 rows; the decode step's ``gdn`` keys and the launches before them, at 32
   rows) compiles on every rank;
 - chain: one step of three launches (``gdn_back``, ``attn``, ``gdn_back``) at 17
   and 32 rows, with a bf16, an MXFP4 and a Hadamard-32 MXFP4 out_proj
   (sgl-project/sglang#46059 rotates its weight), with the fused and the bf16
-  shared expert; each launch's MoE input rows,
+  shared expert; the ``attn`` launch multiplies in the output gate (``og``), its
+  reference is fed SGLang's ``fused_sigmoid_mul``; each launch's MoE input rows,
   routes, route weights, residual and normed rows against the reference fed the
   previous launch's outputs (relative Frobenius errors);
 - front: one decode step of two ``gdn`` launches at 32 rows (the step's first
@@ -43,6 +44,7 @@ import torch
 import torch.distributed as dist
 import wide_reference as R
 from inputs import BF, CORE, MAXT, epoch, errors, gen, k1_state, k1_weights
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
@@ -122,7 +124,7 @@ def allsum(part):
 def key(kind, rows, fmt, **kw):
     """The spec's wide key (``spec._wide_keys``) of a layer kind."""
     if kind == "attn":
-        return W.LayerBuild(kind="attn", tokens=rows, tp=L.TP, og=False, rip=L.RI, **kw)
+        return W.LayerBuild(kind="attn", tokens=rows, tp=L.TP, og=True, rip=L.RI, **kw)
     return W.LayerBuild(
         kind="gdn_back",
         tokens=rows,
@@ -213,13 +215,14 @@ class Side:
             torch.float32
         ).view(-1, L.SLOTS)
 
-    def run(self, n, k, layer, core, w, n_post, n_next, front=None):
+    def run(self, n, k, layer, core, w, n_post, n_next, front=None, gate=None):
         """Launch ``n`` of the step: model layer ``layer`` from its out_proj /
-        o_proj input ``core``, or for ``gdn`` from the scratch rows with the GDN
-        arguments ``front``."""
+        o_proj input ``core`` (``attn``: times sigmoid(``gate``)), or for ``gdn``
+        from the scratch rows with the GDN arguments ``front``."""
         args = dict.fromkeys(W.ABI.names, 0) | {
             "scratch": self.scratch,
             "attn" if k.kind == "attn" else "core_out": 0 if core is None else core,
+            "gate": 0 if gate is None else gate,
             "n_post": n_post,
             "n_next": n_next,
             "w_out": w["out"],
@@ -351,15 +354,20 @@ def check_chain(rows, fmt, fse=True):
             w = weights(shared, mine, kind, fmt, fse)
             cols = L.ATTN_CORE if kind == "attn" else L.VALUE_DIM
             core = (torch.randn(rows, cols, generator=mine, device=DEV)).to(BF)
+            gate = ref_core = None
+            if kind == "attn":
+                gate = (2 * torch.randn(rows, cols, generator=mine, device=DEV)).to(BF)
+                ref_core = fused_sigmoid_mul(core, gate)
             n_post, n_next = norms[2 * n], norms[2 * n + 1]
             res = side.view("res", L.HIDDEN).clone()
-            side.run(n, k, n, core, w, n_post, n_next)
+            side.run(n, k, n, core, w, n_post, n_next, gate=gate)
             torch.cuda.synchronize()
             words = errors(side.epoch)
             if any(words.values()):
                 notes.append((f"L{n} guard error words {words}", 1.0, 0.0))
                 break
-            notes += tail_notes(side, f"L{n} {kind}", res, core, w, n_post, n_next)
+            ref_core = core if ref_core is None else ref_core
+            notes += tail_notes(side, f"L{n} {kind}", res, ref_core, w, n_post, n_next)
     finally:
         side.close()
     se = "fused" if fse else "bf16"

@@ -141,6 +141,9 @@ class TestQwen38MoeK2(CustomTestCase):
     def test_k2(self):
         self.assertEqual(_run("check_k2.py", "--replays", "200", ranks=8), 0)
 
+    def test_og(self):
+        self.assertEqual(_run("check_k2.py", "--og", ranks=8), 0)
+
     def test_chain(self):
         # a process a case: a launch that hangs stops only its own case
         rcs = []

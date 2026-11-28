@@ -314,10 +314,45 @@ def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4, fse):
     assert all(k.tokens == qwen.WIDE and not k.qkv_tail for k in keys)
     assert all(k.fse == fse for k in keys)
     assert all(k.next_q4 == "none" and not k.first for k in keys)
-    # SGLang applies the attention output gate before o_proj
-    assert not keys[3].og
+    # the attention launch multiplies in SGLang's output gate (_gate_input)
+    assert keys[3].og
     assert keys[0].out == ("mxfp4" if mxfp4 else "bf16")
     assert keys[0].out_shuffled == mxfp4
+
+
+def test_the_attention_core_leaves_sglangs_output_gate_to_the_launch(monkeypatch):
+    from sglang.srt import models
+
+    def mul(x, gate, inplace=False, quant=False, round_sigmoid=False):
+        return x * torch.sigmoid(gate.reshape(x.shape))
+
+    fake = SimpleNamespace(fused_sigmoid_mul=mul)
+    monkeypatch.setitem(sys.modules, "sglang.srt.models.qwen3_5", fake)
+    monkeypatch.setattr(models, "qwen3_5", fake, raising=False)
+
+    class Attention(torch.nn.Module):
+        """SGLang's Qwen3.5 self_attention: o_proj of the gated output."""
+
+        def __init__(self, quant=False):
+            super().__init__()
+            self.o_proj, self.quant = torch.nn.Identity(), quant
+
+        def self_attention(self, positions, x, forward_batch):
+            gate = (x + 1).view(2, 2, 2)  # 3D, as SGLang's native path
+            out = fake.fused_sigmoid_mul(2 * x, gate, inplace=True, quant=self.quant)
+            output, _ = self.o_proj(out)
+            return output
+
+    x = torch.arange(8.0).view(2, 4)
+    layer = Attention()
+    core, gate = qwen._Built._core(layer, None, x, None)
+    assert torch.equal(core, 2 * x) and torch.equal(gate, x + 1)
+    assert gate.is_contiguous() and fake.fused_sigmoid_mul is mul
+    assert isinstance(layer.o_proj, torch.nn.Identity)
+    assert torch.equal(qwen._gated(core, gate), 2 * x * torch.sigmoid(x + 1))
+    with pytest.raises(RuntimeError, match="quant=True"):
+        qwen._Built._core(Attention(quant=True), None, x, None)
+    assert fake.fused_sigmoid_mul is mul
 
 
 @pytest.mark.parametrize("mxfp4", [False, True])
