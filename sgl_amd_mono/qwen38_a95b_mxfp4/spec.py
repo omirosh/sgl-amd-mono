@@ -40,7 +40,9 @@ post-attention norm, the MoE and its TP reduce, and the next layer's input norm
 rows on in their scratch, so SGLang runs no input norm between them. In a decode
 step, a GDN layer's launch also runs its front from the normed rows, as K1 does:
 in_proj_qkvz and in_proj_ba, the conv and the gated delta rule with their state
-updates, and the gated norm. It needs the fused shared expert.
+updates, and the gated norm. With SGLang's bf16 shared expert, the launch's
+router also makes the shared gate | up, and its least busy CTAs the shared
+down projection (``wide.stages.moe``).
 
 The kernels read SGLang's weights in place at each launch (SGLang repacks
 in_proj_qkvz after the build). MXFP4 GDN projections (sgl-project/sglang#43839)
@@ -555,14 +557,14 @@ class _Split:
 
 
 def _builds_wide(model, layers, widths) -> bool:
-    """Whether a WIDE-row step runs the wide launches: every shared expert fused,
-    and one eps for the input, post-attention and final norms (a launch's
-    closing combine is the next layer's input norm, with the post-attention
-    eps)."""
+    """Whether a WIDE-row step runs the wide launches: one shared-expert layout
+    (fused, or SGLang's bf16 shared expert) for every layer, and one eps for the
+    input, post-attention and final norms (a launch's closing combine is the next
+    layer's input norm, with the post-attention eps)."""
     e1, _, e2 = _eps(layers)
     return (
         WIDE in widths
-        and all(_fse(x.mlp) for x in layers)
+        and len({_fse(x.mlp) for x in layers}) == 1
         and e1 == e2 == model.model.norm.variance_epsilon
     )
 
@@ -588,6 +590,7 @@ def _wide_keys(layers, eps, tp, fault_site, fault_after, front=None) -> list:
             tokens=WIDE,
             tp=tp,
             rip=L.RI,
+            fse=_fse(x.mlp),
             eps=eps,
             next_q4=q4(layers[n + 1]) if n + 1 < len(layers) else "none",
             fault_site=fault_site,
@@ -620,15 +623,22 @@ def _wide_keys(layers, eps, tp, fault_site, fault_after, front=None) -> list:
 
 
 def _router_gates(layers) -> list:
-    """Each layer's router gate with the shared expert's gate as its last row,
-    [E + 1, H]: the wide router reads one matrix. ponytail: SGLang's two weights
-    become views of it, so the build keeps no copy; the upgrade is a second
-    weight pointer in the wide router."""
+    """Each layer's router matrix (``wide.stages.moe.router_rows``): the router
+    gate, without the fused shared expert the shared expert's gate_up_proj, then
+    the shared expert's gate as its last row, [E + 1 (+ 2 RI), H]: the wide
+    router reads one matrix. ponytail: SGLang's weights become views of it, so
+    the build keeps no copy; the upgrade is a weight pointer for each in the wide
+    router."""
     out = []
     for x in layers:
-        g, sg = x.mlp.gate.weight, x.mlp.shared_expert_gate.weight
-        both = torch.cat([g.data, sg.data], 0)
-        g.data, sg.data = both[: g.shape[0]], both[g.shape[0] :]
+        ws = [x.mlp.gate.weight]
+        if not _fse(x.mlp):
+            ws.append(x.mlp.shared_expert.gate_up_proj.weight)
+        ws.append(x.mlp.shared_expert_gate.weight)
+        both = torch.cat([w.data for w in ws], 0)
+        at = 0
+        for w in ws:
+            w.data, at = both[at : at + w.shape[0]], at + w.shape[0]
         out.append(both)
     return out
 
@@ -680,7 +690,7 @@ class _Wide:
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
         o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
-        ex = layer.mlp.experts
+        ex, se = layer.mlp.experts, layer.mlp.shared_expert
         args = dict.fromkeys(W.ABI.names, 0) | {
             "scratch": self.scratch,
             "core_out" if _is_gdn(layer) else "attn": 0 if core is None else core,
@@ -693,6 +703,7 @@ class _Wide:
             "w13s": ex.w13_weight_scale,
             "w2": ex.w2_weight,
             "w2s": ex.w2_weight_scale,
+            "w_sd": 0 if se is None else se.down_proj.weight,
             "peers": self.peers,
             "rank": self.rank,
             "epoch": self.epoch,

@@ -8,13 +8,14 @@ rows layer_block and of 32 rows the wide launches (with the fused shared expert,
 layer_block runs at 2, 3, 5 to 8 and 16 rows); the tokens of covered steps
 scored again by the normal prefill path (KL consistency); each covered layer
 against SGLang's layer (check mode, with the split GDN launch and layer_block at
-16 rows), with the MXFP4 GDN projections of sgl-project/sglang#43839, also with
-the fused shared expert of sgl-project/sglang#41899 (and layer_block at 3 and 8
-rows, at 32 the wide launches, with the GDN front in a decode step: its conv and
-SSM state rows checked too); the NEXTN verify steps of 4 and 8 rows with and
-without the fused shared expert (K1v's core rows, conv windows and ReplaySSM ring
-records against SGLang's verify); and a fault on one rank that stops the server
-before any token of the failed step is sent."""
+16 rows, and at 32 rows the wide launches with the GDN front in a decode step:
+its conv and SSM state rows checked too), with the MXFP4 GDN projections of
+sgl-project/sglang#43839, with SGLang's bf16 shared expert and with the fused
+shared expert of sgl-project/sglang#41899 (and layer_block at 3 and 8 rows); the
+NEXTN verify steps of 4 and 8 rows with and without the fused shared expert
+(K1v's core rows, conv windows and ReplaySSM ring records against SGLang's
+verify); and a fault on one rank that stops the server before any token of the
+failed step is sent."""
 
 import json
 import math
@@ -196,16 +197,16 @@ class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLang quantizes the GDN projections to MXFP4 by default
         # (sgl-project/sglang#43839), so K1 runs qq and K2 oq; 16 rows run
-        # layer_block with the bf16 shared expert
-        log = self._check()
+        # layer_block and 32 rows the wide launches with the bf16 shared expert
+        log = self._check(["--max-running-requests", "32"])
         self.assertRegex(log, r"Online MXFP4 GDN in_proj_qkvz,out_proj: [1-9]")
+        self.assertIn("2 split and 5 wide launches", log)
 
     def test_each_covered_layer_with_the_fused_shared_expert(self):
         # sgl-project/sglang#41899 quantizes the BF16 shared expert and fuses it as
         # routed expert 512, so K2 runs fse; without the fusion SGLang only warns
         log = self._check(
-            ["--enforce-shared-experts-fusion", "--max-running-requests", "32"],
-            fse=True,
+            ["--enforce-shared-experts-fusion", "--max-running-requests", "32"]
         )
         self.assertIn("Quantizing the BF16 shared expert to MXFP4 while loading", log)
         # K2 at 1 and 4 rows, layer_block at LAYER_WIDTHS and 16 (bf16 and MXFP4
@@ -227,13 +228,14 @@ class TestMonokernelCheck(CustomTestCase):
         log = self._check([*NEXTN, "--enforce-shared-experts-fusion"], verify=True)
         self.assertIn("K1 (K1v, 4 draft tokens)", log)
 
-    def _check(self, extra_args=(), fse=False, verify=False):
+    def _check(self, extra_args=(), verify=False):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
-        # 1, 3 and 8 rows run widths 1, 3 and 8, and 16 rows the split launch
-        # (checked as k1) and layer_block (checked as k2); with `fse`, 3 and 8
-        # rows run layer_block too, and 32 rows the wide launches; with
-        # `verify` (NEXTN), 1 and 2 requests run verify steps of 4 and 8 rows
-        widths = (1, 2) if verify else (1, 3, 8, 16, 32) if fse else (1, 3, 8, 16)
+        # 1, 3 and 8 rows run widths 1, 3 and 8, 16 rows the split launch
+        # (checked as k1) and layer_block (checked as k2), and 32 rows the wide
+        # launches; with the fused shared expert, 3 and 8 rows run layer_block
+        # too; with `verify` (NEXTN), 1 and 2 requests run verify steps of 4 and
+        # 8 rows
+        widths = (1, 2) if verify else (1, 3, 8, 16, 32)
         para = "The river valley archive lists the flood height of every year. "
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
@@ -279,9 +281,7 @@ class TestMonokernelCheck(CustomTestCase):
             want = {(kind, rows) for kind in ("k1v", "k2") for rows in (4, 8)}
         else:
             want = {(kind, rows) for kind in ("k1", "k2") for rows in (1, 3, 8)}
-            want |= {("k1", 16), ("k2", 16)}
-        if fse and not verify:
-            want.add(("wide", 32))
+            want |= {("k1", 16), ("k2", 16), ("wide", 32)}
         self.assertTrue(want <= seen, seen)
         violations = re.findall(r"monokernel check violation: .*", log)
         self.assertEqual(violations, [], "\n".join(violations[:20]))

@@ -110,6 +110,9 @@ class LayerBuild:
     state_bf16: bool = False  # gdn: SGLang's bf16 SSM state (else f32)
     og: bool = True  # attn: o_proj's input is attn x sigmoid(gate), else `attn` as is
     rip: int = 256  # the experts' padded intermediate rows a rank
+    # the shared expert fused as expert 512, else SGLang's bf16 shared expert
+    # (``moe.Shape.fse``: its gate | up rows in ``w_gate``, its down_proj ``w_sd``)
+    fse: bool = True
     eps: float = 1e-6
     gdn_eps: float = 1e-6
     trace: bool = False  # CTA 0 stamps the clock at every phase end (``phase_names``)
@@ -187,6 +190,7 @@ ABI = KernelAbi(
         "w13s",
         "w2",
         "w2s",
+        "w_sd",
         "peers",
         "rank",
         "epoch",
@@ -243,6 +247,7 @@ def _part_words(rows: int) -> int:
         gdn.out_plan(),
         gdn.out_plan(ATTN_CORE),
         moe.router_plan(),
+        moe.router_plan(fse=False),
         attn_.qkv_plan(),
     ]
     return max(p.partial_words(rows) for p in plans)
@@ -256,6 +261,8 @@ def _resident_chunks() -> int:
         gdn.out_plan(),
         gdn.out_plan(ATTN_CORE),
         moe.router_plan(),
+        moe.router_plan(fse=False),
+        moe.shared_down_plan(),
         attn_.qkv_plan(),
     ]
     return max(p.max_per for p in plans)
@@ -315,7 +322,7 @@ def build(key: LayerBuild):
     if key in _BUILDS:
         return _BUILDS[key]
     S, tp = key.tokens, key.tp
-    shape = moe.Shape(S, key.rip)
+    shape = moe.Shape(S, key.rip, key.fse)
     aux_words = max(ex_.GroupTile.words(S), gdn.recur_lds_words(), norm.LDS_WORDS)
     chunks = _resident_chunks()
 
@@ -345,6 +352,7 @@ def build(key: LayerBuild):
     name += "" if key.out == "bf16" else f"_out_{key.out}"
     name += "_qkv" if key.qkv_tail else ""
     name += "_sb16" if key.state_bf16 else ""
+    name += "" if key.fse or key.split else "_f0"
     name += "_split" if key.split else ""
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -378,6 +386,7 @@ def build(key: LayerBuild):
         w13s: Int64,
         w2: Int64,
         w2s: Int64,
+        w_sd: Int64,
         peers: Int64,
         rank: Int32,
         epoch: Int64,
@@ -472,7 +481,7 @@ def build(key: LayerBuild):
                 end_phase("first_combine")
 
             def mlp_half():
-                mw = moe.Weights(w_gate, w13, w13s, w2, w2s)
+                mw = moe.Weights(w_gate, w13, w13s, w2, w2s, w_sd)
                 b = moe.Bufs(
                     part=scr.part,
                     x4=scr.x4,
@@ -636,6 +645,7 @@ def build(key: LayerBuild):
         w13s: Int64,
         w2: Int64,
         w2s: Int64,
+        w_sd: Int64,
         peers: Int64,
         rank: Int32,
         epoch: Int64,
@@ -677,6 +687,7 @@ def build(key: LayerBuild):
             w13s,
             w2,
             w2s,
+            w_sd,
             peers,
             rank,
             epoch,

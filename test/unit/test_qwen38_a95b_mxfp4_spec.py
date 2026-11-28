@@ -266,12 +266,14 @@ def _wide_model(fse=True, mxfp4=True, final_eps=1e-6):
     return m, layers
 
 
-def test_the_wide_launches_need_the_fused_shared_expert_and_one_eps():
+def test_the_wide_launches_need_one_shared_expert_layout_and_one_eps():
     widths = (*range(1, 9), 16, 32)
     m, layers = _wide_model()
     assert qwen._builds_wide(m, layers, widths)
     assert not qwen._builds_wide(m, layers, widths[:-1])
-    assert not qwen._builds_wide(*_wide_model(fse=False), widths)
+    assert qwen._builds_wide(*_wide_model(fse=False), widths)
+    layers[2].mlp = _mlp(fse=False)
+    assert not qwen._builds_wide(m, layers, widths)
     assert not qwen._builds_wide(*_wide_model(final_eps=1e-5), widths)
 
 
@@ -301,14 +303,16 @@ def test_a_rotated_gdn_projection_gets_the_hadamard_keys(proj):
         assert [k.next_q4 for k in front[:3]] == ["plain", "plain", "none"]
 
 
+@pytest.mark.parametrize("fse", [False, True])
 @pytest.mark.parametrize("mxfp4", [False, True])
-def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4):
-    _, layers = _wide_model(mxfp4=mxfp4)
+def test_the_wide_keys_start_at_out_proj_or_o_proj(mxfp4, fse):
+    _, layers = _wide_model(fse=fse, mxfp4=mxfp4)
     keys = qwen._wide_keys(layers, 1e-6, 8, 0, 0)
     assert [k.kind for k in keys] == ["gdn_back"] * 3 + ["attn"] + ["gdn_back"] * 3 + [
         "attn"
     ]
     assert all(k.tokens == qwen.WIDE and not k.qkv_tail for k in keys)
+    assert all(k.fse == fse for k in keys)
     assert all(k.next_q4 == "none" and not k.first for k in keys)
     # SGLang applies the attention output gate before o_proj
     assert not keys[3].og
@@ -349,6 +353,26 @@ def test_the_router_gates_are_views_of_one_matrix():
         assert x.mlp.gate.weight.data_ptr() == both.data_ptr()
         assert x.mlp.shared_expert_gate.weight.data_ptr() == both[4:].data_ptr()
         assert torch.equal(x.mlp.gate.weight, g)
+
+
+def test_the_router_matrix_takes_the_bf16_shared_gate_up_before_the_shared_gate():
+    x = _layer(0, fse=False)
+    p = torch.nn.Parameter
+    x.mlp.gate = SimpleNamespace(weight=p(torch.randn(4, 8)))
+    x.mlp.shared_expert = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight=p(torch.randn(6, 8)))
+    )
+    x.mlp.shared_expert_gate = SimpleNamespace(weight=p(torch.randn(1, 8)))
+    ws = [
+        x.mlp.gate.weight,
+        x.mlp.shared_expert.gate_up_proj.weight,
+        x.mlp.shared_expert_gate.weight,
+    ]
+    want = [w.clone() for w in ws]
+    (both,) = qwen._router_gates([x])
+    assert torch.equal(both, torch.cat(want))
+    for w, at in zip(ws, (0, 4, 10)):
+        assert w.data_ptr() == both[at:].data_ptr()
 
 
 @pytest.mark.parametrize("wide", [False, True])
