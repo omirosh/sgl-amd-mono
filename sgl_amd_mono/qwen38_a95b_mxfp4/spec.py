@@ -20,9 +20,9 @@ layers.
 A step of 16 rows (decode or verify) runs SGLang's GDN or attention up to
 out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
 from vllm-project/vllm#67421) in place of K2. It keeps no x tile in LDS, so it
-takes the rows K2 cannot, with or without the fused shared expert. With the
-fused shared expert, it also runs in place of K2 at the widths of
-``LAYER_WIDTHS``. In a decode step of 16 rows, a GDN layer runs its front as one split launch (``gfx950/wide/layer.py``,
+takes the rows K2 cannot, with or without the fused shared expert. It also
+runs in place of K2 at the widths of ``LAYER_WIDTHS`` (fused shared expert) or
+``LAYER_WIDTHS_F0`` (bf16 shared expert). In a decode step of 16 rows, a GDN layer runs its front as one split launch (``gfx950/wide/layer.py``,
 the ``gdn`` kind at 16 rows, from vllm-project/vllm#67421 at 28f094565b and
 vllm-project/vllm#67678 at ce476ce305) in place of SGLang's GDN: input norm, in_proj_qkvz and in_proj_ba, the conv and the gated delta rule
 with their state updates, and the gated norm, as K1 does.
@@ -91,6 +91,10 @@ WIDTHS = (*range(1, L.MAX_TOKENS + 1), ML.SPLIT_MAX, WIDE)
 # place of K2: at 1 and 4 rows its gate | up tasks (32 columns, K2's 16) leave
 # its busiest CTA more work than K2's
 LAYER_WIDTHS = (2, 3, 5, 6, 7, 8)
+# the same with SGLang's bf16 shared expert: layer_block is 4 to 5% faster at
+# 3, 6 and 8 rows, within 2% at 1, 2, 5 and 7, and 5 to 7% slower at 4
+# (TestQwen38MoeD2::test_time_no_fse)
+LAYER_WIDTHS_F0 = (3, 6, 8)
 # the mailbox tags a launch writes: K1 at slot i, K2 at TAG_SLOTS // 2 + i
 TAG_SLOTS = 256
 MAX_LAYERS = TAG_SLOTS // 2
@@ -1094,7 +1098,9 @@ def _build(model, hf_config, ctx) -> _Built:
     out_formats = sorted({_format(o) for o in outs})
 
     def layer_block_at(w, fse):
-        return L.MAX_TOKENS < w <= ML.SPLIT_MAX or (fse and w in LAYER_WIDTHS)
+        return L.MAX_TOKENS < w <= ML.SPLIT_MAX or w in (
+            LAYER_WIDTHS if fse else LAYER_WIDTHS_F0
+        )
 
     k2_keys = {
         (w, fse, oq, oh): k2.K2Build(

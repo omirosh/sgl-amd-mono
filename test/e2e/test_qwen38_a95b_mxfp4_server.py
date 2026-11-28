@@ -11,8 +11,8 @@ with the split GDN launch and layer_block at 16 rows, and at 32 rows the wide
 launches with the GDN front in a decode step: its conv and SSM state rows
 checked too), with the MXFP4 GDN projections of sgl-project/sglang#43839, with
 SGLang's bf16 shared expert and with the fused shared expert of
-sgl-project/sglang#41899 (and layer_block at 3 and 8 rows); and a fault on one
-rank that stops the server before any token of the failed step is sent."""
+sgl-project/sglang#41899 (layer_block at 3 and 8 rows in both); and a fault on
+one rank that stops the server before any token of the failed step is sent."""
 
 import json
 import math
@@ -209,7 +209,7 @@ class TestMonokernelCheck(CustomTestCase):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each launch;
         # 1, 3 and 8 rows run widths 1, 3 and 8, 16 rows the split launch
         # (checked as k1) and layer_block (checked as k2), and 32 rows the wide
-        # launches; with the fused shared expert, 3 and 8 rows run layer_block too
+        # launches; 3 and 8 rows run layer_block too (LAYER_WIDTHS, LAYER_WIDTHS_F0)
         widths = (1, 3, 8, 16, 32)
         para = "The river valley archive lists the flood height of every year. "
         with (

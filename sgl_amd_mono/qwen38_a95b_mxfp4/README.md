@@ -17,8 +17,8 @@ NEXTN verify step has one row for each token that it scores. GDN is Gated DeltaN
 | checkpoint | `amd/Qwen3.8-2.4T-A95B-Quark-MXFP4`, with MXFP4 routed experts, a bf16 shared expert and bf16 GDN projections |
 | GPU and TP | gfx950 on MI355X, TP 8 |
 | SGLang steps | decode and NEXTN verify |
-| widths | 1 to 8 for K1 and K2, from `layout.MAX_TOKENS`. 16 for `layer_block`, from `mono/layout.SPLIT_MAX`, with or without the fused shared expert. With the fused shared expert, `layer_block` also replaces K2 at the widths of `spec.LAYER_WIDTHS` (2, 3 and 5 to 8). 16 for the split launch, in a decode step. 32 for the wide launches, from `spec.WIDE`, with or without the fused shared expert. |
-| launches per step | 161 on each rank in a decode step of 1 to 8 rows. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2 (`layer_block` in place of K2 at the widths of `LAYER_WIDTHS`, with the fused shared expert). A verify step of 1 to 8 rows has 92, one K2 or `layer_block` launch for each decoder layer. A decode step of 16 rows has 161. Each GDN layer runs a split launch and `layer_block`, and each full-attention layer runs `layer_block`. A verify step of 16 rows has 92, one `layer_block` launch for each decoder layer. A step of 32 rows has 92, one wide launch for each decoder layer. In a decode step of 32 rows, the wide launch of a GDN layer also runs the GDN front, so SGLang runs only the 23 attention blocks. |
+| widths | 1 to 8 for K1 and K2, from `layout.MAX_TOKENS`. 16 for `layer_block`, from `mono/layout.SPLIT_MAX`, with or without the fused shared expert. `layer_block` also replaces K2 at the widths of `spec.LAYER_WIDTHS` (2, 3 and 5 to 8) with the fused shared expert, and of `spec.LAYER_WIDTHS_F0` (3, 6 and 8) with the bf16 shared expert. 16 for the split launch, in a decode step. 32 for the wide launches, from `spec.WIDE`, with or without the fused shared expert. |
+| launches per step | 161 on each rank in a decode step of 1 to 8 rows. Each of the 69 GDN layers runs K1 and K2, and each of the 23 full-attention layers runs K2 (`layer_block` in place of K2 at the widths of `LAYER_WIDTHS` or `LAYER_WIDTHS_F0`). A verify step of 1 to 8 rows has 92, one K2 or `layer_block` launch for each decoder layer. A decode step of 16 rows has 161. Each GDN layer runs a split launch and `layer_block`, and each full-attention layer runs `layer_block`. A verify step of 16 rows has 92, one `layer_block` launch for each decoder layer. A step of 32 rows has 92, one wide launch for each decoder layer. In a decode step of 32 rows, the wide launch of a GDN layer also runs the GDN front, so SGLang runs only the 23 attention blocks. |
 | other steps | SGLang's forward runs prefill, extend, the steps wider than 8 except 16 and 32, and the MTP draft model |
 
 | file | contents |
@@ -267,7 +267,9 @@ split launches, with and without the fused shared expert: one for layer 0 and on
 `layer_block` run `oq` on the GDN layers, with `oh` when SGLang rotates them, and the bf16 build on the
 full-attention layers. Each layer runs the launch of its own format. With the fused shared expert, `_build` also
 makes `layer_block` launches in place of the K2 launches at the widths of `LAYER_WIDTHS`: at 1 and 4 rows, the `ug`
-tasks of `layer_block` (32 columns, K2 16) give its busiest CTA more work than K2.
+tasks of `layer_block` (32 columns, K2 16) give its busiest CTA more work than K2. With the bf16 shared expert, it
+makes them at the widths of `LAYER_WIDTHS_F0`: `TestQwen38MoeD2::test_time_no_fse` gives `layer_block` 4 to 5% less
+time than K2 at 3, 6 and 8 rows, within 2% at 1, 2, 5 and 7 rows, and 5 to 7% more at 4 rows.
 When each layer has the same shared-expert layout, and the input, post-attention and final norms have one eps, `_build`
 also makes the wide launches of the width 32. With speculative decoding, it makes one `attn` build and one `gdn_back`
 build for the `out_proj` format. Without speculative decoding, it makes the `gdn` builds of the first layer, of a GDN
@@ -351,7 +353,7 @@ check-mode test needs the SGLang log line "Online MXFP4 GDN in_proj_qkvz,out_pro
 check-mode test runs with `--enforce-shared-experts-fusion`. It also needs the SGLang log line "Quantizing the BF16
 shared expert to MXFP4 while loading", because SGLang only warns when it does not fuse the shared expert. Both tests
 also send 16 requests, and check mode must log a split launch check and a `layer_block` check at 16 rows. The checks at
-3 and 8 rows of the test with the fused shared expert also run `layer_block`. Both tests also send 32 requests with
+3 and 8 rows also run `layer_block`. Both tests also send 32 requests with
 `--max-running-requests 32`, and check mode must log a `wide` check at 32 rows. These servers have no speculative
 decoding, so their steps of 32 rows run the `gdn` kind. Their build logs must show 2 split launches and 5 wide
 launches. Check mode compares
