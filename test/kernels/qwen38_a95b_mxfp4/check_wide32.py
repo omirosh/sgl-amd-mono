@@ -492,6 +492,15 @@ def check_front(fmt, rows=32, slots=40, fse=True):
                 "st_idx": idx,
             }
             conv0, state0 = conv.clone(), state.clone()
+            seen = None
+            if F64 and qq and not h32 and n > 0:
+                seen = (
+                    side.view("x", L.HIDDEN).clone(),
+                    R.dequant_mx(
+                        side.view("x4", L.HIDDEN // 2, torch.uint8),
+                        side.view("x4s", L.HIDDEN // 32, torch.int32),
+                    ),
+                )
             side.run(n, k, n, None, w, n_post, n_next, front)
             torch.cuda.synchronize()
             words = [errors(side.epoch), errors(k1_epoch)]
@@ -501,7 +510,18 @@ def check_front(fmt, rows=32, slots=40, fse=True):
             tag = f"front L{n}"
             if F64 and not h32:
                 f64_rows(
-                    tag, fse, res, n_in, w1, conv0, state0, idx, ref_core, side, qq
+                    tag,
+                    fse,
+                    res,
+                    n_in,
+                    w1,
+                    conv0,
+                    state0,
+                    idx,
+                    ref_core,
+                    side,
+                    qq,
+                    seen,
                 )
             if qq:
                 core = R.dequant_mx(
@@ -542,11 +562,14 @@ def check_front(fmt, rows=32, slots=40, fse=True):
 F64 = "--front-f64" in sys.argv
 
 
-def f64_rows(tag, fse, res, n_in, w1, conv0, state0, idx, k1_core, side, qq):
+def f64_rows(tag, fse, res, n_in, w1, conv0, state0, idx, k1_core, side, qq, seen=None):
     """Prints, for each rank, K1's and the launch's core against the float64 GDN
     layer (``wide_reference.gdn``) on the launch's input rows: over the live
     rows, and each row with an error above 1e-2. An MXFP4 core is compared
-    with the MXFP4 quantization of the float64 core."""
+    with the MXFP4 quantization of the float64 core. ``seen``: the normed rows
+    and their MXFP4 rows that the previous launch wrote for this one; then also
+    the launch against the float64 layer on those rows, and the MXFP4 input
+    codes that differ from the quantization of the reference norm."""
     live = idx > 0
     x = R.gemma_norm(res.double(), n_in, EPS)
     ref = R.gdn(x, w1, conv0, state0, idx, 1, EPS)[0]
@@ -575,6 +598,19 @@ def f64_rows(tag, fse, res, n_in, w1, conv0, state0, idx, k1_core, side, qq):
         f"K1 quantized {rel(qk1[live], qref[live]):.2e}, the launch "
         f"{rel(got[live], qref[live]):.2e}; rows over 1e-2 (row, slot, K1, K1 "
         f"quantized, the launch): {bad}",
+        flush=True,
+    )
+    if seen is None:
+        return
+    sx, sxq = seen
+    own = R.quant_act(R.gdn(sx.double(), w1, conv0, state0, idx, 1, EPS, xq=sxq)[0])
+    e_own = row(got, own)
+    moved = (sxq != R.quant_act(x)).sum(-1)
+    print(
+        f"[rank {rank}] F64 {tag} fse={fse} on the launch's input rows: the launch "
+        f"{rel(got[live], own[live]):.2e}, x {rel(sx[live].double(), x[live]):.2e}; "
+        f"rows over 1e-2 or with moved input codes (row, slot, the launch, moved "
+        f"codes): {[(i, int(idx[i]), f'{e_own[i]:.4f}', int(moved[i])) for i in live.nonzero().flatten().tolist() if e_own[i] > 1e-2 or moved[i]]}",
         flush=True,
     )
 

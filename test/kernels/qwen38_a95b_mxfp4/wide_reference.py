@@ -201,7 +201,7 @@ def unshuffle_scale(sc):
     )
 
 
-def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
+def gdn(x, w, conv, state, idx, T=1, eps=1e-6, xq=None):
     """The GDN layer of SGLang's decode (T = 1) or target verify (T draft tokens
     a request: rows r T .. r T + T - 1, from the request's state) from the normed
     input rows `x` to the gated core, in float64 at the stock path's bf16 points
@@ -210,6 +210,9 @@ def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
     (`w_qkvzs` there means an MXFP4 in_proj_qkvz in the ASM FP4 GEMM layout);
     `conv` [slots, 2560, 3] and `state` [slots, NV, V, K] are read only; `idx`:
     one state slot a request, <= 0 a pad request (zero core rows).
+
+    `xq`: the dequantized MXFP4 rows that the in_proj_qkvz GEMM reads, in place
+    of `quant_act(x)` (a launch that quantized them itself).
 
     Returns the core and, for SGLang's kernel on the same inputs, the conv
     output (q | k | v), z, b and a (bf16-valued float64)."""
@@ -221,7 +224,7 @@ def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
         n = wq.shape[0]
         s = w["w_qkvzs"].view(torch.uint8).view(n, -1)
         wq = dequant_mx(unshuffle_data(wq.view(torch.uint8)), unshuffle_scale(s))
-        proj = linear(x, wq, "mxfp4")
+        proj = linear(x, wq, "mxfp4") if xq is None else bf(xq.double() @ wq.T)
     else:
         proj = linear(x, wq, "bf16")
     ba = linear(x, w["w_ba"], "bf16")
