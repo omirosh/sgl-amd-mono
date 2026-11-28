@@ -7,16 +7,18 @@ on random TP8 shards in SGLang's layouts, against float64 references with the
 stock rounding points (``wide_reference``):
 
 - compile: every wide key the spec can make (``attn`` on the gated core,
-  ``gdn_back`` with a bf16 or an MXFP4 out_proj, at 17 and 32 rows; the decode
-  step's ``gdn`` keys and the launches before them, at 32 rows) compiles on
-  every rank;
+  ``gdn_back`` with a bf16, an MXFP4 or a Hadamard-32 MXFP4 out_proj, at 17 and
+  32 rows; the decode step's ``gdn`` keys and the launches before them, at 32
+  rows) compiles on every rank;
 - chain: one step of three launches (``gdn_back``, ``attn``, ``gdn_back``) at 17
-  and 32 rows, with a bf16 and an MXFP4 out_proj; each launch's MoE input rows,
+  and 32 rows, with a bf16, an MXFP4 and a Hadamard-32 MXFP4 out_proj
+  (sgl-project/sglang#46059 rotates its weight); each launch's MoE input rows,
   routes, route weights, residual and normed rows against the reference fed the
   previous launch's outputs (relative Frobenius errors);
 - front: one decode step of two ``gdn`` launches at 32 rows (the step's first
   layer, then the next layer from the first launch's MXFP4 rows), bf16
-  projections and an f32 state, or MXFP4 projections and a bf16 state, with
+  projections and an f32 state, or MXFP4 (plain or Hadamard-32) projections and
+  a bf16 state, with
   pad rows: each launch's core and conv and SSM state rows against K1 on 8-row
   chunks of its input rows, every other state slot kept, and its tail as in
   the chain;
@@ -51,7 +53,7 @@ from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 from sgl_amd_mono.qwen38_a95b_mxfp4.spec import _compile_only
 
 WIDTHS = (17, 32)
-FORMATS = ("bf16", "mxfp4")
+FORMATS = ("bf16", "mxfp4", "mxfp4_h32")
 STEP = ("gdn_back", "attn", "gdn_back")
 EPS = 1e-6
 
@@ -97,7 +99,7 @@ def key(kind, rows, fmt, **kw):
         tokens=rows,
         tp=L.TP,
         out=fmt,
-        out_shuffled=fmt == "mxfp4",
+        out_shuffled=fmt != "bf16",
         rip=L.RI,
         **kw,
     )
@@ -120,14 +122,15 @@ def compile_keys(keys):
 
 
 def check_compile():
-    q4 = W.q4_of("mxfp4")
     keys = {key(kind, s, f) for kind in set(STEP) for s in WIDTHS for f in FORMATS}
     # the decode keys: the GDN fronts, and the launches before an MXFP4 front
-    keys |= {front_key(32, qq, n) for qq in (False, True) for n in (0, 1)}
-    keys |= {
-        replace(front_key(32, True, 1), next_q4=q4),
-        key("attn", 32, "bf16", next_q4=q4),
-    }
+    keys |= {front_key(32, f, n) for f in FORMATS for n in (0, 1)}
+    for f in FORMATS[1:]:
+        q4 = W.q4_of(f)
+        keys |= {
+            replace(front_key(32, f, 1), next_q4=q4),
+            key("attn", 32, "bf16", next_q4=q4),
+        }
     keys = sorted(keys, key=repr)
     t0 = time.time()
     ok = compile_keys(keys)
@@ -236,12 +239,13 @@ def weights(shared, mine, kind, fmt):
     }
 
 
-def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
+def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next="none"):
     """(name, relative error, bound) of a launch's MoE input rows, routes, route
     weights, residual and normed rows, against the reference fed the launch's
-    residual ``res`` and out_proj / o_proj input ``core``. ``q4_next``: the
-    closing combine quantized its rows for the next in_proj_qkvz into the MoE
-    input rows' buffer: they are checked as that."""
+    residual ``res`` and out_proj / o_proj input ``core``. ``q4_next`` (a
+    ``norm.Q4_MODES`` mode): the closing combine quantized its rows for the
+    next in_proj_qkvz into the MoE input rows' buffer: they are checked as
+    that."""
     rows = side.rows
     z1 = res.double() + allsum(R.linear(core.double(), w["out_r"], w["fmt"]))
     res1 = R.bf(z1)
@@ -251,7 +255,7 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
         side.view("x4s", L.HIDDEN // 32, torch.int32),
     )
     notes = []
-    if not q4_next:
+    if q4_next == "none":
         notes.append((f"{tag} moe input (MXFP4)", rel(kxd, R.quant_act(xn)), 2e-2))
     kids, kws = side.route()
     y, ids, ws = R.moe(
@@ -266,7 +270,7 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
         L.RI,
         L.RI,
         prefer=kids[:, : L.TOPK],
-        xd=None if q4_next else kxd,
+        xd=None if q4_next != "none" else kxd,
     )
     same = sum(set(kids[r].tolist()) == set(ids[r].tolist()) for r in range(rows))
     notes.append((f"{tag} routes", 1 - same / rows, 0.0))
@@ -276,8 +280,11 @@ def tail_notes(side, tag, res, core, w, n_post, n_next, q4_next=False):
     notes.append((f"{tag} residual", rel(side.view("res", L.HIDDEN), res2), 1e-2))
     x2 = R.gemma_norm(z2, n_next, EPS)
     notes.append((f"{tag} x", rel(side.view("x", L.HIDDEN), x2), 1e-2))
-    if q4_next:
-        notes.append((f"{tag} next qkvz rows (MXFP4)", rel(kxd, R.quant_act(x2)), 2e-2))
+    if q4_next != "none":
+        x2q = R.rotate32(x2) if q4_next.startswith("h32") else x2
+        notes.append(
+            (f"{tag} next qkvz rows (MXFP4)", rel(kxd, R.quant_act(x2q)), 2e-2)
+        )
     return notes
 
 
@@ -321,10 +328,12 @@ def check_chain(rows, fmt):
     return [] if ok else [f"chain ({rows} rows, {fmt})"]
 
 
-def front_key(rows, qq, n):
+def front_key(rows, fmt, n):
     """The spec's decode key of GDN layer ``n`` (0: the step's first) of a step
-    of GDN layers; ``qq``: MXFP4 in_proj_qkvz and out_proj and a bf16 state."""
-    fmt, q4 = ("mxfp4", W.q4_of("mxfp4")) if qq else ("bf16", "none")
+    of GDN layers: in_proj_qkvz and out_proj of format ``fmt``, and with MXFP4
+    a bf16 state."""
+    qq = fmt != "bf16"
+    q4 = W.q4_of(fmt) if qq else "none"
     return W.LayerBuild(
         kind="gdn",
         tokens=rows,
@@ -341,16 +350,17 @@ def front_key(rows, qq, n):
     )
 
 
-def check_front(qq, rows=32, slots=40):
+def check_front(fmt, rows=32, slots=40):
     """Two ``gdn`` launches, the step's first GDN layer and the next, against K1
     on 8-row chunks of the same input rows and state: the core, the conv and SSM
     state rows, the other slots kept; then each launch's tail (``tail_notes``)
     on its own core. Layer 0's experts add zero (the MoE output of a ``gdn``
-    launch is checked on layer 1)."""
-    fmt = "mxfp4" if qq else "bf16"
-    keys = [front_key(rows, qq, n) for n in range(2)]
+    launch is checked on layer 1). A Hadamard-32 core is rotated already, so
+    its tail reads it with the plain MXFP4 GEMM of the rotated weight."""
+    qq, h32 = fmt != "bf16", fmt == "mxfp4_h32"
+    keys = [front_key(rows, fmt, n) for n in range(2)]
     k1 = gdn.K1Build(
-        tokens=MAXT, first=True, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq
+        tokens=MAXT, first=True, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq, qh=h32
     )
     try:
         _compile_only(gdn.build(k1))
@@ -435,7 +445,8 @@ def check_front(qq, rows=32, slots=40):
                     side.view("core", L.VALUE_DIM // 2, torch.uint8),
                     side.view("core_s", L.VALUE_DIM // 32, torch.int32),
                 )
-                want, tol = R.quant_act(ref_core.double()), 2e-2
+                want = R.rotate32(ref_core) if h32 else ref_core.double()
+                want, tol = R.quant_act(want), 2e-2
             else:
                 core, want, tol = side.view("core", L.VALUE_DIM).clone(), ref_core, 1e-2
             notes.append((f"{tag} core", rel(core[idx > 0], want[idx > 0]), tol))
@@ -445,9 +456,8 @@ def check_front(qq, rows=32, slots=40):
                 state[keep], state0[keep]
             )
             notes.append((f"{tag} other slots changed", 0.0 if kept else 1.0, 0.0))
-            notes += tail_notes(
-                side, tag, res, core, w, n_post, n_next, k.next_q4 != "none"
-            )
+            tw = w | {"fmt": "mxfp4"} if h32 else w
+            notes += tail_notes(side, tag, res, core, tw, n_post, n_next, k.next_q4)
             res = side.view("res", L.HIDDEN).clone()
     finally:
         side.close()
@@ -507,9 +517,9 @@ def main():
         for fmt in FORMATS:
             dist.barrier()
             fails += check_chain(rows, fmt)
-    for qq in (False, True):
+    for fmt in FORMATS:
         dist.barrier()
-        fails += check_front(qq)
+        fails += check_front(fmt)
     dist.barrier()
     fails += check_fault()
     for f in fails:

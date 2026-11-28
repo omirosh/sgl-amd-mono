@@ -276,13 +276,29 @@ def test_the_wide_launches_need_the_fused_shared_expert_and_one_eps():
 
 
 @pytest.mark.parametrize("proj", ["in_proj_qkvz", "out_proj"])
-def test_a_rotated_gdn_projection_runs_no_split_or_wide_launch(proj):
+def test_a_rotated_gdn_projection_gets_the_hadamard_keys(proj):
+    # sgl-project/sglang#46059 rotates the weight: the launch rotates the activation
     widths = (*range(1, 9), 16, 32)
     m, layers = _wide_model()
-    assert qwen._builds_split(layers, widths, verify=False)
     getattr(layers[1].linear_attn, proj).quant_method = _Online(**ROTATED)
-    assert not qwen._builds_wide(m, layers, widths)
-    assert not qwen._builds_split(layers, widths, verify=False)
+    assert qwen._builds_wide(m, layers, widths)
+    assert qwen._builds_split(layers, widths, verify=False)
+    split = qwen._split_keys(layers, 1e-6, 1e-6, True, 8, 0, 0)[:3]
+    back = qwen._wide_keys(layers, 1e-6, 8, 0, 0)
+    front = qwen._wide_keys(layers, 1e-6, 8, 0, 0, front=(1e-6, True))
+    if proj == "in_proj_qkvz":
+        assert [k.qkvz for k in split] == ["mxfp4", "mxfp4_h32", "mxfp4"]
+        assert [k.first_q4 for k in split] == ["plain", "h32", "plain"]
+        assert [k.qkvz for k in front[:3]] == ["mxfp4", "mxfp4_h32", "mxfp4"]
+        assert [k.next_q4 for k in front[:3]] == ["h32", "plain", "none"]
+        assert all(k.out == "mxfp4" for k in front[:3])
+    else:
+        # the split launch leaves the core in bf16: layer_block rotates it (oh)
+        assert all(k.out == "bf16" for k in split)
+        assert [k.out for k in back[:3]] == ["mxfp4", "mxfp4_h32", "mxfp4"]
+        assert [k.out for k in front[:3]] == ["mxfp4", "mxfp4_h32", "mxfp4"]
+        assert all(k.out_shuffled for k in back[:3] + front[:3])
+        assert [k.next_q4 for k in front[:3]] == ["plain", "plain", "none"]
 
 
 @pytest.mark.parametrize("mxfp4", [False, True])

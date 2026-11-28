@@ -5,11 +5,13 @@ input norm, in_proj_qkvz and in_proj_ba, the conv and the recurrence with the
 gated norm) on 8 gfx950 GPUs (torchrun), on random TP8 shards in SGLang's
 layouts:
 
-- compile: every split key the spec can make (layer 0 or not, a bf16 or an
-  MXFP4 in_proj_qkvz, an f32 or a bf16 SSM state) compiles on every rank;
+- compile: every split key the spec can make (layer 0 or not, a bf16, an
+  MXFP4 or a Hadamard-32 MXFP4 in_proj_qkvz, an f32 or a bf16 SSM state)
+  compiles on every rank;
 - front: two decode steps of two split launches (the step's first GDN layer
   from the embedding, then the next from its input and residual), bf16
-  projections and an f32 state, or an MXFP4 in_proj_qkvz and a bf16 state, with
+  projections and an f32 state, or an MXFP4 in_proj_qkvz (plain or Hadamard-32,
+  sgl-project/sglang#46059) and a bf16 state, with
   pad rows: each launch's core, residual, and conv and SSM state rows against K1
   on 8-row chunks of the same input rows and state, a zero core on the pad rows,
   every other state slot kept. Each step has new input rows, so a launch that
@@ -62,17 +64,18 @@ def rel(a, b) -> float:
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
-def split_key(qq, first, state_bf16, **kw):
-    """The spec's split key (``spec._split_keys``) of a GDN layer; ``qq``: an
-    MXFP4 in_proj_qkvz."""
+def split_key(fmt, first, state_bf16, **kw):
+    """The spec's split key (``spec._split_keys``) of a GDN layer with an
+    in_proj_qkvz of format ``fmt`` (``W.FORMATS``)."""
+    qq = fmt != "bf16"
     return W.LayerBuild(
         kind="gdn",
         tokens=ROWS,
         tp=L.TP,
         rip=L.RI,
         first=first,
-        first_q4=W.q4_of("mxfp4") if qq else "none",
-        qkvz="mxfp4" if qq else "bf16",
+        first_q4=W.q4_of(fmt) if qq else "none",
+        qkvz=fmt,
         qkvz_shuffled=qq,
         eps=EPS,
         gdn_eps=EPS,
@@ -99,8 +102,8 @@ def compile_keys(keys):
 
 def check_compile():
     keys = [
-        split_key(qq, first, sb)
-        for qq in (False, True)
+        split_key(fmt, first, sb)
+        for fmt in W.FORMATS
         for first in (True, False)
         for sb in (False, True)
     ]
@@ -172,14 +175,20 @@ class Side:
         self.peer.close()
 
 
-def check_front(qq, slots=40, steps=2):
+def check_front(fmt, slots=40, steps=2):
     """``steps`` decode steps of two split launches against K1 on 8-row chunks
     of the same input rows and state."""
-    fmt = "mxfp4" if qq else "bf16"
-    keys = [split_key(qq, n == 0, qq) for n in range(2)]
+    qq = fmt != "bf16"
+    keys = [split_key(fmt, n == 0, qq) for n in range(2)]
     k1s = [
         gdn.K1Build(
-            tokens=MAXT, first=n == 0, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq
+            tokens=MAXT,
+            first=n == 0,
+            eps=EPS,
+            norm_eps=EPS,
+            state_bf16=qq,
+            qq=qq,
+            qh=fmt == "mxfp4_h32",
         )
         for n in range(2)
     ]
@@ -269,7 +278,7 @@ def check_front(qq, slots=40, steps=2):
 
 def check_fault(slots=40):
     fault = dict(fault_site=1) if rank == 3 else {}
-    k = split_key(True, False, True, stop=False, **fault)
+    k = split_key("mxfp4", False, True, stop=False, **fault)
     if not compile_keys([k]):
         raise SystemExit("a rank failed to compile the fault key")
     shared, mine = gen(DEV, 77), gen(DEV, 78 + rank)
@@ -309,9 +318,9 @@ def check_fault(slots=40):
 
 def main():
     fails = check_compile()
-    for qq in (False, True):
+    for fmt in W.FORMATS:
         dist.barrier()
-        fails += check_front(qq)
+        fails += check_front(fmt)
     dist.barrier()
     fails += check_fault()
     for f in fails:

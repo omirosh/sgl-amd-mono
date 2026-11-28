@@ -172,10 +172,14 @@ builds do this:
 
 - The `qh` build of K1 rotates the normed rows, then quantizes them. `in_proj_ba` reads the rows before the rotation.
 - The `oh` build of K2 and of `layer_block` rotates the core rows in the same way.
+- The split and wide launches take the format `mxfp4_h32` of `gfx950/wide/` (`spec._wide_format`). Each combine before
+  a rotated `in_proj_qkvz` writes the rotated MXFP4 rows (`h32`). A wide launch rotates the core before a rotated
+  `out_proj`. The split launch leaves the core in bf16, and the `oh` build of `layer_block` rotates it.
 
 The rotation adds in the order of `hadamard32_rotate` of [aiter#6734](https://github.com/ROCm/aiter/pull/6734), so the
 rotated bf16 values are the same as AITER's, bit for bit. A block lies on 4 adjacent lanes. Stages 1, 2 and 4 run in
-the lane, and stages 8 and 16 exchange values with the lanes `lane ^ 1` and `lane ^ 2`.
+the lane, and stages 8 and 16 exchange values with the lanes `lane ^ 1` and `lane ^ 2`. The wide launches add in the
+same order on the 32 values of one lane (`wide/stages/norm.hadamard32`), with the same f32 factor 1 / sqrt(32).
 
 ## 3. Hand-offs and guarded waits
 

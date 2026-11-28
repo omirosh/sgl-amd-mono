@@ -72,12 +72,30 @@ def quant_act(x):
     return dequant_mx(q.view(torch.uint8), s.view(torch.uint8)[: xb.shape[0]])
 
 
+def rotate32(x):
+    """`block_hadamard_rotate` of bf16-valued `x`: f32 math, bf16 out, in
+    the fast transform's order (`norm.hadamard32`) as the kernels sum it: a
+    matmul's order rounds a rare bf16 ulp apart, which moves a whole 32-group's
+    MXFP4 codes."""
+    v = x.float().unflatten(-1, (-1, 32))
+    h = 1
+    while h < 32:
+        v = v.unflatten(-1, (-1, 2, h))
+        a, b = v[..., 0, :], v[..., 1, :]
+        v = torch.stack([a + b, a - b], -2).flatten(-3)
+        h *= 2
+    return bf((v * torch.tensor(1.0 / 32**0.5, dtype=torch.float32)).flatten(-2))
+
+
 def linear(x, w, fmt: str):
-    """`x @ W.T` with the stock rounding: `w` a bf16 weight, or for "mxfp4" the
-    dequantized float64 weight with the input quantized as the ASM FP4 GEMM
-    does. Returns bf16-rounded float64."""
+    """`x @ W.T` with the stock rounding: `w` a bf16 weight, or for "mxfp4" /
+    "mxfp4_h32" the dequantized float64 weight (of the rotated weight for h32)
+    with the input quantized (after its rotation) as the ASM FP4 GEMM does.
+    Returns bf16-rounded float64."""
     if fmt == "bf16":
         return bf(x.double() @ w.double().T)
+    if fmt == "mxfp4_h32":
+        x = rotate32(x)
     return bf(quant_act(x) @ w.T)
 
 
