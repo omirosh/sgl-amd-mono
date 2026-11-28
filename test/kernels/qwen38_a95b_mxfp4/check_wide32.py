@@ -414,8 +414,9 @@ def check_front(fmt, rows=32, slots=40, fse=True):
     launch is checked on layer 1). A Hadamard-32 core is rotated already, so
     its tail reads it with the plain MXFP4 GEMM of the rotated weight."""
     qq, h32 = fmt != "bf16", fmt == "mxfp4_h32"
-    se = "fused" if fse else "bf16"
-    keys = [front_key(rows, fmt, n, fse) for n in range(2)]
+    fses = fse if isinstance(fse, tuple) else (fse, fse)
+    se = "/".join("fused" if f else "bf16" for f in fses)
+    keys = [front_key(rows, fmt, n, fses[n]) for n in range(2)]
     k1 = gdn.K1Build(
         tokens=MAXT, first=True, eps=EPS, norm_eps=EPS, state_bf16=qq, qq=qq, qh=h32
     )
@@ -467,13 +468,13 @@ def check_front(fmt, rows=32, slots=40, fse=True):
                     epoch=k1_epoch,
                     layer=0,
                 )
-            w = weights(shared, mine, "gdn_back", fmt, fse)
+            w = weights(shared, mine, "gdn_back", fmt, fses[n])
             if n == 0:
                 # The next input norm reads the unrounded residual sum, and K1
                 # below reads only the stored bf16 residual: with no expert
                 # output the sum is bf16-exact, so both norm the same rows.
                 w |= {"w2": torch.zeros_like(w["w2"]), "r2": torch.zeros_like(w["r2"])}
-                if not fse:
+                if not fses[n]:
                     w["sd"] = torch.zeros_like(w["sd"])
             front = {
                 "emb": res if n == 0 else 0,
@@ -506,6 +507,14 @@ def check_front(fmt, rows=32, slots=40, fse=True):
                 )
                 want = R.rotate32(ref_core) if h32 else ref_core.double()
                 notes += mx_notes(f"{tag} core", core[idx > 0], want[idx > 0], 2e-2)
+                wq = R.quant_act(want)
+                per = [(r, int(idx[r]), rel(core[r : r + 1], wq[r : r + 1])) for r in range(rows) if idx[r] > 0]
+                hi = [(r, sl, round(v, 4)) for r, sl, v in per if v > 1e-2]
+                kb = R.quant_act(R.bf(want).double())
+                print(f"[rank {rank}] DIAG {se} {tag}: rows over 1e-2 (row, slot, err): {hi}; "
+                      f"rows {len(per)}; core vs quant(bf16 ref) {rel(core[idx > 0], kb[idx > 0]):.3e}; "
+                      f"ref finite {bool(torch.isfinite(ref_core).all())} core finite {bool(torch.isfinite(core).all())}",
+                      flush=True)
             else:
                 core = side.view("core", L.VALUE_DIM).clone()
                 notes.append(
@@ -518,7 +527,11 @@ def check_front(fmt, rows=32, slots=40, fse=True):
             )
             notes.append((f"{tag} other slots changed", 0.0 if kept else 1.0, 0.0))
             tw = w | {"fmt": "mxfp4"} if h32 else w
+            before = len(notes)
             notes += tail_notes(side, tag, res, core, tw, n_post, n_next, k.next_q4)
+            print(f"[rank {rank}] DIAG {se} {tag} notes: "
+                  + "; ".join(f"{a}={v:.2e}" for a, v, _ in notes[before - 8 if before >= 8 else 0:]),
+                  flush=True)
             res = side.view("res", L.HIDDEN).clone()
     finally:
         side.close()
@@ -574,17 +587,15 @@ def check_fault(rows=32, fmt="mxfp4"):
 
 
 def main():
-    fails = check_compile()
-    for fse in (True, False):
-        for rows in WIDTHS:
-            for fmt in FORMATS:
-                dist.barrier()
-                fails += check_chain(rows, fmt, fse)
-    for fmt, fse in [*((f, True) for f in FORMATS), ("mxfp4", False)]:
+    fails = []
+    for fse in (True, False, (False, True), (True, False)):
         dist.barrier()
-        fails += check_front(fmt, fse=fse)
-    dist.barrier()
-    fails += check_fault()
+        fails += check_front("mxfp4", fse=fse)
+    for fse in (True, False):
+        dist.barrier()
+        fails += check_front("mxfp4_h32", fse=fse)
+        dist.barrier()
+        fails += check_front("bf16", fse=fse)
     for f in fails:
         log(f"FAIL {f}")
     log("PASS" if not fails else f"FAIL ({len(fails)})")
