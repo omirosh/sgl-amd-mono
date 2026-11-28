@@ -402,9 +402,9 @@ def test_each_gdn_layer_gets_the_split_key_of_its_format():
     assert [k.qkvz for k in keys] == ["mxfp4", "bf16"]
 
 
-def test_the_split_launch_runs_only_in_fse_decode_at_16_rows():
-    fse = [_layer(i, fse=True) for i in range(2)]
-    assert qwen._builds_split(fse, (8, 16), verify=False)
-    assert not qwen._builds_split(fse, (8, 16), verify=True)
-    assert not qwen._builds_split(fse, (8,), verify=False)
-    assert not qwen._builds_split([_layer(0, fse=False)], (8, 16), verify=False)
+@pytest.mark.parametrize("fse", [False, True])
+def test_the_split_launch_runs_only_in_decode_at_16_rows(fse):
+    layers = [_layer(i, fse=fse) for i in range(2)]
+    assert qwen._builds_split(layers, (8, 16), verify=False)
+    assert not qwen._builds_split(layers, (8, 16), verify=True)
+    assert not qwen._builds_split(layers, (8,), verify=False)

@@ -465,9 +465,9 @@ def _wide_format(linear) -> str:
 
 
 def _builds_split(layers, widths, verify) -> bool:
-    """The 16-row decode steps run split launches: ``layer_block`` runs their
-    MLP half, so every layer needs the fused shared expert."""
-    return ML.SPLIT_MAX in widths and not verify and all(_fse(x.mlp) for x in layers)
+    """The 16-row decode steps run split launches: ``layer_block`` of the
+    layer's shared-expert layout runs their MLP half."""
+    return ML.SPLIT_MAX in widths and not verify
 
 
 def _split_keys(layers, eps, gdn_eps, state_bf16, tp, fault_site, fault_after):
