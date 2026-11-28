@@ -11,6 +11,7 @@ sgl-project/sglang#43516 kernels, bit for bit (``check_port.py``, where that
 SGLang is installed)."""
 
 import importlib.util
+import re
 import subprocess
 import sys
 import time
@@ -162,6 +163,30 @@ class TestQwen38MoeD2(CustomTestCase):
 
     def test_time_no_fse(self):
         self.assertEqual(_run("check_k2.py", "--time", "--no-fse", ranks=8), 0)
+
+    def test_up_keeps_bits(self):
+        """A slot for each pick at 2 and 3 rows (UP_MAX) gives the union's bits."""
+        sha = []
+        for extra in ((), ("--up-max", "1")):
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--nproc-per-node=8",
+                    "--master-port=29630",
+                    str(CHECKS / "check_k2.py"),
+                    *("--time", "--rows", "2,3", *extra),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+            print(r.stdout, r.stderr[-4000:], sep="\n", flush=True)
+            self.assertEqual(r.returncode, 0)
+            sha.append(re.findall(r"(oq \d s\d+): .*sha1 (\w+)", r.stdout))
+        self.assertEqual(len(sha[0]), 4)
+        self.assertEqual(sha[0], sha[1])
 
     def test_diagnose(self):
         """layer_block's xq and ps thresholds at 2 .. 4 rows, and the phase table."""
