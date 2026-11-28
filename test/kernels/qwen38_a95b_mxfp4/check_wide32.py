@@ -79,6 +79,34 @@ def rel(a, b) -> float:
     return float((a - b).norm() / b.norm().clamp_min(1e-30))
 
 
+def mx_notes(tag, got, want, tol):
+    """(name, value, bound) of dequantized MXFP4 rows ``got`` against AITER's
+    quantization of ``want``. A bf16 ulp in a 32-group's largest value can move
+    the group's e8m0 scale by one step, and with it every code of the group: the
+    relative error leaves out the moved groups, and at most 0.5% of the groups
+    may move, by one step each."""
+    want = R.quant_act(want)
+    g, w = got.double().unflatten(-1, (-1, 32)), want.unflatten(-1, (-1, 32))
+
+    def exp(v):  # the e8m0 exponent of each group: its largest code is 4 or 6
+        return torch.floor(torch.log2(v.abs().amax(-1).clamp_min(1e-30)))
+
+    step = (exp(g) - exp(w)).abs()
+    moved = step > 0
+    if moved.any():
+        n, of = int(moved.sum()), moved.numel()
+        print(f"[rank {rank}] {tag}: the scale of {n} of {of} groups moved", flush=True)
+    return [
+        (f"{tag} (groups with an unmoved scale)", rel(g[~moved], w[~moved]), tol),
+        (
+            f"{tag} share of groups whose scale moved",
+            float(moved.double().mean()),
+            5e-3,
+        ),
+        (f"{tag} largest scale step", float(step.max()), 1.0),
+    ]
+
+
 def allsum(part):
     """Every rank's bf16 partial, summed in rank order -> bf16."""
     parts = [torch.empty_like(part.cpu()) for _ in range(L.TP)]
@@ -457,10 +485,14 @@ def check_front(qq, rows=32, slots=40, fse=True):
                     side.view("core", L.VALUE_DIM // 2, torch.uint8),
                     side.view("core_s", L.VALUE_DIM // 32, torch.int32),
                 )
-                want, tol = R.quant_act(ref_core.double()), 2e-2
+                notes += mx_notes(
+                    f"{tag} core", core[idx > 0], ref_core.double()[idx > 0], 2e-2
+                )
             else:
-                core, want, tol = side.view("core", L.VALUE_DIM).clone(), ref_core, 1e-2
-            notes.append((f"{tag} core", rel(core[idx > 0], want[idx > 0]), tol))
+                core = side.view("core", L.VALUE_DIM).clone()
+                notes.append(
+                    (f"{tag} core", rel(core[idx > 0], ref_core[idx > 0]), 1e-2)
+                )
             notes.append((f"{tag} conv", rel(conv[live], ref_conv[live]), 1e-2))
             notes.append((f"{tag} state", rel(state[live], ref_state[live]), 1e-2))
             kept = torch.equal(conv[keep], conv0[keep]) and torch.equal(
@@ -477,7 +509,8 @@ def check_front(qq, rows=32, slots=40, fse=True):
     for b in bad:
         print(f"[rank {rank}] front {fmt} {se}: {b}", flush=True)
     ok = all_ok(not bad)
-    worst = max((v for name, v, _ in notes if "routes" not in name), default=0.0)
+    errs = (v for name, v, _ in notes if not name.endswith(("routes", "moved", "step")))
+    worst = max(errs, default=0.0)
     log(
         f"front ({rows} rows, {fmt} GDN projections, {se} shared expert): rank 0 "
         f"largest error {worst:.2e}: {'OK' if ok else 'FAIL'}"
