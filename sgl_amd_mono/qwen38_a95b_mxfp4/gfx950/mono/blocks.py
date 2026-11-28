@@ -81,6 +81,8 @@ R0 = NRED  # 64
 RT0 = R0 + R_TASKS  # 80: shared gate CTAs, a token each
 PS0 = RT0 + MAXT  # 96: the fused shared expert's early ug CTAs
 LAYER_XQ_MIN = 5
+# rows up to which (from 2) each pick gets its own union slot (no union pass)
+UP_MAX = 3
 # rows from which down runs the slots of run_ug's full rounds first, under its
 # last round (needs the fused shared expert's tasks first: ``ps``)
 SPLIT_MIN = 8
@@ -127,8 +129,16 @@ class LayerBuild(msgspec.Struct, frozen=True):
         return TOPK + int(self.fse)
 
     @property
+    def up(self) -> bool:
+        """A union slot for each pick (`UP_MAX`)."""
+        return 2 <= self.tokens <= UP_MAX
+
+    @property
     def ps(self) -> bool:
-        return self.fse and self.tokens >= PS_MIN
+        """The fused shared expert's ug tasks run before the route: from
+        `PS_MIN` rows, and at 2 rows, where the layer stage benchmark of
+        vllm-project/vllm#61271 found that faster."""
+        return self.fse and (self.tokens >= PS_MIN or self.tokens == 2)
 
     @property
     def xq(self) -> bool:
@@ -474,6 +484,7 @@ def build_layer(key: LayerBuild):
                 "og": key.og,
                 "shuffled": True,
                 "u1": key.u1,
+                "up": key.up,
                 "fse": key.fse,
                 "KT": kt,
                 "kof_t": s,
@@ -531,15 +542,19 @@ def build_layer(key: LayerBuild):
                 is_s = (bid >= SG0) & (bid < SG0 + SG_TASKS)
                 is_rs = is_r | is_s
             ck = L.VALUE_DIM
-            # ---- o_proj (both tasks' weights in flight first; a router or
-            # shared gate | up CTA's weights behind them), then the AR +
-            # residual add + norm sums, the router, the shared gate | up and
-            # the shared gate
+            # ---- o_proj (both tasks' weights in flight first; a shared
+            # gate | up CTA's weights behind them), then the AR + residual add
+            # + norm sums, the router, the shared gate | up and the shared gate
             if is_r:
                 oops = [moe.o_loads(c, bid + BLOCKS * j, ck) for j in range(2)]
                 ri = bid - R0
-                rops = router_loads(c, ri // R_PARTS, ri % R_PARTS)
                 moe.run_oproj(c, oops, ck)
+                # A router CTA loads its router weights only now. A wave's
+                # wait for a load also waits for each load that it issued
+                # before, so router weights issued before run_oproj would
+                # delay this CTA's o_proj, and each norm task waits for the
+                # o_proj of each CTA. The weights still land before x does.
+                rops = router_loads(c, ri // R_PARTS, ri % R_PARTS)
                 N.load_rstd(c)
                 stage_router(c, ri // R_PARTS, ri % R_PARTS, rops, src)
             if const_expr(not key.fse):  # noqa: SIM102 (traced: `and` does not combine traced values)
@@ -588,8 +603,19 @@ def build_layer(key: LayerBuild):
                 if const_expr(not key.fse):
                     moe.load_h(c)
                 stamp(c, 8)
-                dops2 = moe.stage_down(c, bid, nu, dops, bid + BLOCKS)
-                moe.stage_down(c, bid + BLOCKS, nu, dops2)
+                if const_expr(max_u <= WAVES * moe.DB):
+                    # One batch of a wave covers the union in each row group.
+                    # Then the down rounds run without a prefetch, and the
+                    # second row group's tiles go out here, behind the INTER
+                    # polls, so the polls do not wait for them.
+                    dops2 = moe.down_loads(
+                        c, bid + BLOCKS, nu, fx.min(c["wave"], nu - 1)
+                    )
+                    moe.stage_down(c, bid, nu, dops, prefetch=False, drain=True)
+                    moe.stage_down(c, bid + BLOCKS, nu, dops2, prefetch=False)
+                else:
+                    dops2 = moe.stage_down(c, bid, nu, dops, bid + BLOCKS)
+                    moe.stage_down(c, bid + BLOCKS, nu, dops2)
             stamp(c, 9)
             if bid < NRED:
                 N.stage_final(c, bid)
