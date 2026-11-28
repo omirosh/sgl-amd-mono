@@ -414,26 +414,19 @@ def _proj_input(module, name: str):
         setattr(module, name, proj)
 
 
-def _rotates(layers) -> bool:
-    """Whether SGLang rotates a GDN projection: the split and wide launches
-    quantize their activations without the rotation."""
-    return any(
-        _format(p)[1]
-        for x in layers
-        if _is_gdn(x)
-        for p in (x.linear_attn.in_proj_qkvz, x.linear_attn.out_proj)
-    )
+def _wide_format(linear) -> str:
+    """A GDN projection's weight format in the split and wide launches
+    (``wide.layer.FORMATS``): "mxfp4_h32" rotates the activation by
+    Hadamard-32, as AITER does for a weight that sgl-project/sglang#46059
+    rotated."""
+    mx, rotated = _format(linear)
+    return "mxfp4_h32" if rotated else "mxfp4" if mx else "bf16"
 
 
 def _builds_split(layers, widths, verify) -> bool:
     """The 16-row decode steps run split launches: ``layer_block`` runs their
     MLP half, so every layer needs the fused shared expert."""
-    return (
-        ML.SPLIT_MAX in widths
-        and not verify
-        and all(_fse(x.mlp) for x in layers)
-        and not _rotates(layers)
-    )
+    return ML.SPLIT_MAX in widths and not verify and all(_fse(x.mlp) for x in layers)
 
 
 def _split_keys(layers, eps, gdn_eps, state_bf16, tp, fault_site, fault_after):
@@ -447,7 +440,7 @@ def _split_keys(layers, eps, gdn_eps, state_bf16, tp, fault_site, fault_after):
         if not _is_gdn(x):
             keys.append(None)
             continue
-        qq = _mxfp4(x.linear_attn.in_proj_qkvz)
+        f = _wide_format(x.linear_attn.in_proj_qkvz)
         keys.append(
             W.LayerBuild(
                 kind="gdn",
@@ -455,9 +448,9 @@ def _split_keys(layers, eps, gdn_eps, state_bf16, tp, fault_site, fault_after):
                 tp=tp,
                 rip=L.RI,
                 first=n == 0,
-                first_q4=W.q4_of("mxfp4") if qq else "none",
-                qkvz="mxfp4" if qq else "bf16",
-                qkvz_shuffled=qq,
+                first_q4=W.q4_of(f) or "none",
+                qkvz=f,
+                qkvz_shuffled=f != "bf16",
                 eps=eps,
                 gdn_eps=gdn_eps,
                 state_bf16=state_bf16,
@@ -522,15 +515,14 @@ class _Split:
 
 def _builds_wide(model, layers, widths) -> bool:
     """Whether a WIDE-row step runs the wide launches: every shared expert fused,
-    one eps for the input, post-attention and final norms (a launch's closing
-    combine is the next layer's input norm, with the post-attention eps), and no
-    rotated GDN projection."""
+    and one eps for the input, post-attention and final norms (a launch's
+    closing combine is the next layer's input norm, with the post-attention
+    eps)."""
     e1, _, e2 = _eps(layers)
     return (
         WIDE in widths
         and all(_fse(x.mlp) for x in layers)
         and e1 == e2 == model.model.norm.variance_epsilon
-        and not _rotates(layers)
     )
 
 
@@ -540,40 +532,43 @@ def _wide_keys(layers, eps, tp, fault_site, fault_after, front=None) -> list:
     decode step: the gated norm eps, a bf16 SSM state) ``gdn`` from its input
     rows: the projections, the conv and the recurrence with their state updates.
     A launch before a ``gdn`` launch with an MXFP4 in_proj_qkvz quantizes the
-    rows of its closing combine for it."""
+    rows of its closing combine for it (rotated for a rotated weight)."""
     from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950.wide import layer as W
 
-    def q4(x) -> bool:
-        return front is not None and _is_gdn(x) and _mxfp4(x.linear_attn.in_proj_qkvz)
+    def q4(x) -> str:
+        """The MXFP4 rows that gdn launch ``x`` reads, "none" for bf16."""
+        if front is None or not _is_gdn(x):
+            return "none"
+        return W.q4_of(_wide_format(x.linear_attn.in_proj_qkvz)) or "none"
 
     keys = []
     for n, x in enumerate(layers):
-        q4_next = n + 1 < len(layers) and q4(layers[n + 1])
         common = dict(
             tokens=WIDE,
             tp=tp,
             rip=L.RI,
             eps=eps,
-            next_q4=W.q4_of("mxfp4") if q4_next else "none",
+            next_q4=q4(layers[n + 1]) if n + 1 < len(layers) else "none",
             fault_site=fault_site,
             fault_after=fault_after,
         )
         if not _is_gdn(x):
             keys.append(W.LayerBuild(kind="attn", og=False, **common))
             continue
-        q = _mxfp4(x.linear_attn.out_proj)
-        out = dict(out="mxfp4" if q else "bf16", out_shuffled=q)
+        o = _wide_format(x.linear_attn.out_proj)
+        out = dict(out=o, out_shuffled=o != "bf16")
         if front is None:
             keys.append(W.LayerBuild(kind="gdn_back", **out, **common))
             continue
         gdn_eps, state_bf16 = front
+        f = _wide_format(x.linear_attn.in_proj_qkvz)
         keys.append(
             W.LayerBuild(
                 kind="gdn",
                 first=n == 0,
-                first_q4=W.q4_of("mxfp4") if n == 0 and q4(x) else "none",
-                qkvz="mxfp4" if q4(x) else "bf16",
-                qkvz_shuffled=q4(x),
+                first_q4=q4(x) if n == 0 else "none",
+                qkvz=f,
+                qkvz_shuffled=f != "bf16",
                 gdn_eps=gdn_eps,
                 state_bf16=state_bf16,
                 **out,
