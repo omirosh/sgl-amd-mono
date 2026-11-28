@@ -181,3 +181,86 @@ def moe(
         ws[:, topk] = bf(ws[:, topk])
         y = bf(bf(y) + bf(bf(h @ sd.double().T) * ws[:, topk : topk + 1]))
     return y, ids, ws
+
+
+def unshuffle_data(packed):
+    """The inverse of `shuffle_data`."""
+    *lead, n, kb = packed.shape
+    v = packed.reshape(-1, n // 16, kb // 16, 16, 16).permute(0, 1, 3, 2, 4)
+    return v.contiguous().view(*lead, n, kb)
+
+
+def unshuffle_scale(sc):
+    """The inverse of `shuffle_scale` (the padded columns stay)."""
+    rows, pad = sc.shape
+    return (
+        sc.view(rows // 32, pad // 8, 4, 16, 2, 2)
+        .permute(0, 5, 3, 1, 4, 2)
+        .contiguous()
+        .view(rows, pad)
+    )
+
+
+def gdn(x, w, conv, state, idx, T=1, eps=1e-6):
+    """The GDN layer of SGLang's decode (T = 1) or target verify (T draft tokens
+    a request: rows r T .. r T + T - 1, from the request's state) from the normed
+    input rows `x` to the gated core, in float64 at the stock path's bf16 points
+    (the projections, the conv output, o, the core). `w`: `inputs.k1_weights`
+    (`w_qkvzs` there means an MXFP4 in_proj_qkvz in the ASM FP4 GEMM layout);
+    `conv` [slots, 2560, 3] and `state` [slots, NV, V, K] are read only; `idx`:
+    one state slot a request, <= 0 a pad request (zero core rows).
+
+    Returns the core and, for SGLang's kernel on the same inputs, the conv
+    output (q | k | v), z, b and a (bf16-valued float64)."""
+    hd, nv = state.shape[-1], state.shape[1]
+    key = (conv.shape[1] - nv * hd) // 2
+    nk = key // hd
+    wq = w["w_qkvz"]
+    if "w_qkvzs" in w:
+        n = wq.shape[0]
+        s = w["w_qkvzs"].view(torch.uint8).view(n, -1)
+        wq = dequant_mx(unshuffle_data(wq.view(torch.uint8)), unshuffle_scale(s))
+        proj = linear(x, wq, "mxfp4")
+    else:
+        proj = linear(x, wq, "bf16")
+    ba = linear(x, w["w_ba"], "bf16")
+    b, a = ba[:, :nv], ba[:, nv:]
+    cw = w["conv_w"].double().reshape(conv.shape[1], -1)
+    ch = conv.shape[1]
+    z = proj[:, ch : ch + nv * hd].reshape(-1, nv, hd)
+    sp = a + w["dt_bias"].double()
+    sp = torch.where(sp <= 20.0, torch.log1p(torch.exp(sp)), sp)
+    decay = torch.exp(-torch.exp(w["a_log"].double()) * sp)
+    beta = torch.sigmoid(b)
+    heads = torch.arange(nv, device=x.device) // (nv // nk)
+    mixed = torch.zeros_like(proj[:, :ch])
+    o = torch.zeros(x.shape[0], nv, hd, dtype=torch.float64, device=x.device)
+    for r, slot in enumerate(idx.tolist()):
+        if slot <= 0:
+            continue
+        win = conv[slot].double()
+        h = state[slot].double()
+        for t in range(r * T, r * T + T):
+            win = torch.cat([win, proj[t, :ch, None]], 1)
+            mixed[t] = bf(F.silu((win * cw).sum(1)))
+            win = win[:, 1:]
+            q = mixed[t, :key].view(nk, hd)
+            k = mixed[t, key : 2 * key].view(nk, hd)
+            q = q * torch.rsqrt(q.pow(2).sum(-1, keepdim=True) + 1e-6) * hd**-0.5
+            k = k * torch.rsqrt(k.pow(2).sum(-1, keepdim=True) + 1e-6)
+            q, k = q[heads], k[heads]
+            v = mixed[t, 2 * key :].view(nv, hd)
+            h = h * decay[t, :, None, None]
+            d = (v - (h @ k[..., None])[..., 0]) * beta[t, :, None]
+            h = h + d[..., None] * k[:, None, :]
+            o[t] = bf((h @ q[..., None])[..., 0])
+    core = gated_norm(o, z, w["norm_w"], eps)
+    core[~(idx > 0).repeat_interleave(T)] = 0
+    return core, mixed, z, b, a
+
+
+def gated_norm(o, z, norm_w, eps=1e-6):
+    """SGLang's RMSNormGated of a core `o` [rows, NV, HD] (bf16-valued) with the
+    gate `z` (the z part of in_proj_qkvz) -> the bf16-valued core."""
+    rstd = torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps)
+    return bf(o * rstd * norm_w.double() * F.silu(z)).flatten(-2)

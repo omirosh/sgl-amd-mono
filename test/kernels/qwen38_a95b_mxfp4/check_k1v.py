@@ -16,6 +16,10 @@ SGLang's layouts:
 - pad request: ring row -1 and slot -1 give zero core rows and no record or conv
   window;
 - graph replay: the K1v widths in one graph, replayed, bit for bit against eager.
+
+``--f64``: K1v and SGLang's verify kernel (``fused_sigmoid_gating_delta_rule_update``
+on the same q, k, v, a and b, SGLang's gated norm) against a float64 GDN layer
+(``wide_reference.gdn``), for each draft token; prints only.
 """
 
 import argparse
@@ -23,6 +27,7 @@ import sys
 import time
 
 import torch
+import wide_reference as R
 from inputs import BF, CORE, FP4_FORMATS, HIDDEN, NV, epoch, errors, gen, k1_state
 from inputs import HD, k1_weights, rnd
 
@@ -314,11 +319,91 @@ def check_graph_replay(replays):
     return fails
 
 
+def _rel(a, b):
+    return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
+
+
+def check_f64(seeds):
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update as sglang_verify,
+    )
+
+    key = L.NK * HD
+    for r, qq, bf in ((1, False, False), (2, True, True), (1, True, True)):
+        kv, _ = keys_of(r, first=True, bf16=bf, qq=qq)
+        n = r * T
+        stats = {}
+        for seed in range(seeds):
+            w, conv, state, hidden, _, idx = inputs(100 + seed, r, True, qq)
+            if bf:
+                state = state.to(BF)
+            core, _ = launch(
+                kv,
+                w,
+                hidden,
+                None,
+                conv.clone(),
+                state.clone(),
+                idx,
+                epoch(DEV),
+                ring(r),
+            )
+            x = R.gemma_norm(hidden.double(), w["ln_w"], 1e-6)
+            ref, mixed, z, b, a = R.gdn(x, w, conv, state, idx, T)
+            m = mixed.to(BF)
+            got = {"k1v": core.double()}
+            for rb in (False, True):
+                o = sglang_verify(
+                    A_log=w["a_log"],
+                    a=a.to(BF),
+                    dt_bias=w["dt_bias"],
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=m[:, :key].reshape(1, n, L.NK, HD),
+                    k=m[:, key : 2 * key].reshape(1, n, L.NK, HD),
+                    v=m[:, 2 * key :].reshape(1, n, NV, HD),
+                    b=b.to(BF),
+                    initial_state_source=state,
+                    initial_state_indices=idx,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=torch.arange(0, n + 1, T, dtype=torch.int32, device=DEV),
+                    disable_state_update=True,
+                    round_beta_to_input_dtype=rb,
+                )
+                o = R.bf(o.reshape(n, NV, HD).double())
+                got[f"sglang rb={int(rb)}"] = R.gated_norm(o, z, w["norm_w"])
+            for name, c in got.items():
+                for s in range(T):
+                    stats.setdefault((name, s), []).append(_rel(c[s::T], ref[s::T]))
+                stats.setdefault((name, "cos to k1v"), []).append(
+                    torch.nn.functional.cosine_similarity(
+                        c.flatten(), got["k1v"].flatten(), dim=0
+                    ).item()
+                )
+        tag = f"r={r} qq={qq} bf16 state={bf}, {seeds} seeds"
+        for name in got:
+            per = " ".join(
+                f"t{s} {max(stats[name, s]):.2e}/{sum(stats[name, s]) / seeds:.2e}"
+                for s in range(T)
+            )
+            cos = min(stats[name, "cos to k1v"])
+            print(
+                f"f64 {tag}: {name}: rel to f64 (max/mean) {per}; "
+                f"smallest cosine to k1v {cos:.7f}",
+                flush=True,
+            )
+    return []
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replays", type=int, default=200)
+    ap.add_argument("--f64", type=int, default=0, help="seeds of check_f64 only")
     args = ap.parse_args()
     torch.cuda.set_device(DEV)
+    if args.f64:
+        check_f64(args.f64)
+        return
     fails = check_compile()
     fails += check_chain()
     fails += check_bf16_state()

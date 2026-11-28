@@ -135,6 +135,9 @@ class TestQwen38MoeK1(CustomTestCase):
     def test_k1v(self):
         self.assertEqual(_run("check_k1v.py", "--replays", "200"), 0)
 
+    def test_k1v_f64(self):
+        self.assertEqual(_run("check_k1v.py", "--f64", "8"), 0)
+
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 class TestQwen38MoeK2(CustomTestCase):
@@ -158,6 +161,9 @@ class TestQwen38MoeK2(CustomTestCase):
 
     def test_wide32(self):
         self.assertEqual(_run("check_wide32.py", ranks=8), 0)
+
+    def test_front_f64(self):
+        self.assertEqual(_run("check_wide32.py", "--front-f64", ranks=8), 0)
 
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
