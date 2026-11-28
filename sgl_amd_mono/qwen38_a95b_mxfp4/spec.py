@@ -12,10 +12,15 @@ A decode step runs each decoder layer as at most two launches:
   TP reduce. It writes the layer output and the residual.
 
 A full-attention layer runs SGLang's attention up to o_proj's input, then K2. A
-target-verify step (speculative decoding) runs K2 only: K1 keeps no state per
-draft token for the rollback, so a GDN layer runs SGLang's GDN up to out_proj's
-input there. SGLang's embedding, final norm and logits processor run around the
-layers.
+target-verify step (speculative decoding) runs K2 only, and a GDN layer runs
+SGLang's GDN up to out_proj's input there, except with K1v: on SGLang's compact
+ReplaySSM ring (``--enable-linear-replayssm-spec`` with a bf16 SSM state, the
+draft chain of 2 to 4 tokens), a verify step of up to 8 rows runs each GDN
+layer's front as K1 with ``spec`` = the draft tokens. It writes the ring records
+and the conv windows that SGLang's verify kernels write and no state, and
+SGLang's commit after the accept stays as it is (``gfx950/gdn.py``).
+``SGLANG_AMD_MONO_K1V=0`` turns K1v off. SGLang's embedding, final norm and
+logits processor run around the layers.
 
 A step of 16 rows (decode or verify) runs SGLang's GDN or attention up to
 out_proj's / o_proj's input, then ``layer_block`` (``gfx950/mono/blocks.py``,
@@ -101,14 +106,32 @@ SGLANG_READS = {
         "speculative_eagle_topk",
         "speculative_num_steps",
         "speculative_num_draft_tokens",
+        "enable_linear_replayssm_spec",
+        "linear_replayssm_cache_len",
     ),
     "srt/configs/mamba_utils.py": ("mamba2_state_dtype",),
     "srt/layers/attention/hybrid_linear_attn_backend.py": (
         "linear_attn_backend",
         "forward_metadata",
         "state_layer_cache",
+        "replayssm_ring_indices",
+        "state_pool",
+        "req_to_token_pool",
+    ),
+    "srt/layers/attention/linear/gdn_backend.py": (
+        "verify_intermediate_state_indices",
+    ),
+    "srt/layers/attention/linear/utils.py": (
+        "select_verify_intermediate_state_indices",
     ),
     "srt/layers/attention/mamba/mamba2_metadata.py": ("mamba_cache_indices",),
+    # K1v reads no history: with a bf16 state the commit folds each record, then
+    # the finish kernel sets write_pos to 0
+    "srt/speculative/spec_utils.py": ("commit_gdn_replayssm_after_verify",),
+    "kernels/ops/attention/linear/gdn_replayssm_spec_decode.py": (
+        "commit_gdn_replayssm_after_verify(fold_every_commit)",
+        "_finish_gdn_replayssm_circular_fold_kernel",
+    ),
     "kernels/ops/attention/fla/layernorm_gated.py": (
         "eps",
         "group_size",
@@ -120,6 +143,16 @@ SGLANG_READS = {
         "conv",
         "temporal",
         "replayssm_d",
+        "replayssm_rawv",
+        "replayssm_k",
+        "replayssm_rawk",
+        "replayssm_g",
+        "replayssm_beta",
+        "replayssm_spec_write_pos",
+        "replayssm_cache_base",
+        "replayssm_spec_fold",
+        "replayssm_is_kda",
+        "intermediate_conv_window",
     ),
     "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py": (
         "AiterMxfp4OnlineLinearMethod",
@@ -182,6 +215,7 @@ SGLANG_READS = {
         "Requirements",
     ),
     "srt/runtime_context.py": (
+        "get_exec",
         "get_parallel",
         "get_spec",
         '"tp_rank"',
@@ -201,6 +235,13 @@ NUMERICS = Numerics(
         "k1.core.cosine": 0.9999,
         "k1.conv.cosine": 0.9999,
         "k1.state.cosine": 0.9999,
+        # K1v against SGLang's verify kernel: SGLang takes the checkpoint terms
+        # as bf16 dot products, K1v in fp32
+        "k1v.core.cosine": 0.9999,
+        "k1v.conv.cosine": 0.9999,
+        "k1v.d.cosine": 0.999,
+        "k1v.k.cosine": 0.9999,
+        "k1v.g.cosine": 0.9999,
         "k2.out.cosine": 0.99,
         "wide.out.cosine": 0.99,
         "wide.conv.cosine": 0.9999,
@@ -715,6 +756,9 @@ class _Built:
         self.lm, self.rank = lm, rank
         self.state_dtype = torch.bfloat16 if state_bf16 else torch.float32
         self.k1_keys, self.k2_keys = k1_keys, k2_keys
+        # K1v: the draft tokens a request of the K1 keys (verify steps); 0 decode
+        self.k1v = max((k.spec for k in k1_keys.values()), default=0)
+        self.k1_widths = {w for w, *_ in k1_keys}
         self.wide = wide
         self.widths = {w for w, *_ in k2_keys} | ({WIDE} if wide else set())
         self.k1_scratch, self.k2_scratch = k1_scratch, k2_scratch
@@ -757,7 +801,7 @@ class _Built:
         if s == WIDE:
             return self._wide_forward(input_ids, positions, forward_batch)
         decode = plan.key.forward_mode != "target_verify"
-        k1 = decode and s <= L.MAX_TOKENS
+        k1 = s in self.k1_widths and decode == (not self.k1v)
         split = decode and s == ML.SPLIT_MAX and self.split is not None
         fb = (
             forward_batch
@@ -767,11 +811,17 @@ class _Built:
         self.epoch[:1].add_(1)
         h = m.embed_tokens(input_ids)
         residual = None
-        idx = self._state_indices(s) if k1 or split else None
+        reqs = s // self.k1v if k1 and self.k1v else s
+        idx = self._state_indices(reqs) if k1 or split else None
         for n, i in enumerate(range(m.start_layer, m.end_layer)):
             layer = m.layers[i]
             if _is_gdn(layer) and k1:
-                core, res_attn = self._k1(i, layer, h, residual, idx, s, fb)
+                ring = (
+                    self._ring(layer.linear_attn, forward_batch, reqs)
+                    if self.k1v
+                    else None
+                )
+                core, res_attn = self._k1(i, layer, h, residual, idx, s, fb, ring)
             elif _is_gdn(layer) and split:
                 core, res_attn = self._front16(i, n, layer, h, residual, idx, fb)
             else:
@@ -873,16 +923,70 @@ class _Built:
             )
         return idx
 
-    def _state(self, a, dense=False):
+    def _ring(self, a, forward_batch, reqs):
+        """K1v's view of the layer's ReplaySSM ring (``gdn.Ring``), as
+        ``GDNAttnBackend._replayssm_target_verify`` passes it to SGLang's verify
+        kernel: the compact ring (low parts of d and the key, no beta), the
+        request cursors, and the intermediate conv windows."""
+        from sglang.srt.layers.attention.linear.utils import (
+            select_verify_intermediate_state_indices,
+        )
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
+
+        be = get_attn_backend().linear_attn_backend
+        st, pool, md = (
+            be.state_layer_cache(a.layer_id),
+            be.state_pool,
+            be.forward_metadata,
+        )
+        ring = getattr(md, "replayssm_ring_indices", None)
+        parts = ("replayssm_d", "replayssm_rawv", "replayssm_k", "replayssm_rawk")
+        if (
+            ring is None
+            or any(getattr(st, n, None) is None for n in parts)
+            or getattr(st, "replayssm_beta", None) is not None
+            or pool.replayssm_spec_fold
+            or pool.replayssm_is_kda
+            or pool.replayssm_spec_write_pos is None
+            or pool.replayssm_cache_base is None
+        ):
+            raise RuntimeError(
+                f"Qwen3.8 monokernel: layer {a.layer_id}: K1v needs SGLang's compact "
+                f"GDN ReplaySSM ring (--enable-linear-replayssm-spec)"
+            )
+        idx = md.mamba_cache_indices
+        windows = select_verify_intermediate_state_indices(
+            be.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            lambda: idx[:reqs] >= 0,
+            be.req_to_token_pool.size,
+        )
+        return gdn.Ring(
+            ring_indices=ring,
+            write_pos=pool.replayssm_spec_write_pos,
+            cache_base=pool.replayssm_cache_base,
+            d=st.replayssm_d,
+            rawv=st.replayssm_rawv,
+            k=st.replayssm_k,
+            rawk=st.replayssm_rawk,
+            g=st.replayssm_g,
+            conv_window=st.intermediate_conv_window[0],
+            conv_window_indices=windows,
+        )
+
+    def _state(self, a, dense=False, ring=False):
         """``dense``: a conv state slot is one dense block (the split launch and
-        the wide ``gdn`` launch read no strides within it; K1 does)."""
+        the wide ``gdn`` launch read no strides within it; K1 does). ``ring``:
+        K1v, on a pool with the ReplaySSM ring."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         st = get_attn_backend().linear_attn_backend.state_layer_cache(a.layer_id)
         conv, temporal = st.conv[0], st.temporal
         want = self.state_dtype
         if (
-            getattr(st, "replayssm_d", None) is not None
+            (getattr(st, "replayssm_d", None) is not None) != ring
             or temporal.dtype != want
             or conv.dtype != torch.bfloat16
             or tuple(conv.shape[1:]) != (L.CONV, L.CONV_W - 1)
@@ -898,17 +1002,22 @@ class _Built:
             )
         return conv, temporal
 
-    def _k1(self, i, layer, h, residual, idx, s, check_batch=None):
-        """``check_batch``: the forward batch in check mode, else None."""
+    def _k1(self, i, layer, h, residual, idx, s, check_batch=None, ring=None):
+        """``check_batch``: the forward batch in check mode, else None. ``ring``:
+        K1v's ``gdn.Ring`` (a verify step)."""
         from sgl_amd_mono.qwen38_a95b_mxfp4 import check
         from sgl_amd_mono.qwen38_a95b_mxfp4.gfx950 import gdn
 
         a = layer.linear_attn
-        conv, temporal = self._state(a)
+        conv, temporal = self._state(a, ring=ring is not None)
+        reqs = s // self.k1v if ring is not None else s
         if check_batch is not None:
+            # in a verify step SGLang's GDN writes the records K1v rewrites
             ref = check.k1_reference(
-                layer, h, residual, conv, temporal, idx[:s], check_batch
+                layer, h, residual, conv, temporal, idx[:reqs], check_batch
             )
+            if ring is not None:
+                ref |= check.k1v_records(ring, idx[:reqs], self.k1v)
         qq, qh = _format(a.in_proj_qkvz)
         core = torch.empty(s, L.CORE, dtype=h.dtype, device=h.device)
         res_out = torch.empty_like(h)
@@ -932,10 +1041,15 @@ class _Built:
             epoch=self.epoch,
             layer=i,
             w_qkvzs=a.in_proj_qkvz.weight_scale if qq else None,
+            ring=ring,
         )
-        if check_batch is not None:
+        if check_batch is not None and ring is None:
             got = check.k1_outputs(core, res_out, conv, temporal, idx[:s])
             check.compare("k1", layer.layer_id, s, ref, got)
+        elif check_batch is not None:
+            got = {"core": core} | check.k1v_records(ring, idx[:reqs], self.k1v)
+            ref = {n: ref[n] for n in got}
+            check.compare("k1v", layer.layer_id, s, ref, got)
         return core, res_out
 
     def _front16(self, i, n, layer, h, residual, idx, check_batch=None):
@@ -1035,6 +1149,26 @@ def _writable_flydsl_cache() -> None:
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = str(path)
 
 
+def _k1v(bf16: bool) -> tuple[int, int]:
+    """(draft tokens, ring length) when the verify steps run K1v, else (0, 0):
+    SGLang's compact GDN ReplaySSM ring with a bf16 SSM state (each commit folds
+    the records, so a verify step reads no history) and a draft chain of 2 to 4
+    tokens."""
+    from sglang.srt.runtime_context import get_exec, get_spec
+
+    spec, mamba = get_spec(), get_exec().mamba
+    tokens = spec.speculative_num_draft_tokens or 0
+    if (
+        os.environ.get("SGLANG_AMD_MONO_K1V", "1") == "0"
+        or (spec.speculative_eagle_topk or 1) > 1
+        or not mamba.enable_linear_replayssm_spec
+        or not bf16
+        or not 2 <= tokens <= 4
+    ):
+        return 0, 0
+    return tokens, mamba.linear_replayssm_cache_len
+
+
 def _scratch(keys: dict, size, device) -> dict:
     """One zeroed scratch a width, as large as its largest variant's."""
     out = {}
@@ -1068,8 +1202,11 @@ def _build(model, hf_config, ctx) -> _Built:
     bf16 = mamba2_state_dtype(hf_config).temporal == torch.bfloat16
     narrow = [w for w in ctx.widths if w <= L.MAX_TOKENS]
     k1_keys = {}
-    if not verify:
+    spec, ring_len = _k1v(bf16) if verify else (0, 0)
+    if not verify or spec:
         for w in narrow:
+            if spec and w % spec:
+                continue
             for first in sorted({x is layers[0] for x in gdns}):
                 for qq, qh in qkvz:
                     k1_keys[w, first, qq, qh] = gdn.K1Build(
@@ -1080,6 +1217,8 @@ def _build(model, hf_config, ctx) -> _Built:
                         state_bf16=bf16,
                         qq=qq,
                         qh=qh,
+                        spec=spec,
+                        ring_len=ring_len,
                         fault_site=fault_site,
                         fault_after=fault_after,
                     )
@@ -1183,9 +1322,10 @@ def _build(model, hf_config, ctx) -> _Built:
         _compile_only(launch)
     torch.cuda.synchronize()
     logger.info(
-        "Qwen3.8 monokernel: %d K1, %d K2, %d layer_block, %d split and %d wide "
+        "Qwen3.8 monokernel: %d K1%s, %d K2, %d layer_block, %d split and %d wide "
         "launches (widths %s, %s) in %.0f s",
         len(k1_keys),
+        f" (K1v, {spec} draft tokens)" if spec else "",
         len(k2_keys),
         len(wide_keys),
         len(split_keys),

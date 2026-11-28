@@ -131,6 +131,9 @@ class TestQwen38MoeK1(CustomTestCase):
     def test_k1(self):
         self.assertEqual(_run("check_k1.py", "--replays", "200"), 0)
 
+    def test_k1v(self):
+        self.assertEqual(_run("check_k1v.py", "--replays", "200"), 0)
+
 
 @unittest.skipIf(_gfx950_gpus() < 8, "needs 8 gfx950 GPUs")
 class TestQwen38MoeK2(CustomTestCase):

@@ -98,6 +98,29 @@ def k1_outputs(core, res_out, conv, temporal, idx) -> dict:
     }
 
 
+def k1v_records(ring, idx, spec) -> dict:
+    """What a verify step writes past the core rows, for the live requests (state
+    index > 0, ring row >= 0), copied: the intermediate conv windows and the ring
+    records of the draft tokens (d and the normalized key as high + low part in
+    fp32, g)."""
+    n = ring.d.shape[-2]
+    out = {"conv": [], "d": [], "k": [], "g": []}
+    for q in range(idx.numel()):
+        ri = int(ring.ring_indices[q])
+        if int(idx[q]) <= 0 or ri < 0:
+            continue
+        wp, cb = int(ring.write_pos[ri]), int(ring.cache_base[ri])
+        ps = [(cb + wp + s) % n for s in range(spec) if wp + s < n]
+        out["conv"].append(ring.conv_window[int(ring.conv_window_indices[q])].clone())
+        out["d"].append(ring.d[ri][:, ps].float() + ring.rawv[ri][:, ps].float())
+        out["k"].append(ring.k[ri][:, ps].float() + ring.rawk[ri][:, ps].float())
+        out["g"].append(ring.g[ri][:, ps].clone())
+    return {
+        name: torch.stack(v) if v else torch.empty(0, device=ring.d.device)
+        for name, v in out.items()
+    }
+
+
 def k2_reference(layer, o_proj, core, residual, forward_batch):
     """SGLang's o_proj, post-attention norm and MoE block on K2's input. Both
     projections leave their TP sum to the layer's stage boundary: reduce here.
